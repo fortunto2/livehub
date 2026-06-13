@@ -1,9 +1,11 @@
 //! livehub-engine — the realtime runtime (cpal, symphonia; clack-host / rubato
 //! later) plus device management.
 //!
-//! The lock-free audio callbacks live in this crate and nowhere else. They obey
-//! the same `process()`-rules as the SuperDuper plugins: no heap alloc, no
-//! locks, no syscalls inside a callback.
+//! RT-callback rules (CANONICAL — the lock-free audio callbacks live in this
+//! crate and nowhere else; they obey the same `process()`-rules as the
+//! SuperDuper plugins): no heap alloc, no locks, no syscalls inside a callback.
+//! Pattern: snapshot the shared atomics ONCE per block into stack locals, then
+//! work from those — never re-load mid-block.
 
 mod audio;
 mod clap_fx;

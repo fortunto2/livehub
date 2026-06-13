@@ -42,7 +42,7 @@ impl LinkHub {
     }
 
     pub fn tempo(&self) -> f64 {
-        self.with_state(|s, _| s.tempo())
+        self.with_state(|s| s.tempo())
     }
 
     pub fn set_tempo(&mut self, bpm: f64) {
@@ -51,7 +51,7 @@ impl LinkHub {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.with_state(|s, _| s.is_playing())
+        self.with_state(|s| s.is_playing())
     }
 
     pub fn set_playing(&mut self, playing: bool) {
@@ -63,13 +63,13 @@ impl LinkHub {
     pub fn beat_phase(&self) -> f64 {
         let now = self.link.clock_micros();
         let q = self.quantum;
-        self.with_state(|s, _| s.phase_at_time(now, q))
+        self.with_state(|s| s.phase_at_time(now, q))
     }
 
-    fn with_state<R>(&self, f: impl FnOnce(&SessionState, &AblLink) -> R) -> R {
+    fn with_state<R>(&self, f: impl FnOnce(&SessionState) -> R) -> R {
         let mut state = SessionState::new();
         self.link.capture_app_session_state(&mut state);
-        f(&state, &self.link)
+        f(&state)
     }
 
     fn mutate_state(&self, f: impl FnOnce(&mut SessionState)) {

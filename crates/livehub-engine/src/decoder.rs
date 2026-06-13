@@ -1,5 +1,6 @@
 //! Offline track decode (symphonia) → interleaved stereo f32 at the device rate.
-//! Runs on a worker / loader thread, never on the audio thread.
+//! Runs on a worker / loader thread, never on the audio thread, so it is exempt
+//! from the RT-callback rules (see crate docs in lib.rs) — alloc/blocking is fine.
 //!
 //! Resampling is linear for M1 (good enough for testing; the common case —
 //! 44.1 kHz file on a 44.1 kHz device — needs none). Upgrade to rubato later.

@@ -1,6 +1,6 @@
 //! M0 realtime audio: mic → master passthrough and a channel-identification
-//! tone sweep. Both run lock-free callbacks (no alloc, no syscalls inside the
-//! cpal data closures).
+//! tone sweep. Both run lock-free cpal data callbacks.
+//! RT-callback rules: see crate docs (lib.rs).
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};

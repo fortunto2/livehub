@@ -5,8 +5,8 @@
 //! the mic into an SPSC ring, the output stream mixes both decks + mic and
 //! writes the master pair. Each deck's track is decoded whole into a `TrackBuf`
 //! and swapped in lock-free via `ArcSwapOption`; the audio callback reads it at
-//! a per-deck atomic frame index. The callback stays alloc/lock-free (the
-//! SuperDuper `process()` rules): only fixed `[_; 2]` stack arrays, no heap.
+//! a per-deck atomic frame index, using only fixed `[_; 2]` stack arrays.
+//! RT-callback rules: see crate docs (lib.rs).
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwapOption;
