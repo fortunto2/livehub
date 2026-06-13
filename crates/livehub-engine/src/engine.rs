@@ -700,11 +700,14 @@ impl Engine {
         let target = self.bpm(other) * self.rate(other) as f64;
         let r = sync_rate(self.bpm(me), target);
         self.shared.decks[me].rate.store(r, Ordering::Relaxed);
-        // (2) Phase: reproduce the other deck's beat phase on this deck, via a seek.
+        // (2) Phase: reproduce the other deck's BAR phase on this deck, via a seek —
+        // align on the downbeat grid so the measures' "1"s coincide (not just any
+        // beat); fall back to the beat grid when downbeats weren't detected.
         if let (Some(t), Some(rt)) = (self.current_track(me), self.current_track(other)) {
             let (ph, rph) = (self.playhead_secs(me), self.playhead_secs(other));
-            if let Some(target_secs) = crate::loops::beat_phase_align(&t.beats, ph, &rt.beats, rph)
-            {
+            let grid_me: &[f64] = if t.downbeats.len() >= 2 { &t.downbeats } else { &t.beats };
+            let grid_ot: &[f64] = if rt.downbeats.len() >= 2 { &rt.downbeats } else { &rt.beats };
+            if let Some(target_secs) = crate::loops::beat_phase_align(grid_me, ph, grid_ot, rph) {
                 self.seek_secs(me, target_secs);
             }
         }

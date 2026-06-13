@@ -546,6 +546,10 @@ impl App {
                     _ => seek,
                 };
                 self.engine.seek_secs(d, target);
+                // If a loop is engaged on this deck, MOVE it to where you clicked.
+                if let Some(k) = self.loop_len[d] {
+                    self.engage_loop_at(d, k, target);
+                }
             }
         }
     }
@@ -882,10 +886,17 @@ impl App {
     /// GUI and the headless `selftest-loops` agree. No-op if fewer than `k` beats
     /// remain ahead.
     fn engage_loop(&mut self, d: usize, k: usize) {
+        let at = self.engine.playhead_secs(d);
+        self.engage_loop_at(d, k, at);
+    }
+
+    /// Engage a `k`-beat loop on `deck` starting at the beat at-or-before `at_secs`
+    /// — the live playhead (loop buttons) or a clicked position (to MOVE an active
+    /// loop where you click the overview). No-op if fewer than `k` beats remain.
+    fn engage_loop_at(&mut self, d: usize, k: usize, at_secs: f64) {
         let Some(track) = self.engine.current_track(d) else { return };
-        let ph = self.engine.playhead_secs(d);
         if let Some((start, end)) =
-            livehub_engine::beat_loop_region(&track.beats, ph, k, track.sample_rate)
+            livehub_engine::beat_loop_region(&track.beats, at_secs, k, track.sample_rate)
         {
             self.engine.set_loop(d, start, end);
             self.loop_len[d] = Some(k);
