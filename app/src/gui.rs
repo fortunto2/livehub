@@ -455,7 +455,7 @@ impl App {
     /// trailing `add_space` the layout below it expects.
     fn video_composite(&self, ui: &mut egui::Ui) {
         let aspect = self.canvas_mode.aspect(&self.video_tex);
-        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, aspect, Some(210.0));
+        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, aspect, Some(180.0));
         ui.add_space(8.0);
     }
 
@@ -623,7 +623,35 @@ impl App {
         };
         ui.label(egui::RichText::new(bpm_text).color(accent).heading());
 
-        // Source buttons + transport.
+        // TRANSPORT — the main per-deck control, kept big + obvious and separate
+        // from the source buttons: a coloured Play/Pause + a ⏮ cue-to-start.
+        ui.horizontal(|ui| {
+            let playing = self.engine.is_playing(d);
+            let (label, fill) = if playing {
+                ("⏸  Pause", Color32::from_gray(70))
+            } else {
+                ("▶  Play", accent)
+            };
+            if ui
+                .add_sized(
+                    [110.0, 30.0],
+                    egui::Button::new(egui::RichText::new(label).strong().color(Color32::WHITE))
+                        .fill(fill),
+                )
+                .clicked()
+            {
+                self.engine.toggle(d);
+            }
+            if ui
+                .add_sized([42.0, 30.0], egui::Button::new("⏮"))
+                .on_hover_text("cue to start")
+                .clicked()
+            {
+                self.engine.seek_secs(d, 0.0);
+            }
+        });
+
+        // Source buttons (what the deck shows / its audio source).
         ui.horizontal(|ui| {
             if ui.button("📂 Load").clicked() && self.file_rx[d].is_none() {
                 self.open_file_dialog(d);
@@ -652,10 +680,6 @@ impl App {
                 .clicked()
             {
                 self.load_visualizer(d);
-            }
-            let label = if self.engine.is_playing(d) { "⏸" } else { "▶" };
-            if ui.button(label).clicked() {
-                self.engine.toggle(d);
             }
             // 🎤 = OPTIONAL karaoke split (demucs): swap this deck's AUDIO to the
             // instrumental stem while its video keeps playing. Needs a source file
@@ -1117,15 +1141,6 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-          // Scroll only via wheel/scrollbar (NOT drag), so dragging a slider
-          // (crossfader, faders) is never stolen by the scroll area.
-          egui::ScrollArea::vertical()
-              .auto_shrink([false, false])
-              .scroll_source(egui::scroll_area::ScrollSource {
-                  drag: false,
-                  ..egui::scroll_area::ScrollSource::ALL
-              })
-              .show(ui, |ui| {
             // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
             self.top_bar(ui);
             ui.add_space(6.0);
@@ -1185,11 +1200,14 @@ impl eframe::App for App {
                             DECK_COLOR[0],
                             egui::RichText::new("◀ A").strong().size(18.0),
                         );
-                        let avail = ui.available_width() - 56.0;
-                        ui.spacing_mut().slider_width = avail.max(80.0);
-                        ui.add(egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(false));
-                        // Push every frame (cheap atomic) so the mix always tracks
-                        // the slider even if `.changed()` misfires.
+                        // Explicit-size slider (no slider_width hack), value shown so
+                        // it's obvious it's moving. Drag blends audio AND video.
+                        let w = (ui.available_width() - 64.0).max(80.0);
+                        ui.add_sized(
+                            [w, 22.0],
+                            egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(true),
+                        );
+                        // Push every frame (cheap atomic) so the mix always tracks it.
                         self.engine.set_crossfade(self.crossfade);
                         ui.colored_label(
                             DECK_COLOR[1],
@@ -1219,7 +1237,6 @@ impl eframe::App for App {
                         self.engine.underruns()
                     ));
                 });
-          });
         });
 
         // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live
