@@ -459,6 +459,33 @@ impl App {
         ui.add_space(8.0);
     }
 
+    /// The A↔B CROSSFADER — full width, sits right under the video so it's always
+    /// visible. Drag it: blends BOTH the audio AND the video composite from deck A
+    /// to deck B (the DJ-style mixer). Value shown so it's obviously moving.
+    fn crossfader(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_gray(20))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.colored_label(
+                        Color32::from_gray(150),
+                        egui::RichText::new("CROSSFADE  ·  A ↔ B  ·  audio + video").strong(),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.colored_label(DECK_COLOR[0], egui::RichText::new("◀ A").strong().size(18.0));
+                    let w = (ui.available_width() - 64.0).max(80.0);
+                    ui.add_sized(
+                        [w, 22.0],
+                        egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(true),
+                    );
+                    self.engine.set_crossfade(self.crossfade);
+                    ui.colored_label(DECK_COLOR[1], egui::RichText::new("B ▶").strong().size(18.0));
+                });
+            });
+        ui.add_space(8.0);
+    }
+
     /// Stacked A/B match overview: one full-width rect split into a TOP half
     /// (deck A, blue) and BOTTOM half (deck B, red). Each half draws that deck's
     /// peak envelope, beat ticks, engaged-loop band, and a vertical playhead —
@@ -1148,10 +1175,14 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // 3. VIDEO COMPOSITE (hero): deck A under deck B, blended by the
-            // crossfader. Canvas-aware, ~300 px cap.
+            // crossfader. Canvas-aware, ~180 px cap.
             self.video_composite(ui);
 
-            // 4. THREE COLUMNS: DECK A | MIXER | DECK B. Manual split — decks
+            // 4. CROSSFADER — full width right under the video so it's ALWAYS
+            // visible (it blends the A/B picture you see above + the audio).
+            self.crossfader(ui);
+
+            // 5. THREE COLUMNS: DECK A | MIXER | DECK B. Manual split — decks
             // flex, the mixer is a fixed narrow column.
             let full_w = ui.available_width();
             let spacing = ui.spacing().item_spacing.x;
@@ -1184,40 +1215,6 @@ impl eframe::App for App {
                     },
                 );
             });
-
-            ui.add_space(6.0);
-
-            // 5. CROSSFADER — the A↔B mix. Drag it: blends BOTH the audio AND the
-            // video composite from deck A to deck B (the DJ-style mixer).
-            egui::Frame::group(ui.style())
-                .fill(Color32::from_gray(20))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.colored_label(
-                            Color32::from_gray(150),
-                            egui::RichText::new("CROSSFADE  ·  A ↔ B  ·  audio + video").strong(),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            DECK_COLOR[0],
-                            egui::RichText::new("◀ A").strong().size(18.0),
-                        );
-                        // Explicit-size slider (no slider_width hack), value shown so
-                        // it's obvious it's moving. Drag blends audio AND video.
-                        let w = (ui.available_width() - 64.0).max(80.0);
-                        ui.add_sized(
-                            [w, 22.0],
-                            egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(true),
-                        );
-                        // Push every frame (cheap atomic) so the mix always tracks it.
-                        self.engine.set_crossfade(self.crossfade);
-                        ui.colored_label(
-                            DECK_COLOR[1],
-                            egui::RichText::new("B ▶").strong().size(18.0),
-                        );
-                    });
-                });
 
             ui.add_space(8.0);
 
