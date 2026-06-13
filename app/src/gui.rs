@@ -1117,11 +1117,14 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-          // drag_to_scroll(false): scroll only via wheel/scrollbar, so dragging a
-          // slider (crossfader, faders) is NOT stolen by the scroll area.
+          // Scroll only via wheel/scrollbar (NOT drag), so dragging a slider
+          // (crossfader, faders) is never stolen by the scroll area.
           egui::ScrollArea::vertical()
               .auto_shrink([false, false])
-              .drag_to_scroll(false)
+              .scroll_source(egui::scroll_area::ScrollSource {
+                  drag: false,
+                  ..egui::scroll_area::ScrollSource::ALL
+              })
               .show(ui, |ui| {
             // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
             self.top_bar(ui);
