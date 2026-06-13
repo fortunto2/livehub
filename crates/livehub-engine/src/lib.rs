@@ -20,7 +20,7 @@ pub use audio::{run_passthrough, run_sweep};
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;
 pub use device::list_devices;
-pub use engine::{Engine, Transport};
+pub use engine::{sync_rate, Engine, Transport};
 pub use link::LinkHub;
 pub use loops::beat_loop_region;
 pub use track::TrackBuf;

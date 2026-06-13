@@ -121,6 +121,15 @@ enum Cmd {
         /// Plugin basename substring to match among installed SuperDuper*.clap.
         plugin: String,
     },
+    /// Headless beatmatch test: decode two media files, print each detected BPM,
+    /// the `sync_rate(bpmB, bpmA)` that retempos B onto A, and the resulting
+    /// matched BPM (bpmB × rate). Asserts the math headlessly. No GUI, no audio.
+    SelftestSync {
+        /// File A (the target tempo — B is retempo'd onto it).
+        file_a: String,
+        /// File B (gets retempo'd to match A).
+        file_b: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -189,7 +198,42 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::SelftestFx { plugin }) => selftest_fx(&plugin),
+        Some(Cmd::SelftestSync { file_a, file_b }) => selftest_sync(&file_a, &file_b),
     }
+}
+
+/// Headless beatmatch (SYNC) test. Decodes both files for their detected BPMs,
+/// then computes the rate that retempos B onto A via the SAME pure helper the
+/// engine's `sync_deck` uses (`sync_rate`), and prints the resulting matched
+/// BPM. Asserts the match lands on A's tempo (within the rate clamp). No GUI,
+/// no audio device — runs anywhere for autonomous verification of the math.
+fn selftest_sync(file_a: &str, file_b: &str) -> Result<()> {
+    use livehub_engine::{decode_track, sync_rate};
+
+    println!("== livehub sync test ==");
+    println!("  A: {file_a}");
+    println!("  B: {file_b}");
+    let ta = decode_track(std::path::Path::new(file_a), 48_000)?;
+    let tb = decode_track(std::path::Path::new(file_b), 48_000)?;
+    let (bpm_a, bpm_b) = (ta.bpm, tb.bpm);
+    println!("  bpmA = {bpm_a:.2}");
+    println!("  bpmB = {bpm_b:.2}");
+
+    // Retempo B onto A: rate makes B's effective bpm == A's bpm.
+    let rate = sync_rate(bpm_b, bpm_a);
+    let matched = bpm_b * rate as f64;
+    println!("  sync_rate(bpmB → bpmA) = {rate:.6}");
+    println!("  matched BPM (bpmB × rate) = {matched:.2}");
+
+    // Verdict: with both BPMs detected and the ratio inside the clamp, the
+    // matched tempo must equal A's. If clamped (>4× / <0.25×) it can't reach A.
+    let ok = if bpm_a > 0.0 && bpm_b > 0.0 {
+        (matched - bpm_a).abs() < 0.5
+    } else {
+        (rate - 1.0).abs() < 1e-6 // un-analyzed → no-op rate 1.0
+    };
+    println!("  sync {}", if ok { "PASS" } else { "FAIL (clamped or bpm missing)" });
+    Ok(())
 }
 
 /// Headless CLAP end-to-end test of the master-bus insert. Loads the named

@@ -48,6 +48,9 @@ struct App {
     file_rx: [Option<Receiver<Option<PathBuf>>>; 2],
     /// Per-deck gain (pre-crossfader).
     deck_gain: [f32; 2],
+    /// Per-deck playback rate (1.0 = original). Mirrors `engine.rate(d)`; the
+    /// tempo slider writes it and SYNC reads the engine back into it each frame.
+    deck_rate: [f32; 2],
     /// Crossfader: 0.0 = full deck A, 1.0 = full deck B. Drives audio AND the
     /// video composite blend.
     crossfade: f32,
@@ -106,6 +109,7 @@ impl App {
             image_rx: [None, None],
             cameras: CameraDeck::list_cameras(),
             deck_gain: [1.0, 1.0],
+            deck_rate: [1.0, 1.0],
             crossfade: 0.5,
             mic_gain: 1.0,
             aux_gain: 1.0,
@@ -437,6 +441,48 @@ impl App {
                 .changed()
             {
                 self.engine.set_deck_gain(d, self.deck_gain[d]);
+            }
+        });
+
+        // TEMPO row: a ±8% variable-rate (vinyl) fader, an effective-BPM readout,
+        // a reset-to-1.00 affordance, and SYNC (match the other deck's tempo).
+        // Mirror the engine's rate first so SYNC's new value shows on the slider.
+        self.deck_rate[d] = self.engine.rate(d);
+        ui.horizontal(|ui| {
+            ui.label("tempo");
+            // ±8% beatmatch range. Pitch shift over this span is negligible
+            // (keylock is a deferred M6.x); the slider is the audible vinyl pull.
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.deck_rate[d], 0.92..=1.08)
+                        .show_value(false),
+                )
+                .changed()
+            {
+                self.engine.set_rate(d, self.deck_rate[d]);
+            }
+            // ⟲ snaps the rate back to exactly 1.00 (also double-click the slider).
+            if ui.small_button("⟲").on_hover_text("reset to 1.00×").clicked() {
+                self.deck_rate[d] = 1.0;
+                self.engine.set_rate(d, 1.0);
+            }
+            // Effective BPM = detected grid bpm × the live rate, so the readout
+            // shows where the track actually beats right now.
+            let eff = self.engine.bpm(d) * self.deck_rate[d] as f64;
+            if eff > 0.0 {
+                ui.monospace(format!("{eff:6.2}"));
+            } else {
+                ui.monospace(format!("{:.3}×", self.deck_rate[d]));
+            }
+            // ⇄ SYNC: match this deck's effective tempo to the OTHER deck's.
+            if ui
+                .button("⇄ SYNC")
+                .on_hover_text("match the other deck's tempo")
+                .clicked()
+            {
+                self.engine.sync_deck(d, 1 - d);
+                // Reflect the engine's new rate immediately on this slider.
+                self.deck_rate[d] = self.engine.rate(d);
             }
         });
 

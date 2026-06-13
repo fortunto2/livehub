@@ -14,7 +14,7 @@ use atomic_float::AtomicF32;
 use core::f32::consts::FRAC_PI_2;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use livehub_core::OutputRouting;
@@ -29,15 +29,28 @@ use crate::track::TrackBuf;
 /// this many frames so the plugin's activated `max_frames` is never exceeded.
 const MAX_FX_BLOCK: usize = 2048;
 
+/// Playback-rate clamp (two octaves either way). The ±8% beatmatch range sits
+/// well inside this; the bound just keeps interpolation + the playhead advance
+/// sane against a wild value.
+const MIN_RATE: f32 = 0.25;
+const MAX_RATE: f32 = 4.0;
+
 /// One independent deck: its own track, playhead, seek state, play flag and gain.
 struct Deck {
     track: ArcSwapOption<TrackBuf>,
-    pos: AtomicUsize,        // current deck frame, advanced by the audio thread
+    /// FRACTIONAL deck frame (f64 bits in an AtomicU64), advanced by the audio
+    /// thread by `rate` per output frame. Fractional so variable-rate (vinyl)
+    /// playback reads between sample frames by linear interpolation. Store via
+    /// `f64::to_bits`, read via `f64::from_bits`. `playhead_secs = posf / sr`.
+    pos: AtomicU64,
     seek_to: AtomicI64,      // UI-requested target frame, or -1
     seek_epoch: AtomicU64,   // bumped on every discontinuous jump (seek / load)
     playing: AtomicBool,
     loading: AtomicBool,     // a background decode is in flight
     gain: AtomicF32,
+    /// Playback rate: 1.0 = original speed/pitch, >1 = faster+higher (vinyl-style,
+    /// NOT pitch-preserving). One Relaxed load per deck per block.
+    rate: AtomicF32,
     loop_start: AtomicI64,   // beat-loop start frame, or -1 (no loop)
     loop_end: AtomicI64,     // beat-loop end frame (exclusive), or -1 (no loop)
     cue: AtomicBool,         // headphone CUE / PFL engaged for this deck
@@ -47,12 +60,13 @@ impl Deck {
     fn new() -> Self {
         Deck {
             track: ArcSwapOption::empty(),
-            pos: AtomicUsize::new(0),
+            pos: AtomicU64::new(0.0f64.to_bits()),
             seek_to: AtomicI64::new(-1),
             seek_epoch: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             loading: AtomicBool::new(false),
             gain: AtomicF32::new(1.0),
+            rate: AtomicF32::new(1.0),
             loop_start: AtomicI64::new(-1),
             loop_end: AtomicI64::new(-1),
             cue: AtomicBool::new(false),
@@ -163,9 +177,12 @@ fn build_output_stream(
                 // snapshot the track Arc / playhead / play flag / gain ONCE.
                 // Fixed [_; 2] stack arrays only — no heap, no lock.
                 let tracks = [sh.decks[0].track.load(), sh.decks[1].track.load()];
-                let mut p = [0usize; 2];
+                // FRACTIONAL in-block playhead (f64), advanced by `rate` per frame.
+                let mut p = [0.0f64; 2];
                 let mut playing = [false; 2];
                 let mut dg = [0.0f32; 2];
+                // Per-deck playback rate (1.0 = original), snapshotted once/block.
+                let mut rate = [1.0f64; 2];
                 // Per-deck headphone CUE / PFL flag, snapshotted once per block.
                 let mut cue = [false; 2];
                 // Per-deck beat-loop region (frames); -1 = no loop. Snapshotted
@@ -178,11 +195,13 @@ fn build_output_stream(
                 for d in 0..2 {
                     let s = sh.decks[d].seek_to.swap(-1, Ordering::AcqRel);
                     if s >= 0 {
-                        sh.decks[d].pos.store(s as usize, Ordering::Relaxed);
+                        // Seek lands on an integer frame, stored as fractional bits.
+                        sh.decks[d].pos.store((s as f64).to_bits(), Ordering::Relaxed);
                     }
-                    p[d] = sh.decks[d].pos.load(Ordering::Relaxed);
+                    p[d] = f64::from_bits(sh.decks[d].pos.load(Ordering::Relaxed));
                     playing[d] = sh.decks[d].playing.load(Ordering::Relaxed);
                     dg[d] = sh.decks[d].gain.load(Ordering::Relaxed);
+                    rate[d] = sh.decks[d].rate.load(Ordering::Relaxed) as f64;
                     lstart[d] = sh.decks[d].loop_start.load(Ordering::Relaxed);
                     lend[d] = sh.decks[d].loop_end.load(Ordering::Relaxed);
                     cue[d] = sh.decks[d].cue.load(Ordering::Relaxed);
@@ -242,9 +261,26 @@ fn build_output_stream(
                         for d in 0..2 {
                             if playing[d] {
                                 if let Some(t) = tracks[d].as_ref() {
-                                    if let (Some(&a), Some(&b)) =
-                                        (t.samples.get(p[d] * 2), t.samples.get(p[d] * 2 + 1))
-                                    {
+                                    // Variable-rate read: floor the fractional
+                                    // playhead to the frame index, interpolate
+                                    // linearly toward the NEXT frame by `frac`.
+                                    // Both taps go through the bounds-guarded
+                                    // `samples.get(..)`; out-of-range → 0.0, so
+                                    // end-of-track is silent (the deck contributes
+                                    // nothing once it runs off the buffer).
+                                    let i0 = p[d].floor();
+                                    let frac = (p[d] - i0) as f32;
+                                    let i = i0 as usize;
+                                    let g = |k: usize| t.samples.get(k).copied().unwrap_or(0.0);
+                                    // Only mix while the current frame exists; past
+                                    // the end both `get`s miss → silence + no advance.
+                                    if i0 >= 0.0 && i * 2 + 1 < t.samples.len() {
+                                        let a0 = g(i * 2);
+                                        let a1 = g(i * 2 + 2);
+                                        let b0 = g(i * 2 + 1);
+                                        let b1 = g(i * 2 + 3);
+                                        let a = a0 + (a1 - a0) * frac;
+                                        let b = b0 + (b1 - b0) * frac;
                                         let w = dg[d] * xw[d];
                                         dl += a * w;
                                         dr += b * w;
@@ -253,14 +289,17 @@ fn build_output_stream(
                                             cl += a * dg[d];
                                             cr += b * dg[d];
                                         }
-                                        p[d] += 1;
+                                        // Advance by the deck's rate (fractional).
+                                        p[d] += rate[d];
                                         // Beat-loop wrap: a valid loop is ls>=0 &&
                                         // le>ls; on reaching the end, snap back to
-                                        // start. Flag the wrap so we bump the epoch
+                                        // start, preserving the fractional overshoot
+                                        // for sample-accurate looping at non-unit
+                                        // rates. Flag the wrap so we bump the epoch
                                         // once per block (not per sample).
                                         let (ls, le) = (lstart[d], lend[d]);
-                                        if ls >= 0 && le > ls && p[d] as i64 >= le {
-                                            p[d] = ls as usize;
+                                        if ls >= 0 && le > ls && p[d] >= le as f64 {
+                                            p[d] = ls as f64 + (p[d] - le as f64);
                                             wrapped[d] = true;
                                         }
                                     }
@@ -311,7 +350,7 @@ fn build_output_stream(
                 }
 
                 for (deck, &pd) in sh.decks.iter().zip(p.iter()) {
-                    deck.pos.store(pd, Ordering::Relaxed);
+                    deck.pos.store(pd.to_bits(), Ordering::Relaxed);
                 }
                 // One epoch bump per deck that looped this block, so the video
                 // worker re-seeks and the picture loops with the audio.
@@ -360,9 +399,11 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Current audio playhead of this deck, in seconds.
+    /// Current audio playhead of this deck, in seconds. `pos` is the fractional
+    /// frame (f64 bits); content time is unchanged by the playback rate, so the
+    /// video paced to this follows variable-rate playback automatically.
     pub fn playhead_secs(&self) -> f64 {
-        self.shared.decks[self.deck].pos.load(Ordering::Relaxed) as f64
+        f64::from_bits(self.shared.decks[self.deck].pos.load(Ordering::Relaxed))
             / self.shared.device_sr as f64
     }
     pub fn is_playing(&self) -> bool {
@@ -548,7 +589,7 @@ impl Engine {
         let d = &self.shared.decks[deck_idx(deck)];
         let track = decode_track(path, self.shared.device_sr)?;
         let secs = track.duration_secs();
-        d.pos.store(0, Ordering::Relaxed);
+        d.pos.store(0.0f64.to_bits(), Ordering::Relaxed);
         d.seek_to.store(-1, Ordering::Relaxed);
         d.seek_epoch.fetch_add(1, Ordering::Release);
         d.track.store(Some(Arc::new(track)));
@@ -568,7 +609,7 @@ impl Engine {
             match decode_track(&path, shared.device_sr) {
                 Ok(track) => {
                     d.playing.store(false, Ordering::Relaxed);
-                    d.pos.store(0, Ordering::Relaxed);
+                    d.pos.store(0.0f64.to_bits(), Ordering::Relaxed);
                     d.seek_to.store(-1, Ordering::Relaxed);
                     d.seek_epoch.fetch_add(1, Ordering::Release);
                     d.track.store(Some(Arc::new(track)));
@@ -606,6 +647,34 @@ impl Engine {
     }
     pub fn set_deck_gain(&self, deck: usize, g: f32) {
         self.shared.decks[deck_idx(deck)].gain.store(g, Ordering::Relaxed);
+    }
+    /// Set `deck`'s playback rate (1.0 = original speed/pitch). >1 plays faster +
+    /// higher (vinyl-style, NOT pitch-preserving), <1 slower + lower. Clamped to
+    /// `0.25..=4.0` (two octaves either way) to keep interpolation sane and the
+    /// playhead advance bounded. The ±8% beatmatch range lives well inside this.
+    pub fn set_rate(&self, deck: usize, rate: f32) {
+        let r = rate.clamp(MIN_RATE, MAX_RATE);
+        self.shared.decks[deck_idx(deck)].rate.store(r, Ordering::Relaxed);
+    }
+    /// `deck`'s current playback rate (1.0 = original).
+    pub fn rate(&self, deck: usize) -> f32 {
+        self.shared.decks[deck_idx(deck)].rate.load(Ordering::Relaxed)
+    }
+    /// SYNC: set `deck`'s rate so its EFFECTIVE bpm (`track_bpm * rate`) matches
+    /// the OTHER deck's effective bpm. No-op if either deck's detected bpm is
+    /// `<= 0` (an un-analyzed track can't be matched). The new rate is clamped to
+    /// `0.25..=4.0`. After this, both decks beat at the same tempo (their phase
+    /// still has to be nudged by a seek — sync handles tempo, not downbeat align).
+    pub fn sync_deck(&self, deck: usize, to: usize) {
+        let me = deck_idx(deck);
+        let other = deck_idx(to);
+        let my_bpm = self.bpm(me);
+        let other_bpm = self.bpm(other);
+        let other_rate = self.rate(other) as f64;
+        // Target = the OTHER deck's *effective* tempo (its grid bpm × its rate).
+        let target = other_bpm * other_rate;
+        let r = sync_rate(my_bpm, target);
+        self.shared.decks[me].rate.store(r, Ordering::Relaxed);
     }
     /// Toggle headphone CUE / PFL (pre-fader listen) on `deck`. A cued deck's raw
     /// stereo (its deck gain, but pre-crossfade and pre-master-FX) is summed onto
@@ -666,7 +735,7 @@ impl Engine {
         self.shared.aux.is_some()
     }
     pub fn playhead_secs(&self, deck: usize) -> f64 {
-        self.shared.decks[deck_idx(deck)].pos.load(Ordering::Relaxed) as f64
+        f64::from_bits(self.shared.decks[deck_idx(deck)].pos.load(Ordering::Relaxed))
             / self.shared.device_sr as f64
     }
     pub fn duration_secs(&self, deck: usize) -> f64 {
@@ -701,5 +770,59 @@ impl Engine {
     }
     pub fn underruns(&self) -> u64 {
         self.shared.underruns.load(Ordering::Relaxed)
+    }
+}
+
+/// Pure beatmatch helper: the playback rate that makes a track at `my_bpm` play
+/// at `target_bpm` (`target / my`), clamped to `0.25..=4.0`. Returns `1.0` if
+/// either bpm is `<= 0` (an un-analyzed track can't be matched). No side effects,
+/// no atomics — shared between [`Engine::sync_deck`] and the `selftest-sync` CLI
+/// so the sync math is verifiable headlessly.
+pub fn sync_rate(my_bpm: f64, target_bpm: f64) -> f32 {
+    if my_bpm <= 0.0 || target_bpm <= 0.0 {
+        return 1.0;
+    }
+    ((target_bpm / my_bpm) as f32).clamp(MIN_RATE, MAX_RATE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_rate_speeds_up_slower_track() {
+        // A 120-BPM track matched to a 128-BPM target speeds up by 128/120.
+        let r = sync_rate(120.0, 128.0);
+        assert!((r - (128.0 / 120.0)) < 1e-6 && (r - (128.0 / 120.0)) > -1e-6);
+        assert!(r > 1.0, "matching to a faster target must speed up");
+    }
+
+    #[test]
+    fn sync_rate_slows_down_faster_track() {
+        // A 140-BPM track matched to a 120-BPM target slows to 120/140 < 1.
+        let r = sync_rate(140.0, 120.0);
+        assert!((r - (120.0 / 140.0_f32)).abs() < 1e-6);
+        assert!(r < 1.0);
+    }
+
+    #[test]
+    fn sync_rate_identity_when_equal() {
+        assert!((sync_rate(124.0, 124.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_rate_zero_or_negative_bpm_is_noop() {
+        assert_eq!(sync_rate(0.0, 128.0), 1.0);
+        assert_eq!(sync_rate(120.0, 0.0), 1.0);
+        assert_eq!(sync_rate(-5.0, 128.0), 1.0);
+        assert_eq!(sync_rate(120.0, -1.0), 1.0);
+    }
+
+    #[test]
+    fn sync_rate_clamps_extremes() {
+        // 60 → 600 would be 10×, clamped to MAX_RATE.
+        assert_eq!(sync_rate(60.0, 600.0), MAX_RATE);
+        // 600 → 60 would be 0.1×, clamped to MIN_RATE.
+        assert_eq!(sync_rate(600.0, 60.0), MIN_RATE);
     }
 }
