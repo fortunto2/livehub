@@ -455,7 +455,7 @@ impl App {
     /// trailing `add_space` the layout below it expects.
     fn video_composite(&self, ui: &mut egui::Ui) {
         let aspect = self.canvas_mode.aspect(&self.video_tex);
-        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, aspect, Some(300.0));
+        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, aspect, Some(210.0));
         ui.add_space(8.0);
     }
 
@@ -1117,6 +1117,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+          egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
             self.top_bar(ui);
             ui.add_space(6.0);
@@ -1164,27 +1165,38 @@ impl eframe::App for App {
                 );
             });
 
+            ui.add_space(6.0);
+
+            // 5. CROSSFADER — full width, framed + big A/B so it reads as THE mix
+            // control. Drag it: blends both the audio AND the video composite.
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_gray(20))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            DECK_COLOR[0],
+                            egui::RichText::new("◀ A").strong().size(18.0),
+                        );
+                        let xfade =
+                            egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(false);
+                        let avail = ui.available_width() - 48.0;
+                        ui.spacing_mut().slider_width = avail.max(80.0);
+                        if ui.add(xfade).changed() {
+                            self.engine.set_crossfade(self.crossfade);
+                        }
+                        ui.colored_label(
+                            DECK_COLOR[1],
+                            egui::RichText::new("B ▶").strong().size(18.0),
+                        );
+                    });
+                });
+
             ui.add_space(8.0);
 
-            // 5. CROSSFADER — full width, prominent, below the columns.
-            ui.horizontal(|ui| {
-                ui.colored_label(DECK_COLOR[0], egui::RichText::new("A").strong());
-                let xfade = egui::Slider::new(&mut self.crossfade, 0.0..=1.0)
-                    .show_value(false);
-                let avail = ui.available_width() - 24.0;
-                ui.spacing_mut().slider_width = avail.max(80.0);
-                if ui.add(xfade).changed() {
-                    self.engine.set_crossfade(self.crossfade);
-                }
-                ui.colored_label(DECK_COLOR[1], egui::RichText::new("B").strong());
-            });
-
-            ui.add_space(8.0);
-
-            // 6. ADVANCED DRAWER — collapsed during a set: Master FX, URL import,
-            // mic/aux gains, Ableton Link, and the device/underruns label.
-            egui::CollapsingHeader::new("⚙ Advanced")
-                .default_open(false)
+            // 6. ADVANCED — open by default so nothing looks "removed"; collapse it
+            // for a clean set view. Holds Master FX, URL import, mic/aux, Link.
+            egui::CollapsingHeader::new("⚙ Advanced — Master FX · Import · Mic/Aux · Link")
+                .default_open(true)
                 .show(ui, |ui| {
                     self.master_fx_panel(ui);
                     ui.separator();
@@ -1200,6 +1212,7 @@ impl eframe::App for App {
                         self.engine.underruns()
                     ));
                 });
+          });
         });
 
         // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live
