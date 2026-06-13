@@ -14,7 +14,7 @@ use atomic_float::AtomicF32;
 use core::f32::consts::FRAC_PI_2;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use livehub_core::OutputRouting;
@@ -35,6 +35,11 @@ const MAX_FX_BLOCK: usize = 2048;
 const MIN_RATE: f32 = 0.25;
 const MAX_RATE: f32 = 4.0;
 
+/// Declick ramp length (output frames). After a discontinuous jump (seek or beat
+/// loop wrap) the deck fades in linearly over this many samples (~2.7 ms at
+/// 48 kHz) so the jump's edge doesn't pop. Short enough not to soften transients.
+const DECLICK_SAMPLES: u32 = 128;
+
 /// One independent deck: its own track, playhead, seek state, play flag and gain.
 struct Deck {
     track: ArcSwapOption<TrackBuf>,
@@ -54,6 +59,7 @@ struct Deck {
     loop_start: AtomicI64,   // beat-loop start frame, or -1 (no loop)
     loop_end: AtomicI64,     // beat-loop end frame (exclusive), or -1 (no loop)
     cue: AtomicBool,         // headphone CUE / PFL engaged for this deck
+    declick: AtomicU32,      // frames left in the post-jump fade-in (0 = none)
 }
 
 impl Deck {
@@ -70,6 +76,7 @@ impl Deck {
             loop_start: AtomicI64::new(-1),
             loop_end: AtomicI64::new(-1),
             cue: AtomicBool::new(false),
+            declick: AtomicU32::new(0),
         }
     }
 }
@@ -192,11 +199,17 @@ fn build_output_stream(
                 // Set true if a deck's playhead wrapped this block → bump its
                 // seek_epoch ONCE after the block so its video re-seeks too.
                 let mut wrapped = [false; 2];
+                // Per-deck declick fade-in counter (frames left), carried across
+                // blocks via the atomic; a seek/loop-wrap (re)arms it to fade the
+                // jump edge in instead of popping.
+                let mut declick = [0u32; 2];
                 for d in 0..2 {
                     let s = sh.decks[d].seek_to.swap(-1, Ordering::AcqRel);
+                    declick[d] = sh.decks[d].declick.load(Ordering::Relaxed);
                     if s >= 0 {
                         // Seek lands on an integer frame, stored as fractional bits.
                         sh.decks[d].pos.store((s as f64).to_bits(), Ordering::Relaxed);
+                        declick[d] = DECLICK_SAMPLES; // fade the jump in, no pop.
                     }
                     p[d] = f64::from_bits(sh.decks[d].pos.load(Ordering::Relaxed));
                     playing[d] = sh.decks[d].playing.load(Ordering::Relaxed);
@@ -279,8 +292,19 @@ fn build_output_stream(
                                         let a1 = g(i * 2 + 2);
                                         let b0 = g(i * 2 + 1);
                                         let b1 = g(i * 2 + 3);
-                                        let a = a0 + (a1 - a0) * frac;
-                                        let b = b0 + (b1 - b0) * frac;
+                                        // Post-jump declick: linear fade-in 0→1 over
+                                        // DECLICK_SAMPLES frames so a seek/wrap edge
+                                        // doesn't pop. 1.0 once the counter drains.
+                                        let ramp = if declick[d] > 0 {
+                                            let r = 1.0
+                                                - declick[d] as f32 / DECLICK_SAMPLES as f32;
+                                            declick[d] -= 1;
+                                            r
+                                        } else {
+                                            1.0
+                                        };
+                                        let a = (a0 + (a1 - a0) * frac) * ramp;
+                                        let b = (b0 + (b1 - b0) * frac) * ramp;
                                         let w = dg[d] * xw[d];
                                         dl += a * w;
                                         dr += b * w;
@@ -301,6 +325,7 @@ fn build_output_stream(
                                         if ls >= 0 && le > ls && p[d] >= le as f64 {
                                             p[d] = ls as f64 + (p[d] - le as f64);
                                             wrapped[d] = true;
+                                            declick[d] = DECLICK_SAMPLES; // fade the seam.
                                         }
                                     }
                                 }
@@ -349,8 +374,11 @@ fn build_output_stream(
                     done += chunk;
                 }
 
-                for (deck, &pd) in sh.decks.iter().zip(p.iter()) {
+                for ((deck, &pd), &dc) in
+                    sh.decks.iter().zip(p.iter()).zip(declick.iter())
+                {
                     deck.pos.store(pd.to_bits(), Ordering::Relaxed);
+                    deck.declick.store(dc, Ordering::Relaxed);
                 }
                 // One epoch bump per deck that looped this block, so the video
                 // worker re-seeks and the picture loops with the audio.
