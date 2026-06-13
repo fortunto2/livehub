@@ -808,23 +808,21 @@ impl App {
         });
         ui.add_space(4.0);
 
-        // Two vertical gain faders side by side, each with its deck's cue toggle.
-        // The vertical slider's LENGTH is `spacing.slider_width`, so set it here.
+        // Two vertical gain faders side by side. add_sized gives each an EXPLICIT
+        // interactive rect (34×fader_h) — the old `slider_width` spacing trick left
+        // the vertical sliders un-draggable. Gain pushed every frame + shown.
         ui.horizontal(|ui| {
-            ui.spacing_mut().slider_width = fader_h;
             for (d, &accent) in DECK_COLOR.iter().enumerate() {
-                ui.vertical_centered(|ui| {
+                ui.vertical(|ui| {
                     ui.colored_label(accent, if d == 0 { "A" } else { "B" });
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut self.deck_gain[d], 0.0..=1.5)
-                                .vertical()
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
-                        self.engine.set_deck_gain(d, self.deck_gain[d]);
-                    }
+                    ui.add_sized(
+                        [34.0, fader_h],
+                        egui::Slider::new(&mut self.deck_gain[d], 0.0..=1.5)
+                            .vertical()
+                            .show_value(false),
+                    );
+                    self.engine.set_deck_gain(d, self.deck_gain[d]); // push every frame
+                    ui.label(egui::RichText::new(format!("{:.2}", self.deck_gain[d])).small());
                     // 🎧 cue toggle (pre-fader headphone listen) under the fader.
                     let mut cued = self.engine.is_cued(d);
                     if ui
@@ -836,20 +834,19 @@ impl App {
                     }
                 });
                 if d == 0 {
-                    ui.add_space(8.0);
+                    ui.add_space(20.0);
                 }
             }
         });
 
-        ui.add_space(6.0);
-        // Shared headphone CUE bus level (full-width within the narrow column).
+        ui.add_space(8.0);
+        // Shared headphone CUE bus level.
         ui.label("cue");
-        if ui
-            .add(egui::Slider::new(&mut self.cue_gain, 0.0..=1.5).show_value(false))
-            .changed()
-        {
-            self.engine.set_cue_gain(self.cue_gain);
-        }
+        ui.add_sized(
+            [MIXER_W - 12.0, 18.0],
+            egui::Slider::new(&mut self.cue_gain, 0.0..=1.5).show_value(false),
+        );
+        self.engine.set_cue_gain(self.cue_gain);
     }
 
     /// Engage a `k`-beat loop on `deck` (the loop buttons pass `k` as beats; the
