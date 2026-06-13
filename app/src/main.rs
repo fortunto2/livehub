@@ -17,10 +17,13 @@ struct Cli {
     /// to mix other apps' audio in via BlackHole. Off by default.
     #[arg(long)]
     aux: Option<String>,
-    /// Auto-load this media file into the deck on GUI launch.
+    /// Auto-load this media file into deck A on GUI launch.
     #[arg(long)]
     open: Option<std::path::PathBuf>,
-    /// Start playing immediately after the auto-loaded file finishes decoding.
+    /// Auto-load this media file into deck B on GUI launch.
+    #[arg(long)]
+    open_b: Option<std::path::PathBuf>,
+    /// Start playing immediately after the auto-loaded file(s) finish decoding.
     #[arg(long)]
     play: bool,
     /// With no subcommand, launch the GUI.
@@ -91,7 +94,13 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        None => gui::run(&cli.device, parse_aux(cli.aux.as_deref()), cli.open, cli.play),
+        None => gui::run(
+            &cli.device,
+            parse_aux(cli.aux.as_deref()),
+            cli.open,
+            cli.open_b,
+            cli.play,
+        ),
         Some(Cmd::ListDevices) => livehub_engine::list_devices(),
         Some(Cmd::Passthrough { device, mic_ch, master_l, master_r }) => {
             livehub_engine::run_passthrough(&device, mic_ch, master_l, master_r)
@@ -148,17 +157,17 @@ fn play(device: &str, file: &str, looped: bool) -> Result<()> {
 
     let eng = livehub_engine::Engine::new(device, livehub_core::OutputRouting::default(), None)?;
     eprintln!("decoding '{file}' … (mic is already live)");
-    let secs = eng.load_track(std::path::Path::new(file))?;
+    let secs = eng.load_track(0, std::path::Path::new(file))?;
     eprintln!("loaded ({secs:.1}s) — deck + live mic; Ctrl-C to stop");
-    eng.play();
+    eng.play(0);
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        let ph = eng.playhead_secs();
+        let ph = eng.playhead_secs(0);
         eprint!("\r{ph:6.1} / {secs:6.1} s   ");
         let _ = std::io::stderr().flush();
         if ph >= secs - 0.05 {
             if looped {
-                eng.seek_secs(0.0);
+                eng.seek_secs(0, 0.0);
             } else {
                 break;
             }

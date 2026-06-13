@@ -1,6 +1,7 @@
-//! M1b egui transport — the first window. Load a file (decoded on a worker so
-//! the UI never blocks), play/pause, scrub a seek slider bound to the atomic
-//! playhead, and trim deck/mic gain. Waveform + beat ticks arrive in M2.5.
+//! M4 egui transport — TWO independent decks (A/B), each with its own audio
+//! playhead + video, an equal-power crossfader between them, and a video
+//! composite (deck A under deck B, blended by the crossfader). Mic, aux and
+//! Ableton Link stay shared. Files decode on a worker so the UI never blocks.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -16,18 +17,19 @@ pub fn run(
     device: &str,
     aux: Option<(usize, usize)>,
     open: Option<PathBuf>,
+    open_b: Option<PathBuf>,
     autoplay: bool,
 ) -> anyhow::Result<()> {
     let engine = Engine::new(device, OutputRouting::default(), aux)?;
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 820.0]),
         ..Default::default()
     };
     eframe::run_native(
         "livehub",
         options,
         Box::new(move |_cc| -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(Box::new(App::new(engine, open, autoplay)))
+            Ok(Box::new(App::new(engine, open, open_b, autoplay)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
@@ -36,22 +38,26 @@ pub fn run(
 struct App {
     engine: Engine,
     link: LinkHub,
-    /// Pending native file-dialog result (dialog runs on its own thread).
-    file_rx: Option<Receiver<Option<PathBuf>>>,
-    deck_gain: f32,
+    /// Per-deck pending native file-dialog result (dialog runs on its own thread).
+    file_rx: [Option<Receiver<Option<PathBuf>>>; 2],
+    /// Per-deck gain (pre-crossfader).
+    deck_gain: [f32; 2],
+    /// Crossfader: 0.0 = full deck A, 1.0 = full deck B. Drives audio AND the
+    /// video composite blend.
+    crossfade: f32,
     mic_gain: f32,
     aux_gain: f32,
-    /// The video deck whose displayed frame = f(audio playhead). `None` until a
-    /// file with a video stream is loaded.
-    video: Option<VideoDeck>,
-    /// GPU texture reused across frames; re-`set` only when the deck's frame
-    /// generation changes (no realloc, no leak).
-    video_tex: Option<egui::TextureHandle>,
-    /// Last frame generation uploaded to `video_tex`.
-    last_gen: u64,
-    /// File to auto-load on the first frame (from `--open`).
-    pending_open: Option<PathBuf>,
-    /// Start playback once the auto-loaded file has decoded (`--play`).
+    /// Per-deck video deck; frame = f(that deck's audio playhead). `None` until a
+    /// file with a video stream is loaded into that deck.
+    video: [Option<VideoDeck>; 2],
+    /// Per-deck GPU texture reused across frames; re-`set` only when the deck's
+    /// frame generation changes (no realloc, no leak).
+    video_tex: [Option<egui::TextureHandle>; 2],
+    /// Last frame generation uploaded to each `video_tex`.
+    last_gen: [u64; 2],
+    /// Files to auto-load on the first frame (from `--open` / `--open-b`).
+    pending_open: [Option<PathBuf>; 2],
+    /// Start playback once the auto-loaded files have decoded (`--play`).
     autoplay_pending: bool,
     // GUI render-time instrumentation (logged to spot repaint hitches).
     gui_frames: u64,
@@ -60,18 +66,24 @@ struct App {
 }
 
 impl App {
-    fn new(engine: Engine, open: Option<PathBuf>, autoplay: bool) -> Self {
+    fn new(
+        engine: Engine,
+        open: Option<PathBuf>,
+        open_b: Option<PathBuf>,
+        autoplay: bool,
+    ) -> Self {
         Self {
             engine,
             link: LinkHub::new(120.0),
-            file_rx: None,
-            deck_gain: 1.0,
+            file_rx: [None, None],
+            deck_gain: [1.0, 1.0],
+            crossfade: 0.5,
             mic_gain: 1.0,
             aux_gain: 1.0,
-            video: None,
-            video_tex: None,
-            last_gen: 0,
-            pending_open: open,
+            video: [None, None],
+            video_tex: [None, None],
+            last_gen: [0, 0],
+            pending_open: [open, open_b],
             autoplay_pending: autoplay,
             gui_frames: 0,
             gui_slow: 0,
@@ -79,7 +91,7 @@ impl App {
         }
     }
 
-    fn open_file_dialog(&mut self) {
+    fn open_file_dialog(&mut self, deck: usize) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let picked = rfd::FileDialog::new()
@@ -88,18 +100,136 @@ impl App {
                 .pick_file();
             let _ = tx.send(picked);
         });
-        self.file_rx = Some(rx);
+        self.file_rx[deck] = Some(rx);
     }
 
-    /// Load `path` into the engine (its AUDIO drives the playhead) and, if it has
-    /// a video stream, spin up a `VideoDeck` whose worker paces frames to that
-    /// playhead. Dropping the old deck first stops its worker (kills ffmpeg).
-    fn load_path(&mut self, path: PathBuf) {
-        self.video = None; // drop old deck → joins worker, kills its ffmpeg.
-        self.video_tex = None;
-        self.last_gen = 0;
-        self.video = VideoDeck::open(path.clone(), self.engine.transport());
-        self.engine.load_track_background(path);
+    /// Load `path` into `deck` (its AUDIO drives that deck's playhead) and, if it
+    /// has a video stream, spin up a `VideoDeck` whose worker paces frames to that
+    /// deck's playhead. Dropping the old deck first stops its worker (kills
+    /// ffmpeg).
+    fn load_path(&mut self, deck: usize, path: PathBuf) {
+        self.video[deck] = None; // drop old deck → joins worker, kills its ffmpeg.
+        self.video_tex[deck] = None;
+        self.last_gen[deck] = 0;
+        self.video[deck] = VideoDeck::open(path.clone(), self.engine.transport(deck));
+        self.engine.load_track_background(deck, path);
+    }
+
+    /// Draw the A-over-B video composite into one fixed letterbox rect: deck A
+    /// underneath, deck B on top, each tinted so the crossfader (`self.crossfade`)
+    /// is a true alpha dissolve (A at `1-x`, B at `x`) — no double-bright midpoint.
+    fn video_composite(&self, ui: &mut egui::Ui) {
+        const MAX_H: f32 = 300.0;
+        // Pick a composite size from whichever deck has a texture (fall back 16:9).
+        let aspect = self
+            .video_tex
+            .iter()
+            .flatten()
+            .find_map(|t| {
+                let [w, h] = t.size();
+                (w > 0 && h > 0).then(|| w as f32 / h as f32)
+            })
+            .unwrap_or(16.0 / 9.0);
+        let avail_w = ui.available_width();
+        let (mut cw, mut ch) = (avail_w, avail_w / aspect);
+        if ch > MAX_H {
+            ch = MAX_H;
+            cw = MAX_H * aspect;
+        }
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail_w, ch), egui::Sense::hover());
+        // Center the letterboxed composite within the allocated row.
+        let composite =
+            Rect::from_center_size(rect.center(), egui::vec2(cw.min(avail_w), ch));
+
+        let xb = self.crossfade.clamp(0.0, 1.0);
+        let a_alpha = ((1.0 - xb) * 255.0) as u8;
+        let b_alpha = (xb * 255.0) as u8;
+        if let Some(tex) = &self.video_tex[0] {
+            egui::Image::new((tex.id(), composite.size()))
+                .tint(Color32::from_white_alpha(a_alpha))
+                .paint_at(ui, composite);
+        }
+        if let Some(tex) = &self.video_tex[1] {
+            egui::Image::new((tex.id(), composite.size()))
+                .tint(Color32::from_white_alpha(b_alpha))
+                .paint_at(ui, composite);
+        }
+        ui.add_space(8.0);
+    }
+
+    /// Draw one deck's controls (Load / Play, waveform+beats, BPM, seek, gain,
+    /// video sync) into `ui`, driving the deck-indexed engine methods.
+    fn deck_panel(&mut self, ui: &mut egui::Ui, d: usize) {
+        let dur = self.engine.duration_secs(d);
+        let loading = self.engine.is_loading(d);
+
+        ui.horizontal(|ui| {
+            ui.strong(if d == 0 { "Deck A" } else { "Deck B" });
+            if ui.button("📂 Load").clicked() && self.file_rx[d].is_none() {
+                self.open_file_dialog(d);
+            }
+            let label = if self.engine.is_playing(d) { "⏸" } else { "▶" };
+            if ui.button(label).clicked() {
+                self.engine.toggle(d);
+            }
+            if loading {
+                ui.spinner();
+            }
+        });
+
+        // Waveform strip + beat ticks + playhead. One cheap Arc clone per frame;
+        // click the strip to seek this deck.
+        let track = self.engine.current_track(d);
+        let playhead = self.engine.playhead_secs(d);
+        if let Some(seek) = draw_waveform(ui, track.as_deref(), dur, playhead) {
+            self.engine.seek_secs(d, seek);
+        }
+
+        // BPM readout (detected at load time).
+        let bpm = self.engine.bpm(d);
+        if bpm > 0.0 {
+            ui.label(format!("{bpm:.1} BPM"));
+        } else {
+            ui.label("— BPM");
+        }
+
+        // Seek slider follows the playhead; dragging it seeks.
+        let mut ph = self.engine.playhead_secs(d);
+        let resp = ui.add(
+            egui::Slider::new(&mut ph, 0.0..=dur.max(0.001))
+                .show_value(false)
+                .text("position"),
+        );
+        if resp.dragged() || resp.changed() {
+            self.engine.seek_secs(d, ph);
+        }
+        ui.label(format!("{:>6.1} / {:>6.1} s", self.engine.playhead_secs(d), dur));
+
+        ui.horizontal(|ui| {
+            ui.label("gain");
+            if ui
+                .add(egui::Slider::new(&mut self.deck_gain[d], 0.0..=1.5))
+                .changed()
+            {
+                self.engine.set_deck_gain(d, self.deck_gain[d]);
+            }
+        });
+
+        // Video↔audio sync trim: drag until the picture sits on the beat. The
+        // pipeline latency is machine/display specific, so it's a live knob.
+        if let Some(deck) = &self.video[d] {
+            ui.horizontal(|ui| {
+                ui.label("video sync");
+                let mut off = deck.offset_ms();
+                if ui
+                    .add(egui::Slider::new(&mut off, -200..=400).suffix(" ms"))
+                    .changed()
+                {
+                    deck.set_offset_ms(off);
+                }
+            });
+        }
     }
 }
 
@@ -123,132 +253,101 @@ impl eframe::App for App {
             self.gui_maxdt = 0.0;
         }
 
-        // Auto-load a file passed via --open (once, on the first frame).
-        if let Some(path) = self.pending_open.take() {
-            self.load_path(path);
-        }
-
-        // Collect a finished file-dialog pick.
-        if let Some(rx) = &self.file_rx {
-            if let Ok(result) = rx.try_recv() {
-                if let Some(path) = result {
-                    self.load_path(path);
-                }
-                self.file_rx = None;
+        // Auto-load files passed via --open / --open-b (once, on the first frame).
+        for d in 0..2 {
+            if let Some(path) = self.pending_open[d].take() {
+                self.load_path(d, path);
             }
         }
 
-        // Pull the latest video frame into the GPU texture, but only when the
-        // worker reports a new generation (no per-repaint re-upload).
-        if let Some(deck) = &self.video {
-            let gen = deck.generation();
-            if gen != self.last_gen {
-                let img = deck.with_latest(|fr| {
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [fr.width as usize, fr.height as usize],
-                        &fr.rgba,
-                    )
-                });
-                if let Some(img) = img {
-                    match &mut self.video_tex {
-                        Some(h) => h.set(img, egui::TextureOptions::LINEAR),
-                        None => {
-                            self.video_tex = Some(ctx.load_texture(
-                                "video",
-                                img,
-                                egui::TextureOptions::LINEAR,
-                            ));
-                        }
+        // Collect finished file-dialog picks, per deck.
+        for d in 0..2 {
+            if let Some(rx) = &self.file_rx[d] {
+                if let Ok(result) = rx.try_recv() {
+                    if let Some(path) = result {
+                        self.load_path(d, path);
                     }
-                    self.last_gen = gen;
+                    self.file_rx[d] = None;
                 }
             }
         }
 
-        let dur = self.engine.duration_secs();
-        let loading = self.engine.is_loading();
+        // Pull the latest video frame into each deck's GPU texture, but only when
+        // its worker reports a new generation (no per-repaint re-upload).
+        for d in 0..2 {
+            if let Some(deck) = &self.video[d] {
+                let gen = deck.generation();
+                if gen != self.last_gen[d] {
+                    let img = deck.with_latest(|fr| {
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [fr.width as usize, fr.height as usize],
+                            &fr.rgba,
+                        )
+                    });
+                    if let Some(img) = img {
+                        let name = if d == 0 { "video_a" } else { "video_b" };
+                        match &mut self.video_tex[d] {
+                            Some(h) => h.set(img, egui::TextureOptions::LINEAR),
+                            None => {
+                                self.video_tex[d] = Some(ctx.load_texture(
+                                    name,
+                                    img,
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                            }
+                        }
+                        self.last_gen[d] = gen;
+                    }
+                }
+            }
+        }
 
-        // --play: start once the auto-loaded file has finished decoding.
-        if self.autoplay_pending && !loading && dur > 0.0 {
-            self.engine.play();
-            self.autoplay_pending = false;
+        let loading = self.engine.is_loading(0) || self.engine.is_loading(1);
+
+        // --play: start each loaded deck once its file has finished decoding.
+        if self.autoplay_pending && !loading {
+            let mut any = false;
+            for d in 0..2 {
+                if self.engine.duration_secs(d) > 0.0 {
+                    self.engine.play(d);
+                    any = true;
+                }
+            }
+            if any {
+                self.autoplay_pending = false;
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("livehub");
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("📂 Load").clicked() && self.file_rx.is_none() {
-                    self.open_file_dialog();
-                }
-                let playing = self.engine.is_playing();
-                let label = if playing { "⏸ Pause" } else { "▶ Play" };
-                if ui.button(label).clicked() {
-                    self.engine.toggle();
-                }
-                if loading {
-                    ui.spinner();
-                    ui.label("decoding…");
-                }
+            // Video COMPOSITE: deck A under deck B, blended by the crossfader.
+            self.video_composite(ui);
+
+            // Two deck strips side by side.
+            ui.columns(2, |cols| {
+                self.deck_panel(&mut cols[0], 0);
+                self.deck_panel(&mut cols[1], 1);
             });
 
-            ui.add_space(8.0);
-
-            // Video frame (frame = f(audio playhead)). Fit inside avail-width ×
-            // max-height, aspect kept, so a vertical reels clip doesn't blow up
-            // the window. Centered horizontally.
-            if let Some(tex) = &self.video_tex {
-                let [tw, th] = tex.size();
-                if tw > 0 && th > 0 {
-                    const MAX_H: f32 = 300.0;
-                    let avail_w = ui.available_width();
-                    let scale = (avail_w / tw as f32).min(MAX_H / th as f32);
-                    let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
-                    ui.vertical_centered(|ui| ui.image((tex.id(), size)));
-                    ui.add_space(8.0);
-                }
+            ui.add_space(6.0);
+            // The crossfader, full width, between the decks and the shared section.
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.crossfade, 0.0..=1.0)
+                        .show_value(false)
+                        .text("A  ⟷  B"),
+                )
+                .changed()
+            {
+                self.engine.set_crossfade(self.crossfade);
             }
-
-            // Waveform strip + beat ticks + playhead (M2.5). One cheap Arc clone
-            // per frame; click the strip to seek.
-            let track = self.engine.current_track();
-            let playhead = self.engine.playhead_secs();
-            if let Some(seek) = draw_waveform(ui, track.as_deref(), dur, playhead) {
-                self.engine.seek_secs(seek);
-            }
-
-            // BPM readout (detected at load time).
-            let bpm = self.engine.bpm();
-            if bpm > 0.0 {
-                ui.label(format!("{bpm:.1} BPM"));
-            } else {
-                ui.label("— BPM");
-            }
-
-            // Seek slider follows the playhead; dragging it seeks.
-            let mut ph = self.engine.playhead_secs();
-            let resp = ui.add(
-                egui::Slider::new(&mut ph, 0.0..=dur.max(0.001))
-                    .show_value(false)
-                    .text("position"),
-            );
-            if resp.dragged() || resp.changed() {
-                self.engine.seek_secs(ph);
-            }
-            ui.label(format!("{:>6.1} / {:>6.1} s", self.engine.playhead_secs(), dur));
 
             ui.add_space(8.0);
+            ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("deck");
-                if ui
-                    .add(egui::Slider::new(&mut self.deck_gain, 0.0..=1.5))
-                    .changed()
-                {
-                    self.engine.set_deck_gain(self.deck_gain);
-                }
-            });
+            // Shared mic / aux gain.
             ui.horizontal(|ui| {
                 ui.label("mic ");
                 if ui
@@ -266,20 +365,6 @@ impl eframe::App for App {
                         .changed()
                     {
                         self.engine.set_aux_gain(self.aux_gain);
-                    }
-                });
-            }
-            // Video↔audio sync trim: drag until the picture sits on the beat. The
-            // pipeline latency is machine/display specific, so it's a live knob.
-            if let Some(deck) = &self.video {
-                ui.horizontal(|ui| {
-                    ui.label("video sync");
-                    let mut off = deck.offset_ms();
-                    if ui
-                        .add(egui::Slider::new(&mut off, -200..=400).suffix(" ms"))
-                        .changed()
-                    {
-                        deck.set_offset_ms(off);
                     }
                 });
             }
