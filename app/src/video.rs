@@ -410,6 +410,174 @@ impl ImageStill {
 }
 
 // ===========================================================================
+// Beat-reactive visualizer source (M5b-2): no input media — a worker renders a
+// generated picture that PULSES on the deck's beatgrid, driven by the deck's own
+// playhead (a VideoClock) so it stays locked to the audio. For music-only decks.
+// ===========================================================================
+
+const VIS_W: u32 = 480;
+const VIS_H: u32 = 270;
+
+/// Beat-reactive pulse intensity in `0..=1` at content time `t`: `1.0` right on
+/// the most recent beat, decaying exponentially toward the next (window scaled by
+/// `bpm`). Returns `0` before the first beat or with no grid. Pure + tested so the
+/// "react to the beat" behaviour is verified without rendering a pixel.
+pub fn beat_intensity(beats: &[f64], t: f64, bpm: f64) -> f32 {
+    if beats.is_empty() || t < beats[0] {
+        return 0.0;
+    }
+    let i = beats.partition_point(|&b| b <= t).saturating_sub(1);
+    let dt = t - beats[i];
+    let period = if bpm > 0.0 { 60.0 / bpm } else { 0.5 };
+    let tau = (period * 0.25).clamp(0.05, 0.25);
+    (-dt / tau).exp() as f32
+}
+
+/// A generated, beat-locked picture. A worker renders ~30 fps into a [`FrameSlot`]
+/// using the deck's playhead (any [`VideoClock`]) + a snapshot of its beatgrid, so
+/// seeks/loops are reflected automatically (it just re-reads the playhead). Drop
+/// stops + joins the worker.
+pub struct Visualizer {
+    slot: Arc<FrameSlot>,
+    running: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Visualizer {
+    /// Start a visualizer paced by `clock`, reacting to `beats` (seconds) at `bpm`.
+    pub fn open<C: VideoClock>(clock: C, beats: Vec<f64>, bpm: f64) -> Visualizer {
+        let slot = Arc::new(FrameSlot::default());
+        let running = Arc::new(AtomicBool::new(true));
+        let worker = {
+            let slot = slot.clone();
+            let running = running.clone();
+            std::thread::Builder::new()
+                .name("visualizer-worker".into())
+                .spawn(move || visualizer_loop(clock, beats, bpm, slot, running))
+                .ok()
+        };
+        Visualizer { slot, running, worker }
+    }
+
+    /// The shared frame slot the render worker feeds.
+    pub fn slot(&self) -> &Arc<FrameSlot> {
+        &self.slot
+    }
+}
+
+impl Drop for Visualizer {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Render loop: ~30 fps, reading the playhead each frame and publishing a pulse.
+fn visualizer_loop<C: VideoClock>(
+    clock: C,
+    beats: Vec<f64>,
+    bpm: f64,
+    slot: Arc<FrameSlot>,
+    running: Arc<AtomicBool>,
+) {
+    let mut buf = vec![0u8; (VIS_W as usize) * (VIS_H as usize) * 4];
+    while running.load(Ordering::Acquire) {
+        let t = clock.pos_secs();
+        let intensity = beat_intensity(&beats, t, bpm);
+        render_visualizer(&mut buf, t, intensity, &beats);
+        present_frame(&slot, &buf, VIS_W, VIS_H, t);
+        std::thread::sleep(Duration::from_millis(33));
+    }
+}
+
+/// Paint one visualizer frame: a dark vertical-gradient background lifted by the
+/// beat `intensity`, a soft-edged centre disc whose radius tracks `intensity`, and
+/// a hue that advances every beat so each beat flashes a fresh colour.
+fn render_visualizer(buf: &mut [u8], t: f64, intensity: f32, beats: &[f64]) {
+    let (w, h) = (VIS_W as i32, VIS_H as i32);
+    let beat_idx = beats.partition_point(|&b| b <= t);
+    let hue = (beat_idx as f32 * 47.0) % 360.0;
+    let (dr, dg, db) = hsv_to_rgb(hue, 0.7, 0.55 + 0.45 * intensity);
+    let (cx, cy) = (w / 2, h / 2);
+    let r = 28.0 + 100.0 * intensity;
+    let r2 = r * r;
+    for y in 0..h {
+        // Background: dim vertical gradient, brightened by the pulse.
+        let bg = (8.0 + 18.0 * (y as f32 / h as f32) + 26.0 * intensity) as u8;
+        for x in 0..w {
+            let idx = ((y * w + x) as usize) * 4;
+            let (mut pr, mut pg, mut pb) = (bg / 3, bg / 3, bg);
+            let (dx, dy) = ((x - cx) as f32, (y - cy) as f32);
+            let d2 = dx * dx + dy * dy;
+            if d2 < r2 {
+                let edge = 1.0 - d2 / r2; // bright centre → soft rim
+                pr = lerp_u8(pr, dr, edge);
+                pg = lerp_u8(pg, dg, edge);
+                pb = lerp_u8(pb, db, edge);
+            }
+            buf[idx] = pr;
+            buf[idx + 1] = pg;
+            buf[idx + 2] = pb;
+            buf[idx + 3] = 255;
+        }
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, f: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * f.clamp(0.0, 1.0)) as u8
+}
+
+/// Minimal HSV→RGB (h in degrees, s/v in `0..=1`).
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    ((((r + m) * 255.0) as u8), (((g + m) * 255.0) as u8), (((b + m) * 255.0) as u8))
+}
+
+/// Headless visualizer self-test: drive a real [`Visualizer`] with a synthetic
+/// playhead over a track's beatgrid for a moment and report that it renders frames
+/// and that intensity peaks on a beat vs between beats. No GUI, no audio device.
+pub fn selftest_viz(beats: &[f64], bpm: f64) -> String {
+    if beats.len() < 2 {
+        return "  viz : no beat grid".to_string();
+    }
+    // Pure intensity check: on a beat ≈ 1.0, a quarter-beat later clearly less.
+    let period = if bpm > 0.0 { 60.0 / bpm } else { 0.5 };
+    let on = beat_intensity(beats, beats[1], bpm);
+    let between = beat_intensity(beats, beats[1] + period * 0.5, bpm);
+
+    // Live worker check: run against a synthetic clock anchored at beats[1].
+    let start = Instant::now();
+    let clock = SyntheticClock { start, step_s: 0.0 };
+    let viz = Visualizer::open(clock, beats.to_vec(), bpm);
+    std::thread::sleep(Duration::from_millis(150));
+    let gen = viz.slot().generation();
+    let dims = viz.slot().with_latest(|f| (f.width, f.height)).unwrap_or((0, 0));
+    drop(viz);
+
+    let ok = on > 0.95 && between < on * 0.6 && gen > 0 && dims == (VIS_W, VIS_H);
+    format!(
+        "  viz : intensity on-beat {on:.2} vs mid-beat {between:.2}, \
+rendered {gen} frames @ {}x{} — {}",
+        dims.0,
+        dims.1,
+        if ok { "PASS" } else { "FAIL" }
+    )
+}
+
+// ===========================================================================
 // Unified video source (M5b-1): file deck, live camera, or static image — all
 // publish RGBA into a `FrameSlot`, so the GUI's texture-upload + composite code
 // reads every kind through one enum.
@@ -422,6 +590,7 @@ pub enum VideoSource {
     File(VideoDeck),
     Camera(CameraDeck),
     Image(ImageStill),
+    Visualizer(Visualizer),
 }
 
 impl VideoSource {
@@ -431,6 +600,7 @@ impl VideoSource {
             VideoSource::File(d) => d.slot(),
             VideoSource::Camera(c) => c.slot(),
             VideoSource::Image(i) => i.slot(),
+            VideoSource::Visualizer(v) => v.slot(),
         }
     }
 
@@ -462,6 +632,7 @@ impl VideoSource {
             VideoSource::File(_) => "file",
             VideoSource::Camera(_) => "cam",
             VideoSource::Image(_) => "image",
+            VideoSource::Visualizer(_) => "viz",
         }
     }
 }
@@ -1103,5 +1274,39 @@ fn parse_rational(s: &str) -> f64 {
             }
         }
         None => s.trim().parse().unwrap_or(0.0),
+    }
+}
+
+#[cfg(test)]
+mod viz_tests {
+    use super::beat_intensity;
+
+    // Even 120 BPM grid: a beat every 0.5 s.
+    fn grid() -> Vec<f64> {
+        (0..16).map(|n| n as f64 * 0.5).collect()
+    }
+
+    #[test]
+    fn peaks_on_the_beat() {
+        let g = grid();
+        assert!((beat_intensity(&g, 1.0, 120.0) - 1.0).abs() < 1e-3); // exactly on beat 2
+    }
+
+    #[test]
+    fn decays_between_beats() {
+        let g = grid();
+        let on = beat_intensity(&g, 1.0, 120.0);
+        let mid = beat_intensity(&g, 1.25, 120.0); // a quarter beat later
+        let late = beat_intensity(&g, 1.45, 120.0); // nearly the next beat
+        assert!(mid < on);
+        assert!(late < mid);
+        assert!(late >= 0.0);
+    }
+
+    #[test]
+    fn zero_before_first_beat_or_empty() {
+        let g = grid();
+        assert_eq!(beat_intensity(&g, -0.3, 120.0), 0.0);
+        assert_eq!(beat_intensity(&[], 1.0, 120.0), 0.0);
     }
 }

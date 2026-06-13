@@ -104,6 +104,13 @@ enum Cmd {
         /// Image file (png/jpg/webp/…) to load.
         file: String,
     },
+    /// Headless self-test of the beat visualizer: analyze a file's beatgrid, run
+    /// the real render worker against a synthetic playhead, and assert the pulse
+    /// peaks on the beat and frames are produced. For autonomous testing.
+    SelftestViz {
+        /// Media file (its beat grid drives the visualizer) to test.
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -149,6 +156,13 @@ fn main() -> Result<()> {
         Some(Cmd::SelftestImage { file }) => {
             println!("== livehub image test: {file} ==");
             println!("{}", video::selftest_image(std::path::Path::new(&file)));
+            Ok(())
+        }
+        Some(Cmd::SelftestViz { file }) => {
+            println!("== livehub visualizer test: {file} ==");
+            let t = livehub_engine::decode_track(std::path::Path::new(&file), 48_000)?;
+            println!("  grid : bpm={:.1}, {} beats", t.bpm, t.beats.len());
+            println!("{}", video::selftest_viz(&t.beats, t.bpm));
             Ok(())
         }
     }

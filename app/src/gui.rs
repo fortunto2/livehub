@@ -10,7 +10,7 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use livehub_core::OutputRouting;
 use livehub_engine::{Engine, LinkHub, TrackBuf};
 
-use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource};
+use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource, Visualizer};
 
 /// Loop sizes as `(bar-fraction label, beats)`. One bar = 4 beats, so `¼` = 1
 /// beat: short enough for rolls, while reading musically. At 80 BPM these span
@@ -150,6 +150,19 @@ impl App {
         self.video[deck] = ImageStill::open(&path).map(VideoSource::Image);
     }
 
+    /// Switch `deck`'s picture to a beat-reactive visualizer locked to this deck's
+    /// playhead + beatgrid. Needs a decoded track (for the beats); no-op otherwise.
+    fn load_visualizer(&mut self, deck: usize) {
+        let Some(track) = self.engine.current_track(deck) else { return };
+        let (beats, bpm) = (track.beats.clone(), track.bpm);
+        self.reset_video(deck);
+        self.video[deck] = Some(VideoSource::Visualizer(Visualizer::open(
+            self.engine.transport(deck),
+            beats,
+            bpm,
+        )));
+    }
+
     /// Drop the deck's current video source (joins its worker / kills its ffmpeg)
     /// and reset the GPU texture state, ready for a fresh source.
     fn reset_video(&mut self, deck: usize) {
@@ -242,6 +255,17 @@ impl App {
                 && self.image_rx[d].is_none()
             {
                 self.open_image_dialog(d);
+            }
+            // 🌈 = beat-reactive visualizer; needs this deck's beatgrid (a track).
+            if ui
+                .add_enabled(
+                    self.engine.current_track(d).is_some(),
+                    egui::Button::new("🌈"),
+                )
+                .on_hover_text("beat visualizer")
+                .clicked()
+            {
+                self.load_visualizer(d);
             }
             let label = if self.engine.is_playing(d) { "⏸" } else { "▶" };
             if ui.button(label).clicked() {
