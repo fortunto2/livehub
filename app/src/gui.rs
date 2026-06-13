@@ -1117,7 +1117,12 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-          egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+          // drag_to_scroll(false): scroll only via wheel/scrollbar, so dragging a
+          // slider (crossfader, faders) is NOT stolen by the scroll area.
+          egui::ScrollArea::vertical()
+              .auto_shrink([false, false])
+              .drag_to_scroll(false)
+              .show(ui, |ui| {
             // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
             self.top_bar(ui);
             ui.add_space(6.0);
@@ -1177,13 +1182,12 @@ impl eframe::App for App {
                             DECK_COLOR[0],
                             egui::RichText::new("◀ A").strong().size(18.0),
                         );
-                        let xfade =
-                            egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(false);
-                        let avail = ui.available_width() - 48.0;
+                        let avail = ui.available_width() - 56.0;
                         ui.spacing_mut().slider_width = avail.max(80.0);
-                        if ui.add(xfade).changed() {
-                            self.engine.set_crossfade(self.crossfade);
-                        }
+                        ui.add(egui::Slider::new(&mut self.crossfade, 0.0..=1.0).show_value(false));
+                        // Push every frame (cheap atomic) so the mix always tracks
+                        // the slider even if `.changed()` misfires.
+                        self.engine.set_crossfade(self.crossfade);
                         ui.colored_label(
                             DECK_COLOR[1],
                             egui::RichText::new("B ▶").strong().size(18.0),
