@@ -203,10 +203,10 @@ impl App {
             self.engine.seek_secs(d, target);
         }
 
-        // Beat-loop row: engage a loop of N beats from the beat at-or-before the
+        // Bar-loop row: engage a loop of N bars from the downbeat at-or-before the
         // playhead; ✕ clears it. Active size is highlighted.
         ui.horizontal(|ui| {
-            ui.label("loop");
+            ui.label("loop (bars)");
             for n in [1usize, 2, 4, 8, 16] {
                 if ui
                     .selectable_label(self.loop_len[d] == Some(n), n.to_string())
@@ -271,25 +271,31 @@ impl App {
         }
     }
 
-    /// Engage an `n`-beat loop on `deck` starting at the beat at-or-before the
-    /// current playhead. No-op if the track has fewer than two beats or the loop
-    /// would run off the end of the grid.
+    /// Engage an `n`-BAR loop on `deck`, snapped to the downbeat grid (one unit =
+    /// one bar = the span between consecutive downbeats), starting at the downbeat
+    /// at-or-before the playhead. Falls back to the plain beat grid when downbeats
+    /// weren't detected. No-op if fewer than `n` units remain ahead.
     fn engage_loop(&mut self, d: usize, n: usize) {
         let Some(track) = self.engine.current_track(d) else { return };
-        let beats = &track.beats;
-        if beats.len() < 2 {
+        // Prefer the bar grid (downbeats, ~every 4 beats); fall back to beats.
+        let grid: &[f64] = if track.downbeats.len() >= 2 {
+            &track.downbeats
+        } else {
+            &track.beats
+        };
+        if grid.len() < 2 {
             return;
         }
         let ph = self.engine.playhead_secs(d);
-        // First beat at-or-before the playhead (clamped to a valid index).
-        let i = beats.partition_point(|&b| b <= ph).saturating_sub(1);
+        // First grid line at-or-before the playhead (clamped to a valid index).
+        let i = grid.partition_point(|&b| b <= ph).saturating_sub(1);
         let end_idx = i + n;
-        if end_idx >= beats.len() {
-            return; // fewer than n beats left → don't engage a short loop.
+        if end_idx >= grid.len() {
+            return; // fewer than n bars left → don't engage a short loop.
         }
         let sr = track.sample_rate as f64;
-        let start_frame = (beats[i] * sr) as usize;
-        let end_frame = (beats[end_idx] * sr) as usize;
+        let start_frame = (grid[i] * sr) as usize;
+        let end_frame = (grid[end_idx] * sr) as usize;
         self.engine.set_loop(d, start_frame, end_frame);
         self.loop_len[d] = Some(n);
     }
