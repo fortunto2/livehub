@@ -18,6 +18,65 @@ use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource, Visualizer};
 pub(crate) const LOOP_SIZES: [(&str, usize); 5] =
     [("¼", 1), ("½", 2), ("1", 4), ("2", 8), ("4", 16)];
 
+/// Output-stage (canvas) aspect, switchable live. `Auto` follows the loaded
+/// clips' orientation; the fixed modes force a shape regardless of the sources.
+#[derive(Clone, Copy, PartialEq)]
+enum CanvasMode {
+    Auto,
+    Wide,   // 16:9 horizontal
+    Tall,   // 9:16 vertical
+    Square, // 1:1
+}
+
+impl CanvasMode {
+    const ALL: [CanvasMode; 4] =
+        [CanvasMode::Auto, CanvasMode::Wide, CanvasMode::Tall, CanvasMode::Square];
+
+    fn label(self) -> &'static str {
+        match self {
+            CanvasMode::Auto => "Auto",
+            CanvasMode::Wide => "16:9",
+            CanvasMode::Tall => "9:16",
+            CanvasMode::Square => "1:1",
+        }
+    }
+
+    /// Resolve to a concrete width:height aspect. `Auto` inspects the loaded
+    /// clips: all portrait → vertical 9:16, all landscape → 16:9, all square →
+    /// 1:1, mixed orientations or nothing loaded → 16:9.
+    fn aspect(self, video_tex: &[Option<egui::TextureHandle>; 2]) -> f32 {
+        match self {
+            CanvasMode::Wide => 16.0 / 9.0,
+            CanvasMode::Tall => 9.0 / 16.0,
+            CanvasMode::Square => 1.0,
+            CanvasMode::Auto => {
+                let (mut any, mut all_portrait, mut all_landscape, mut all_square) =
+                    (false, true, true, true);
+                for t in video_tex.iter().flatten() {
+                    let [w, h] = t.size();
+                    if w == 0 || h == 0 {
+                        continue;
+                    }
+                    any = true;
+                    let a = w as f32 / h as f32;
+                    all_portrait &= a < 0.95;
+                    all_landscape &= a > 1.05;
+                    all_square &= (a - 1.0).abs() <= 0.05;
+                }
+                if !any || (!all_portrait && !all_landscape && !all_square) {
+                    16.0 / 9.0 // nothing loaded, or mixed orientations → wide
+                } else if all_square {
+                    1.0
+                } else if all_portrait {
+                    9.0 / 16.0
+                } else {
+                    16.0 / 9.0
+                }
+            }
+        }
+    }
+}
+
 /// Launch the GUI. Builds the audio engine first, then hands it to eframe.
 pub fn run(
     device: &str,
@@ -102,6 +161,9 @@ struct App {
     /// composite (no controls) — fullscreen it on a second display for OBS to
     /// grab via Window/Display Capture.
     output_open: bool,
+    /// Output-stage aspect (Auto / 16:9 / 9:16 / 1:1), switchable live; drives
+    /// both the in-app composite and the output window.
+    canvas_mode: CanvasMode,
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
@@ -153,6 +215,7 @@ impl App {
             autoplay_pending: autoplay,
             snap: true,
             output_open: false,
+            canvas_mode: CanvasMode::Auto,
             loop_len: [None, None],
             fx_choices: Engine::list_fx(),
             fx_selected: None,
@@ -344,7 +407,8 @@ impl App {
     /// over [`paint_composite_into`] with the in-app 300 px height cap, plus the
     /// trailing `add_space` the layout below it expects.
     fn video_composite(&self, ui: &mut egui::Ui) {
-        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, Some(300.0));
+        let aspect = self.canvas_mode.aspect(&self.video_tex);
+        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, aspect, Some(300.0));
         ui.add_space(8.0);
     }
 
@@ -365,22 +429,23 @@ impl App {
         ui: &mut egui::Ui,
         video_tex: &[Option<egui::TextureHandle>; 2],
         crossfade: f32,
+        canvas_aspect: f32,
         max_h: Option<f32>,
     ) {
-        // The canvas is a fixed broadcast aspect (the output frame), NOT derived
-        // from the clips — so A and B share one stage and each keeps its shape.
-        const CANVAS_ASPECT: f32 = 16.0 / 9.0;
+        // The canvas (stage) aspect is chosen by the user (Auto/16:9/9:16/1:1),
+        // NOT derived per-clip — so A and B share one stage and each keeps its
+        // own shape inside it.
         let avail_w = ui.available_width();
         let row_h = match max_h {
-            Some(cap) => (avail_w / CANVAS_ASPECT).min(cap),
+            Some(cap) => (avail_w / canvas_aspect).min(cap),
             None => ui.available_size().y.max(1.0),
         };
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(avail_w, row_h), egui::Sense::hover());
 
-        // The 16:9 canvas, aspect-fit + centered in the allocated row, painted
-        // black so every clip letterboxes/pillarboxes against a clean stage.
-        let canvas = fit_aspect(rect, CANVAS_ASPECT);
+        // The canvas, aspect-fit + centered in the allocated row, painted black
+        // so every clip letterboxes/pillarboxes against a clean stage.
+        let canvas = fit_aspect(rect, canvas_aspect);
         ui.painter().rect_filled(canvas, 0.0, Color32::BLACK);
 
         let xb = crossfade.clamp(0.0, 1.0);
@@ -765,6 +830,27 @@ impl eframe::App for App {
             ui.heading("livehub");
             ui.add_space(6.0);
 
+            // Output-stage (canvas) aspect — switches the composite + output
+            // window live. Auto follows the loaded clips' orientation.
+            ui.horizontal(|ui| {
+                ui.label("canvas:");
+                for m in CanvasMode::ALL {
+                    if ui.selectable_label(self.canvas_mode == m, m.label()).clicked() {
+                        self.canvas_mode = m;
+                    }
+                }
+                if self.canvas_mode == CanvasMode::Auto {
+                    let a = CanvasMode::Auto.aspect(&self.video_tex);
+                    ui.weak(if a > 1.05 {
+                        "→ 16:9"
+                    } else if a < 0.95 {
+                        "→ 9:16"
+                    } else {
+                        "→ 1:1"
+                    });
+                }
+            });
+
             // Video COMPOSITE: deck A under deck B, blended by the crossfader.
             self.video_composite(ui);
 
@@ -924,6 +1010,7 @@ impl eframe::App for App {
         if self.output_open {
             let video_tex = &self.video_tex;
             let crossfade = self.crossfade;
+            let canvas_aspect = self.canvas_mode.aspect(&self.video_tex);
             let mut close_requested = false;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("livehub_output"),
@@ -935,7 +1022,13 @@ impl eframe::App for App {
                         .frame(egui::Frame::NONE.fill(Color32::BLACK))
                         .show(vctx, |ui| {
                             // No height cap → fill the viewport, black letterbox.
-                            App::paint_composite_into(ui, video_tex, crossfade, None);
+                            App::paint_composite_into(
+                                ui,
+                                video_tex,
+                                crossfade,
+                                canvas_aspect,
+                                None,
+                            );
                         });
                     // OS close button (red dot / ⌘W): note it, clear flag below.
                     if vctx.input(|i| i.viewport().close_requested()) {
