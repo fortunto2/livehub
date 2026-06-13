@@ -1187,11 +1187,17 @@ impl eframe::App for App {
 
             ui.add_space(6.0);
 
-            // 5. CROSSFADER — full width, framed + big A/B so it reads as THE mix
-            // control. Drag it: blends both the audio AND the video composite.
+            // 5. CROSSFADER — the A↔B mix. Drag it: blends BOTH the audio AND the
+            // video composite from deck A to deck B (the DJ-style mixer).
             egui::Frame::group(ui.style())
                 .fill(Color32::from_gray(20))
                 .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.colored_label(
+                            Color32::from_gray(150),
+                            egui::RichText::new("CROSSFADE  ·  A ↔ B  ·  audio + video").strong(),
+                        );
+                    });
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             DECK_COLOR[0],

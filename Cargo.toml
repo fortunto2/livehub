@@ -12,7 +12,6 @@ license = "MIT"
 # --- livehub's own stack ---
 anyhow = "1"
 thiserror = "1"
-crossbeam-channel = "0.5"
 rtrb = "0.3"
 atomic_float = "1"
 arc-swap = "1"
@@ -20,14 +19,12 @@ cpal = "0.15"
 symphonia = { version = "0.5", default-features = false, features = [
     "mp3", "flac", "wav", "pcm", "isomp4", "aac",
 ] }
-rubato = "0.15"
 egui = "0.33"
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
 clack-host = "0.1"
 clack-extensions = { version = "0.1", features = ["params", "audio-ports", "log", "clack-host"] }
 clack-common = "0.1"
 rusty_link = "0.4"
-hound = "3.5"
 clap = { version = "4", features = ["derive"] }
 rfd = "0.14"
 
