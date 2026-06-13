@@ -77,6 +77,10 @@ struct App {
     autoplay_pending: bool,
     /// Snap seeks to the nearest beat when ON (global, applies to both decks).
     snap: bool,
+    /// When ON, a separate borderless OUTPUT WINDOW shows only the live video
+    /// composite (no controls) — fullscreen it on a second display for OBS to
+    /// grab via Window/Display Capture.
+    output_open: bool,
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
@@ -120,6 +124,7 @@ impl App {
             pending_open: [open, open_b],
             autoplay_pending: autoplay,
             snap: true,
+            output_open: false,
             loop_len: [None, None],
             fx_choices: Engine::list_fx(),
             fx_selected: None,
@@ -270,14 +275,34 @@ impl App {
         self.image_rx[deck] = Some(rx);
     }
 
-    /// Draw the A-over-B video composite into one fixed letterbox rect: deck A
-    /// underneath, deck B on top, each tinted so the crossfader (`self.crossfade`)
-    /// is a true alpha dissolve (A at `1-x`, B at `x`) — no double-bright midpoint.
+    /// Draw the A-over-B video composite into one fixed letterbox row of `ui`:
+    /// deck A underneath, deck B on top, blended by the crossfader. Thin wrapper
+    /// over [`paint_composite_into`] with the in-app 300 px height cap, plus the
+    /// trailing `add_space` the layout below it expects.
     fn video_composite(&self, ui: &mut egui::Ui) {
-        const MAX_H: f32 = 300.0;
-        // Pick a composite size from whichever deck has a texture (fall back 16:9).
-        let aspect = self
-            .video_tex
+        Self::paint_composite_into(ui, &self.video_tex, self.crossfade, Some(300.0));
+        ui.add_space(8.0);
+    }
+
+    /// Shared composite renderer used by BOTH the in-app strip and the standalone
+    /// output window — one implementation of the A-over-B alpha-dissolve blend.
+    ///
+    /// `video_tex` are the two deck textures (deck 0 under deck 1). `crossfade`
+    /// (0 = full A, 1 = full B) tints each layer so the fade is a true alpha
+    /// dissolve (A at `1-x`, B at `x`) — no double-bright midpoint.
+    ///
+    /// The composite is aspect-fit (letterboxed) inside the row this allocates,
+    /// which spans the full available width. `max_h = Some(h)` caps the row
+    /// height at `h` (the in-app strip); `max_h = None` fills `ui.available_size()`
+    /// entirely (the output window) so OBS captures a full-bleed frame.
+    fn paint_composite_into(
+        ui: &mut egui::Ui,
+        video_tex: &[Option<egui::TextureHandle>; 2],
+        crossfade: f32,
+        max_h: Option<f32>,
+    ) {
+        // Pick a composite aspect from whichever deck has a texture (fall back 16:9).
+        let aspect = video_tex
             .iter()
             .flatten()
             .find_map(|t| {
@@ -286,31 +311,36 @@ impl App {
             })
             .unwrap_or(16.0 / 9.0);
         let avail_w = ui.available_width();
-        let (mut cw, mut ch) = (avail_w, avail_w / aspect);
-        if ch > MAX_H {
-            ch = MAX_H;
-            cw = MAX_H * aspect;
-        }
+        // Row height: capped (in-app) or the whole remaining viewport (output).
+        let row_h = match max_h {
+            Some(cap) => (avail_w / aspect).min(cap),
+            None => ui.available_size().y.max(1.0),
+        };
         let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(avail_w, ch), egui::Sense::hover());
-        // Center the letterboxed composite within the allocated row.
-        let composite =
-            Rect::from_center_size(rect.center(), egui::vec2(cw.min(avail_w), ch));
+            ui.allocate_exact_size(egui::vec2(avail_w, row_h), egui::Sense::hover());
 
-        let xb = self.crossfade.clamp(0.0, 1.0);
+        // Aspect-fit the composite inside that row, centered — black letterbox
+        // bars fill the remainder (the output panel paints a BLACK frame behind).
+        let (mut cw, mut ch) = (row_h * aspect, row_h);
+        if cw > avail_w {
+            cw = avail_w;
+            ch = avail_w / aspect;
+        }
+        let composite = Rect::from_center_size(rect.center(), egui::vec2(cw, ch));
+
+        let xb = crossfade.clamp(0.0, 1.0);
         let a_alpha = ((1.0 - xb) * 255.0) as u8;
         let b_alpha = (xb * 255.0) as u8;
-        if let Some(tex) = &self.video_tex[0] {
+        if let Some(tex) = &video_tex[0] {
             egui::Image::new((tex.id(), composite.size()))
                 .tint(Color32::from_white_alpha(a_alpha))
                 .paint_at(ui, composite);
         }
-        if let Some(tex) = &self.video_tex[1] {
+        if let Some(tex) = &video_tex[1] {
             egui::Image::new((tex.id(), composite.size()))
                 .tint(Color32::from_white_alpha(b_alpha))
                 .paint_at(ui, composite);
         }
-        ui.add_space(8.0);
     }
 
     /// Draw one deck's controls (Load / Play, waveform+beats, BPM, seek, gain,
@@ -634,9 +664,13 @@ impl eframe::App for App {
             });
 
             ui.add_space(6.0);
-            // Global beat-snap toggle: when ON, every seek rounds to the nearest
-            // beat (applies to both decks' waveform clicks and seek sliders).
-            ui.toggle_value(&mut self.snap, "⊞ Snap to beats");
+            ui.horizontal(|ui| {
+                // Global beat-snap toggle: when ON, every seek rounds to the
+                // nearest beat (applies to both decks' waveform clicks + seek).
+                ui.toggle_value(&mut self.snap, "⊞ Snap to beats");
+                // Pop out the controls-free OUTPUT WINDOW for OBS to capture.
+                ui.toggle_value(&mut self.output_open, "🖥 Output");
+            });
 
             ui.add_space(6.0);
             // The crossfader, full width, between the decks and the shared section.
@@ -739,6 +773,39 @@ impl eframe::App for App {
                 self.engine.underruns()
             ));
         });
+
+        // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live
+        // composite (no controls). Fullscreen it on a second display and let OBS
+        // grab it via Window/Display Capture. The texture upload above already
+        // ran this frame, so we just re-paint the SAME shared textures here.
+        if self.output_open {
+            let video_tex = &self.video_tex;
+            let crossfade = self.crossfade;
+            let mut close_requested = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("livehub_output"),
+                egui::ViewportBuilder::default()
+                    .with_title("livehub output")
+                    .with_inner_size([1280.0, 720.0]),
+                |vctx, _class| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(Color32::BLACK))
+                        .show(vctx, |ui| {
+                            // No height cap → fill the viewport, black letterbox.
+                            App::paint_composite_into(ui, video_tex, crossfade, None);
+                        });
+                    // OS close button (red dot / ⌘W): note it, clear flag below.
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        close_requested = true;
+                    }
+                    vctx.request_repaint();
+                },
+            );
+            // Closed via the window's own button → don't reopen next frame.
+            if close_requested {
+                self.output_open = false;
+            }
+        }
 
         // Keep the playhead/meters live.
         ctx.request_repaint();
