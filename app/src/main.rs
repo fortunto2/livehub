@@ -96,6 +96,14 @@ enum Cmd {
         /// Media file (its beat grid is analyzed) to test.
         file: String,
     },
+    /// List avfoundation video capture devices (cameras) usable as a deck source.
+    ListCameras,
+    /// Headless self-test of the static-image source: decode + scale an image and
+    /// report its dimensions / generation / slot state. For autonomous testing.
+    SelftestImage {
+        /// Image file (png/jpg/webp/…) to load.
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -126,6 +134,23 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::SelftestLoops { file }) => selftest_loops(&file),
+        Some(Cmd::ListCameras) => {
+            println!("== livehub cameras ==");
+            let cams = video::CameraDeck::list_cameras();
+            if cams.is_empty() {
+                println!("  (none)");
+            } else {
+                for c in cams {
+                    println!("  {c}");
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::SelftestImage { file }) => {
+            println!("== livehub image test: {file} ==");
+            println!("{}", video::selftest_image(std::path::Path::new(&file)));
+            Ok(())
+        }
     }
 }
 
@@ -155,8 +180,8 @@ fn selftest_loops(file: &str) -> Result<()> {
     let ph = t.beats[1];
     println!("  playhead = {ph:.3}s");
     println!(
-        "  {:>4} {:>5} {:>13} {:>8} {:>8}  {}",
-        "size", "beats", "frames", "len(s)", "nom(s)", "result"
+        "  {:>4} {:>5} {:>13} {:>8} {:>8}  result",
+        "size", "beats", "frames", "len(s)", "nom(s)"
     );
 
     let mut prev_len: Option<f64> = None;

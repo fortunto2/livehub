@@ -17,3 +17,4 @@ eframe = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true }
 ffmpeg-next = "8"
+image = "0.25"

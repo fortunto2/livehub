@@ -10,7 +10,7 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use livehub_core::OutputRouting;
 use livehub_engine::{Engine, LinkHub, TrackBuf};
 
-use crate::video::VideoDeck;
+use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource};
 
 /// Loop sizes as `(bar-fraction label, beats)`. One bar = 4 beats, so `¼` = 1
 /// beat: short enough for rolls, while reading musically. At 80 BPM these span
@@ -53,9 +53,14 @@ struct App {
     crossfade: f32,
     mic_gain: f32,
     aux_gain: f32,
-    /// Per-deck video deck; frame = f(that deck's audio playhead). `None` until a
-    /// file with a video stream is loaded into that deck.
-    video: [Option<VideoDeck>; 2],
+    /// Per-deck video source: a paced file deck (frame = f(playhead)), a live
+    /// webcam, or a static image. `None` until something is loaded into that deck.
+    video: [Option<VideoSource>; 2],
+    /// Per-deck pending image-dialog result (dialog runs on its own thread).
+    image_rx: [Option<Receiver<Option<PathBuf>>>; 2],
+    /// Camera enumeration cached once at startup (`CameraDeck::list_cameras`
+    /// spawns an ffmpeg probe, so we never call it per-repaint).
+    cameras: Vec<String>,
     /// Per-deck GPU texture reused across frames; re-`set` only when the deck's
     /// frame generation changes (no realloc, no leak).
     video_tex: [Option<egui::TextureHandle>; 2],
@@ -87,6 +92,8 @@ impl App {
             engine,
             link: LinkHub::new(120.0),
             file_rx: [None, None],
+            image_rx: [None, None],
+            cameras: CameraDeck::list_cameras(),
             deck_gain: [1.0, 1.0],
             crossfade: 0.5,
             mic_gain: 1.0,
@@ -121,11 +128,47 @@ impl App {
     /// deck's playhead. Dropping the old deck first stops its worker (kills
     /// ffmpeg).
     fn load_path(&mut self, deck: usize, path: PathBuf) {
-        self.video[deck] = None; // drop old deck → joins worker, kills its ffmpeg.
+        self.reset_video(deck); // drop old source → joins worker, kills its ffmpeg.
+        self.video[deck] =
+            VideoDeck::open(path.clone(), self.engine.transport(deck)).map(VideoSource::File);
+        self.engine.load_track_background(deck, path);
+    }
+
+    /// Switch `deck`'s picture to a live webcam (camera `index`). Camera is
+    /// video-only: it does NOT touch the deck's audio (the deck can still have a
+    /// track loaded). Dropping the old source first stops its worker.
+    fn load_camera(&mut self, deck: usize, index: usize) {
+        self.reset_video(deck);
+        self.video[deck] = CameraDeck::open(index).map(VideoSource::Camera);
+    }
+
+    /// Switch `deck`'s picture to a static image. Image has no audio, so unlike
+    /// `load_path` this does not call `load_track_background` — the deck keeps
+    /// whatever audio it had.
+    fn load_image(&mut self, deck: usize, path: PathBuf) {
+        self.reset_video(deck);
+        self.video[deck] = ImageStill::open(&path).map(VideoSource::Image);
+    }
+
+    /// Drop the deck's current video source (joins its worker / kills its ffmpeg)
+    /// and reset the GPU texture state, ready for a fresh source.
+    fn reset_video(&mut self, deck: usize) {
+        self.video[deck] = None;
         self.video_tex[deck] = None;
         self.last_gen[deck] = 0;
-        self.video[deck] = VideoDeck::open(path.clone(), self.engine.transport(deck));
-        self.engine.load_track_background(deck, path);
+    }
+
+    /// Open a native image-file picker on a worker thread; the result is drained in
+    /// `update()` and routed to `load_image`.
+    fn open_image_dialog(&mut self, deck: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .add_filter("image", &["png", "jpg", "jpeg", "webp", "gif"])
+                .pick_file();
+            let _ = tx.send(picked);
+        });
+        self.image_rx[deck] = Some(rx);
     }
 
     /// Draw the A-over-B video composite into one fixed letterbox rect: deck A
@@ -179,8 +222,26 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.strong(if d == 0 { "Deck A" } else { "Deck B" });
+            // Tiny tag showing the current picture source kind (file/cam/image).
+            if let Some(src) = &self.video[d] {
+                ui.weak(src.kind());
+            }
             if ui.button("📂 Load").clicked() && self.file_rx[d].is_none() {
                 self.open_file_dialog(d);
+            }
+            // 📷 = live webcam (index 0); only offered when a camera exists.
+            if ui
+                .add_enabled(!self.cameras.is_empty(), egui::Button::new("📷"))
+                .on_hover_text("live camera")
+                .clicked()
+            {
+                self.load_camera(d, 0);
+            }
+            // 🖼 = static image (file dialog on a worker thread).
+            if ui.button("🖼").on_hover_text("still image").clicked()
+                && self.image_rx[d].is_none()
+            {
+                self.open_image_dialog(d);
             }
             let label = if self.engine.is_playing(d) { "⏸" } else { "▶" };
             if ui.button(label).clicked() {
@@ -263,16 +324,19 @@ impl App {
         });
 
         // Video↔audio sync trim: drag until the picture sits on the beat. The
-        // pipeline latency is machine/display specific, so it's a live knob.
-        if let Some(deck) = &self.video[d] {
+        // pipeline latency is machine/display specific, so it's a live knob. Only
+        // a paced file deck has a meaningful offset — camera/image have no
+        // playhead to compensate against, so the slider is hidden for them.
+        if self.video[d].as_ref().is_some_and(|s| s.is_file()) {
+            let source = self.video[d].as_ref().unwrap();
             ui.horizontal(|ui| {
                 ui.label("video sync");
-                let mut off = deck.offset_ms();
+                let mut off = source.offset_ms();
                 if ui
                     .add(egui::Slider::new(&mut off, -200..=400).suffix(" ms"))
                     .changed()
                 {
-                    deck.set_offset_ms(off);
+                    source.set_offset_ms(off);
                 }
             });
         }
@@ -334,13 +398,26 @@ impl eframe::App for App {
             }
         }
 
+        // Collect finished image-dialog picks, per deck → static-image source.
+        for d in 0..2 {
+            if let Some(rx) = &self.image_rx[d] {
+                if let Ok(result) = rx.try_recv() {
+                    if let Some(path) = result {
+                        self.load_image(d, path);
+                    }
+                    self.image_rx[d] = None;
+                }
+            }
+        }
+
         // Pull the latest video frame into each deck's GPU texture, but only when
         // its worker reports a new generation (no per-repaint re-upload).
         for d in 0..2 {
-            if let Some(deck) = &self.video[d] {
-                let gen = deck.generation();
+            if let Some(source) = &self.video[d] {
+                let slot = source.slot();
+                let gen = slot.generation();
                 if gen != self.last_gen[d] {
-                    let img = deck.with_latest(|fr| {
+                    let img = slot.with_latest(|fr| {
                         egui::ColorImage::from_rgba_unmultiplied(
                             [fr.width as usize, fr.height as usize],
                             &fr.rgba,

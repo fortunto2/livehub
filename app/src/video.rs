@@ -81,14 +81,33 @@ pub struct VideoFrame {
 
 /// Lock-light shared slot the worker writes and the GUI reads. The GUI only
 /// re-uploads to the GPU when `generation` changes, so it never re-reads an
-/// unchanged frame.
+/// unchanged frame. Public so `VideoSource` can hand the same slot handle out for
+/// every source kind (file worker / camera worker / static image).
 #[derive(Default)]
-struct FrameSlot {
+pub struct FrameSlot {
     frame: Mutex<Option<VideoFrame>>,
     generation: AtomicU64,
     /// Content time (seconds, f64 bits) of the latest presented frame — lets the
     /// headless pace test measure sync error against the playhead.
     pts_bits: AtomicU64,
+}
+
+impl FrameSlot {
+    /// The latest frame generation (Acquire pairs with the worker's Release bump).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Content time (seconds) of the latest presented frame.
+    pub fn frame_pts(&self) -> f64 {
+        f64::from_bits(self.pts_bits.load(Ordering::Acquire))
+    }
+
+    /// Run `f` over the latest frame, if any — lock held only for the closure.
+    pub fn with_latest<R>(&self, f: impl FnOnce(&VideoFrame) -> R) -> Option<R> {
+        let guard = self.frame.lock().ok()?;
+        guard.as_ref().map(f)
+    }
 }
 
 /// A live video deck: an in-process ffmpeg-driven worker thread plus the shared
@@ -153,22 +172,21 @@ impl VideoDeck {
         Some(VideoDeck { slot, running, offset_ms, worker: Some(worker) })
     }
 
-    /// The worker's monotonic frame generation. The GUI compares this to its own
-    /// last-seen value to decide whether to re-upload the texture.
+    /// The shared frame slot the worker feeds. Exposed so `VideoSource` can read
+    /// every source kind (file / camera / image) through one uniform slot handle.
+    pub fn slot(&self) -> &Arc<FrameSlot> {
+        &self.slot
+    }
+
+    /// The worker's monotonic frame generation (delegates to the slot). The
+    /// headless pace/seek tests compare it to spot newly presented frames.
     pub fn generation(&self) -> u64 {
-        self.slot.generation.load(Ordering::Acquire)
+        self.slot.generation()
     }
 
-    /// Content time (seconds) of the latest presented frame.
+    /// Content time (seconds) of the latest presented frame (delegates to slot).
     pub fn frame_pts(&self) -> f64 {
-        f64::from_bits(self.slot.pts_bits.load(Ordering::Acquire))
-    }
-
-    /// Run `f` over the latest frame, if any. Returns `None` when no frame has
-    /// been produced yet. Keeps the lock held only for the closure's duration.
-    pub fn with_latest<R>(&self, f: impl FnOnce(&VideoFrame) -> R) -> Option<R> {
-        let guard = self.slot.frame.lock().ok()?;
-        guard.as_ref().map(f)
+        self.slot.frame_pts()
     }
 
     /// Display-pipeline compensation in ms (positive = show the video earlier).
@@ -190,6 +208,260 @@ impl Drop for VideoDeck {
         self.running.store(false, Ordering::Release);
         if let Some(h) = self.worker.take() {
             let _ = h.join();
+        }
+    }
+}
+
+// ===========================================================================
+// Live camera source (M5b-1).
+// ===========================================================================
+
+/// Camera capture box: the live webcam is decoded to this fixed size and the GUI
+/// upscales it to the composite. 480×270 = 16:9, light enough to copy each frame.
+const CAM_W: u32 = 480;
+const CAM_H: u32 = 270;
+
+/// A live webcam deck. Unlike [`VideoDeck`] there is no playhead to pace against —
+/// a worker thread reads raw RGBA frames straight off an `ffmpeg` avfoundation
+/// capture child and publishes each into a [`FrameSlot`] the moment it arrives,
+/// using the SAME lock + pts_bits.store + generation.fetch_add sequence the file
+/// worker uses, so the GUI consumes camera frames byte-for-byte identically.
+pub struct CameraDeck {
+    slot: Arc<FrameSlot>,
+    running: Arc<AtomicBool>,
+    /// The `ffmpeg` capture child; killed on drop so the camera LED goes out.
+    child: Option<std::process::Child>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CameraDeck {
+    /// Enumerate avfoundation video capture devices as `"[idx] Name"` strings, in
+    /// index order. `ffmpeg -list_devices` exits non-zero and prints the list to
+    /// STDERR; we parse the lines under the "AVFoundation video devices" header and
+    /// stop at the "AVFoundation audio devices" header. Returns `[]` if ffmpeg is
+    /// missing or nothing parses.
+    pub fn list_cameras() -> Vec<String> {
+        let out = match Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-f",
+                "avfoundation",
+                "-list_devices",
+                "true",
+                "-i",
+                "",
+            ])
+            .stdout(Stdio::null())
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return Vec::new(), // ffmpeg not on PATH.
+        };
+        let text = String::from_utf8_lossy(&out.stderr);
+        let mut cams = Vec::new();
+        let mut in_video = false;
+        for line in text.lines() {
+            if line.contains("AVFoundation video devices") {
+                in_video = true;
+                continue;
+            }
+            if line.contains("AVFoundation audio devices") {
+                break; // audio section starts → done with video devices.
+            }
+            if !in_video {
+                continue;
+            }
+            // Each device line looks like:
+            //   [AVFoundation indev @ 0x..] [0] FaceTime HD Camera
+            // Drop the `[... indev ...]` prefix, then keep `[idx] Name`.
+            if let Some((_, rest)) = line.split_once(']') {
+                let rest = rest.trim();
+                if rest.starts_with('[') {
+                    cams.push(rest.to_string());
+                }
+            }
+        }
+        cams
+    }
+
+    /// Spawn an `ffmpeg` avfoundation capture for camera `index`, scaling to
+    /// `CAM_W`×`CAM_H` RGBA on a rawvideo pipe, and start a worker that reads one
+    /// full frame at a time and publishes it. Returns `None` only if the child
+    /// fails to spawn; if the child spawns but produces nothing (no camera / denied
+    /// permission) the deck is still `Some` and its slot simply stays empty → black.
+    pub fn open(index: usize) -> Option<CameraDeck> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avfoundation",
+                "-framerate",
+                "30",
+                "-video_size",
+                "1280x720",
+                "-i",
+                &format!("{index}:none"),
+                "-vf",
+                &format!("scale={CAM_W}:{CAM_H}"),
+                "-pix_fmt",
+                "rgba",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let stdout = child.stdout.take()?;
+        let slot = Arc::new(FrameSlot::default());
+        let running = Arc::new(AtomicBool::new(true));
+
+        let worker = {
+            let slot = slot.clone();
+            let running = running.clone();
+            std::thread::Builder::new()
+                .name("camera-worker".into())
+                .spawn(move || camera_loop(stdout, slot, running))
+                .ok()?
+        };
+
+        Some(CameraDeck { slot, running, child: Some(child), worker: Some(worker) })
+    }
+
+    /// The shared frame slot the capture worker feeds.
+    pub fn slot(&self) -> &Arc<FrameSlot> {
+        &self.slot
+    }
+}
+
+impl Drop for CameraDeck {
+    fn drop(&mut self) {
+        // Signal the worker to stop, kill the ffmpeg child (releases the camera so
+        // its LED goes out and the read returns EOF), then join the worker.
+        self.running.store(false, Ordering::Release);
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Camera worker: read exactly `CAM_W*CAM_H*4` bytes per frame off the ffmpeg
+/// rawvideo pipe into a reused buffer and publish each one. PTS is irrelevant for
+/// a live feed, so it rides a frame counter (seconds-ish) just to fill the slot's
+/// `pts_bits`; the GUI only watches `generation`.
+fn camera_loop(mut stdout: std::process::ChildStdout, slot: Arc<FrameSlot>, running: Arc<AtomicBool>) {
+    use std::io::Read;
+    let frame_bytes = (CAM_W as usize) * (CAM_H as usize) * 4;
+    let mut buf = vec![0u8; frame_bytes];
+    let mut frame_no: u64 = 0;
+    while running.load(Ordering::Acquire) {
+        // `read_exact` fills the whole frame or fails (EOF when the child dies).
+        match stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                present_frame(&slot, &buf, CAM_W, CAM_H, frame_no as f64 / 30.0);
+                frame_no += 1;
+            }
+            Err(_) => break, // child exited / pipe closed → stop publishing.
+        }
+    }
+}
+
+// ===========================================================================
+// Static image source (M5b-1).
+// ===========================================================================
+
+/// A single still image published once into a [`FrameSlot`]. No worker, no decode
+/// thread: `open` decodes + scales the image, publishes ONE frame (generation → 1
+/// so the GUI uploads it), and that's the whole lifetime.
+pub struct ImageStill {
+    slot: Arc<FrameSlot>,
+}
+
+impl ImageStill {
+    /// Decode `path`, fit it into a 480×480 box (downscale only, even dims), and
+    /// publish the single RGBA frame. Returns `None` if the image fails to decode.
+    pub fn open(path: &Path) -> Option<ImageStill> {
+        let img = image::open(path).ok()?.to_rgba8();
+        let (sw, sh) = fit_box(img.width(), img.height(), 480, 480);
+        // `fit_box` only downscales; if the image already fits, `resize` to the
+        // same dims is a cheap copy. Triangle filter = good quality, fast.
+        let scaled = image::imageops::resize(&img, sw, sh, image::imageops::FilterType::Triangle);
+        let (w, h) = (scaled.width(), scaled.height());
+        let rgba = scaled.into_raw(); // tight w*h*4, no stride padding.
+
+        let slot = Arc::new(FrameSlot::default());
+        present_frame(&slot, &rgba, w, h, 0.0); // generation: 0 → 1.
+        Some(ImageStill { slot })
+    }
+
+    /// The shared frame slot holding the single still.
+    pub fn slot(&self) -> &Arc<FrameSlot> {
+        &self.slot
+    }
+}
+
+// ===========================================================================
+// Unified video source (M5b-1): file deck, live camera, or static image — all
+// publish RGBA into a `FrameSlot`, so the GUI's texture-upload + composite code
+// reads every kind through one enum.
+// ===========================================================================
+
+/// One deck's picture: a paced file deck, a live webcam, or a static image. Each
+/// variant feeds a [`FrameSlot`] with the identical publish sequence, so the GUI
+/// reads them all uniformly via [`VideoSource::slot`].
+pub enum VideoSource {
+    File(VideoDeck),
+    Camera(CameraDeck),
+    Image(ImageStill),
+}
+
+impl VideoSource {
+    /// The frame slot to read (generation + latest frame), whatever the kind.
+    pub fn slot(&self) -> &Arc<FrameSlot> {
+        match self {
+            VideoSource::File(d) => d.slot(),
+            VideoSource::Camera(c) => c.slot(),
+            VideoSource::Image(i) => i.slot(),
+        }
+    }
+
+    /// Display-pipeline compensation (ms). Only a paced file deck has one; camera
+    /// and image have no playhead to compensate against → `0`.
+    pub fn offset_ms(&self) -> i32 {
+        match self {
+            VideoSource::File(d) => d.offset_ms() as i32,
+            _ => 0,
+        }
+    }
+
+    /// Set the file deck's display-comp offset; no-op for camera / image.
+    pub fn set_offset_ms(&self, ms: i32) {
+        if let VideoSource::File(d) = self {
+            d.set_offset_ms(ms as i64);
+        }
+    }
+
+    /// True only for the paced file deck (the only kind with a meaningful sync
+    /// offset — the GUI gates its "video sync" slider on this).
+    pub fn is_file(&self) -> bool {
+        matches!(self, VideoSource::File(_))
+    }
+
+    /// Short kind tag for the GUI's deck-title label.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            VideoSource::File(_) => "file",
+            VideoSource::Camera(_) => "cam",
+            VideoSource::Image(_) => "image",
         }
     }
 }
@@ -571,6 +843,27 @@ pub fn selftest_video(path: &Path) -> String {
         }
     }
     out
+}
+
+/// Headless smoke test of the static-image source: open `path` as an [`ImageStill`]
+/// and report its scaled dimensions, generation, and whether the slot holds a
+/// frame — the autonomous check that an image deck publishes exactly one frame.
+pub fn selftest_image(path: &Path) -> String {
+    match ImageStill::open(path) {
+        Some(still) => {
+            let slot = still.slot();
+            let gen = slot.generation();
+            let dims = slot
+                .with_latest(|fr| (fr.width, fr.height))
+                .unwrap_or((0, 0));
+            let has_frame = slot.with_latest(|_| true).unwrap_or(false);
+            format!(
+                "image OK: {}x{}, generation={gen}, slot has frame={has_frame}",
+                dims.0, dims.1
+            )
+        }
+        None => "image FAILED".to_string(),
+    }
 }
 
 /// In-process decode of a single RGBA frame at time `t`, returning its mean luma
