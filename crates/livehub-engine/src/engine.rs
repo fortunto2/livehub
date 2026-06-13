@@ -688,21 +688,26 @@ impl Engine {
     pub fn rate(&self, deck: usize) -> f32 {
         self.shared.decks[deck_idx(deck)].rate.load(Ordering::Relaxed)
     }
-    /// SYNC: set `deck`'s rate so its EFFECTIVE bpm (`track_bpm * rate`) matches
-    /// the OTHER deck's effective bpm. No-op if either deck's detected bpm is
-    /// `<= 0` (an un-analyzed track can't be matched). The new rate is clamped to
-    /// `0.25..=4.0`. After this, both decks beat at the same tempo (their phase
-    /// still has to be nudged by a seek — sync handles tempo, not downbeat align).
+    /// SYNC: match `deck` to the OTHER deck — BOTH tempo and beat PHASE. (1) set
+    /// `deck`'s rate so its effective bpm (`track_bpm * rate`) equals the other's,
+    /// then (2) seek `deck` so its beat phase lines up with the other's, so their
+    /// beats coincide ("no clash"). No-op on tempo if either detected bpm is `<=0`;
+    /// no-op on phase if either grid is unusable at the current playheads.
     pub fn sync_deck(&self, deck: usize, to: usize) {
         let me = deck_idx(deck);
         let other = deck_idx(to);
-        let my_bpm = self.bpm(me);
-        let other_bpm = self.bpm(other);
-        let other_rate = self.rate(other) as f64;
-        // Target = the OTHER deck's *effective* tempo (its grid bpm × its rate).
-        let target = other_bpm * other_rate;
-        let r = sync_rate(my_bpm, target);
+        // (1) Tempo: target the OTHER deck's *effective* tempo (grid bpm × rate).
+        let target = self.bpm(other) * self.rate(other) as f64;
+        let r = sync_rate(self.bpm(me), target);
         self.shared.decks[me].rate.store(r, Ordering::Relaxed);
+        // (2) Phase: reproduce the other deck's beat phase on this deck, via a seek.
+        if let (Some(t), Some(rt)) = (self.current_track(me), self.current_track(other)) {
+            let (ph, rph) = (self.playhead_secs(me), self.playhead_secs(other));
+            if let Some(target_secs) = crate::loops::beat_phase_align(&t.beats, ph, &rt.beats, rph)
+            {
+                self.seek_secs(me, target_secs);
+            }
+        }
     }
     /// Toggle headphone CUE / PFL (pre-fader listen) on `deck`. A cued deck's raw
     /// stereo (its deck gain, but pre-crossfade and pre-master-FX) is summed onto

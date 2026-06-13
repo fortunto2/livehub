@@ -26,6 +26,35 @@ pub fn beat_loop_region(
     Some(((beats[i] * sr) as usize, (beats[end] * sr) as usize))
 }
 
+/// Fractional position (0..1) of `t` within its current beat interval on `beats`
+/// (0 = on the beat, →1 approaching the next). `None` before the first / past the
+/// last beat or with a degenerate interval.
+pub fn beat_phase(beats: &[f64], t: f64) -> Option<f64> {
+    let j = beats.partition_point(|&b| b <= t);
+    if j == 0 || j >= beats.len() {
+        return None;
+    }
+    let (lo, hi) = (beats[j - 1], beats[j]);
+    if hi <= lo {
+        return None;
+    }
+    Some(((t - lo) / (hi - lo)).clamp(0.0, 1.0))
+}
+
+/// Target playhead (seconds) so a deck's beat PHASE matches a reference deck's:
+/// the reference's fractional position between its beats is reproduced between
+/// THIS deck's current beats, so — once tempos match — their beats coincide going
+/// forward (the "no clash" beatmatch). `None` if either grid is unusable here.
+pub fn beat_phase_align(beats: &[f64], ph: f64, ref_beats: &[f64], ref_ph: f64) -> Option<f64> {
+    let phase = beat_phase(ref_beats, ref_ph)?;
+    let j = beats.partition_point(|&b| b <= ph);
+    if j == 0 || j >= beats.len() {
+        return None;
+    }
+    let (lo, hi) = (beats[j - 1], beats[j]);
+    Some(lo + phase * (hi - lo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +104,28 @@ mod tests {
         assert!(beat_loop_region(&[0.0], 0.0, 1, 48_000).is_none());
         // Zero-length loop is rejected.
         assert!(beat_loop_region(&g, 0.0, 0, 48_000).is_none());
+    }
+
+    #[test]
+    fn phase_is_fraction_within_beat() {
+        let g = grid(); // beat every 0.5 s
+        assert!((beat_phase(&g, 2.0).unwrap() - 0.0).abs() < 1e-9); // on beat 4
+        assert!((beat_phase(&g, 2.25).unwrap() - 0.5).abs() < 1e-9); // halfway
+        assert!((beat_phase(&g, 2.4).unwrap() - 0.8).abs() < 1e-9);
+        assert!(beat_phase(&[], 1.0).is_none());
+    }
+
+    #[test]
+    fn phase_align_matches_reference_phase() {
+        // A grid at 0.5 s/beat, B grid OFFSET by 0.1 s and 0.4 s/beat.
+        let a: Vec<f64> = (0..16).map(|n| n as f64 * 0.5).collect();
+        let b: Vec<f64> = (0..16).map(|n| 0.1 + n as f64 * 0.4).collect();
+        // Reference A at 2.25 → phase 0.5. Align B at 1.4 (between b[3]=1.3 and
+        // b[4]=1.7) → target = 1.3 + 0.5*0.4 = 1.5. (1.4, not exactly on a beat,
+        // sidesteps float-boundary flakiness in the synthetic grid.)
+        let target = beat_phase_align(&b, 1.4, &a, 2.25).unwrap();
+        assert!((target - 1.5).abs() < 1e-6);
+        // After aligning, B's phase equals A's reference phase.
+        assert!((beat_phase(&b, target).unwrap() - 0.5).abs() < 1e-6);
     }
 }

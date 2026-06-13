@@ -607,8 +607,9 @@ impl App {
         });
 
         // BIG BPM readout — heading-size, deck-coloured. Shows the effective BPM
-        // (grid × live rate) when the tempo fader is off 1.00×, else the grid BPM.
-        self.deck_rate[d] = self.engine.rate(d);
+        // (grid × the deck's base rate) when off 1.00×, else the grid BPM.
+        // `deck_rate` is UI-authoritative (slider / SYNC / reset write it); we do
+        // NOT mirror the engine here, so a held nudge can't corrupt the base.
         let bpm = self.engine.bpm(d);
         let rate = self.deck_rate[d];
         let bpm_text = if bpm > 0.0 {
@@ -713,46 +714,45 @@ impl App {
         }
         ui.label(format!("{:>6.1} / {:>6.1} s", self.engine.playhead_secs(d), dur));
 
-        // TEMPO row: a ±8% variable-rate (vinyl) fader, an effective-BPM readout,
-        // a reset-to-1.00 affordance, and SYNC (match the other deck's tempo).
-        // `deck_rate[d]` is already mirrored from the engine above (for the big
-        // BPM readout), so SYNC's new value shows on the slider.
+        // TEMPO row: ±8% vinyl-rate fader (the BASE rate) + ⟲ reset + NUDGE ◀/▶
+        // (hold to pull the deck against the other for manual beatmatch) + ⇄ SYNC
+        // (match the other deck's tempo AND beat phase). `deck_rate[d]` is the base;
+        // a held nudge multiplies it momentarily without changing the base.
         ui.horizontal(|ui| {
             ui.label("tempo");
-            // ±8% beatmatch range. Pitch shift over this span is negligible
-            // (keylock is a deferred M6.x); the slider is the audible vinyl pull.
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.deck_rate[d], 0.92..=1.08)
-                        .show_value(false),
-                )
-                .changed()
-            {
-                self.engine.set_rate(d, self.deck_rate[d]);
-            }
-            // ⟲ snaps the rate back to exactly 1.00 (also double-click the slider).
+            ui.add(egui::Slider::new(&mut self.deck_rate[d], 0.92..=1.08).show_value(false));
             if ui.small_button("⟲").on_hover_text("reset to 1.00×").clicked() {
                 self.deck_rate[d] = 1.0;
-                self.engine.set_rate(d, 1.0);
             }
-            // Effective BPM = detected grid bpm × the live rate, so the readout
-            // shows where the track actually beats right now.
-            let eff = self.engine.bpm(d) * self.deck_rate[d] as f64;
-            if eff > 0.0 {
-                ui.monospace(format!("{eff:6.2}"));
+            // NUDGE: hold ◀/▶ to temporarily slow/speed the deck so its beats slide
+            // against the other deck (like nudging a CDJ jog). Releases back to base.
+            let back = ui.button("◀").on_hover_text("nudge slower (hold)");
+            let fwd = ui.button("▶").on_hover_text("nudge faster (hold)");
+            let nudge = if fwd.is_pointer_button_down_on() {
+                1.04
+            } else if back.is_pointer_button_down_on() {
+                0.96
             } else {
-                ui.monospace(format!("{:.3}×", self.deck_rate[d]));
-            }
-            // ⇄ SYNC: match this deck's effective tempo to the OTHER deck's.
+                1.0
+            };
+            // ⇄ SYNC: match the other deck's tempo AND beat phase (no clash).
             if ui
                 .button("⇄ SYNC")
-                .on_hover_text("match the other deck's tempo")
+                .on_hover_text("match the other deck's tempo + beat phase")
                 .clicked()
             {
                 self.engine.sync_deck(d, 1 - d);
-                // Reflect the engine's new rate immediately on this slider.
-                self.deck_rate[d] = self.engine.rate(d);
+                self.deck_rate[d] = self.engine.rate(d); // reflect synced base
             }
+            // Effective BPM = grid bpm × base × nudge.
+            let eff = self.engine.bpm(d) * (self.deck_rate[d] * nudge) as f64;
+            if eff > 0.0 {
+                ui.monospace(format!("{eff:6.2}"));
+            } else {
+                ui.monospace(format!("{:.3}×", self.deck_rate[d] * nudge));
+            }
+            // Apply base × nudge every frame (cheap atomic store).
+            self.engine.set_rate(d, self.deck_rate[d] * nudge);
         });
 
         // Video↔audio sync trim: drag until the picture sits on the beat. The
