@@ -63,6 +63,27 @@ struct App {
     video: [Option<VideoSource>; 2],
     /// Per-deck pending image-dialog result (dialog runs on its own thread).
     image_rx: [Option<Receiver<Option<PathBuf>>>; 2],
+    /// Per-deck source media path (the file driving its audio), kept so karaoke
+    /// knows what to split. Set by `load_path` and on a finished import; left
+    /// `None` for camera/image/visualizer sources (they have no audio file).
+    deck_path: [Option<PathBuf>; 2],
+    /// Shared URL text box feeding the `⬇A` / `⬇B` import buttons (one URL, either
+    /// deck) — the source is global, not per-deck.
+    import_url: String,
+    /// Per-deck pending yt-dlp download (`Ok(mp4 path)` or an error string). Worker
+    /// runs on its own thread; drained in `update()`.
+    import_rx: [Option<Receiver<Result<PathBuf, String>>>; 2],
+    /// Per-deck pending demucs split (`Ok(no_vocals.wav)` or an error string).
+    karaoke_rx: [Option<Receiver<Result<PathBuf, String>>>; 2],
+    /// Per-deck background-task status label ("downloading…" / "splitting…"), shown
+    /// as a spinner+label and used to gate the buttons while busy. `None` = idle.
+    busy: [Option<&'static str>; 2],
+    /// Whether `demucs` is installed (probed once at startup — the `-h` shell-out
+    /// is too slow to run per-repaint). Gates the 🎤 Karaoke button.
+    demucs_ok: bool,
+    /// Whether `yt-dlp` is installed (probed once at startup). Gates the import
+    /// buttons.
+    ytdlp_ok: bool,
     /// Camera enumeration cached once at startup (`CameraDeck::list_cameras`
     /// spawns an ffmpeg probe, so we never call it per-repaint).
     cameras: Vec<String>,
@@ -111,6 +132,13 @@ impl App {
             link: LinkHub::new(120.0),
             file_rx: [None, None],
             image_rx: [None, None],
+            deck_path: [None, None],
+            import_url: String::new(),
+            import_rx: [None, None],
+            karaoke_rx: [None, None],
+            busy: [None, None],
+            demucs_ok: crate::import::demucs_available(),
+            ytdlp_ok: crate::import::yt_dlp_available(),
             cameras: CameraDeck::list_cameras(),
             deck_gain: [1.0, 1.0],
             deck_rate: [1.0, 1.0],
@@ -220,9 +248,45 @@ impl App {
     /// ffmpeg).
     fn load_path(&mut self, deck: usize, path: PathBuf) {
         self.reset_video(deck); // drop old source → joins worker, kills its ffmpeg.
+        self.deck_path[deck] = Some(path.clone()); // remember the source for karaoke.
         self.video[deck] =
             VideoDeck::open(path.clone(), self.engine.transport(deck)).map(VideoSource::File);
         self.engine.load_track_background(deck, path);
+    }
+
+    /// Spawn the yt-dlp download worker for `deck`: download `self.import_url` to
+    /// the import scratch dir on its own thread, sending `Result<PathBuf, String>`
+    /// back over `import_rx[deck]`. Marks the deck busy; the drain in `update()`
+    /// loads the finished mp4 via `load_path`. No-op if the URL is empty.
+    fn start_import(&mut self, deck: usize) {
+        let url = self.import_url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = crate::import::yt_dlp_download(&url, &crate::import::import_dir())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.import_rx[deck] = Some(rx);
+        self.busy[deck] = Some("downloading…");
+    }
+
+    /// Spawn the demucs karaoke-split worker for `deck`: split this deck's source
+    /// file into vocals + instrumental on its own thread, sending the instrumental
+    /// path (or an error) back over `karaoke_rx[deck]`. Marks the deck busy; the
+    /// drain swaps the deck's AUDIO to the instrumental. No-op without a source.
+    fn start_karaoke(&mut self, deck: usize) {
+        let Some(input) = self.deck_path[deck].clone() else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = crate::import::demucs_split(&input, &crate::import::import_dir())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.karaoke_rx[deck] = Some(rx);
+        self.busy[deck] = Some("splitting…");
     }
 
     /// Switch `deck`'s picture to a live webcam (camera `index`). Camera is
@@ -398,8 +462,28 @@ impl App {
             {
                 self.engine.set_cue(d, cued);
             }
+            // 🎤 = OPTIONAL karaoke split (demucs): swap this deck's AUDIO to the
+            // instrumental stem while its video keeps playing. Needs a source file
+            // to split, demucs installed, and the deck idle. When demucs is missing
+            // the button is disabled with an install hint.
+            let can_karaoke =
+                self.demucs_ok && self.deck_path[d].is_some() && self.busy[d].is_none();
+            let karaoke_btn = ui.add_enabled(can_karaoke, egui::Button::new("🎤"));
+            let karaoke_btn = if self.demucs_ok {
+                karaoke_btn.on_hover_text("karaoke: split out vocals (demucs)")
+            } else {
+                karaoke_btn.on_disabled_hover_text("install demucs: uv tool install demucs")
+            };
+            if karaoke_btn.clicked() {
+                self.start_karaoke(d);
+            }
             if loading {
                 ui.spinner();
+            }
+            // Background-task (download / split) progress for this deck.
+            if let Some(status) = self.busy[d] {
+                ui.spinner();
+                ui.weak(status);
             }
         });
 
@@ -603,6 +687,39 @@ impl eframe::App for App {
             }
         }
 
+        // Collect finished URL downloads, per deck → load the mp4 (audio+video).
+        for d in 0..2 {
+            if let Some(rx) = &self.import_rx[d] {
+                if let Ok(result) = rx.try_recv() {
+                    match result {
+                        Ok(path) => self.load_path(d, path), // sets deck_path too.
+                        Err(e) => eprintln!("import (deck {d}) failed: {e}"),
+                    }
+                    self.import_rx[d] = None;
+                    self.busy[d] = None;
+                }
+            }
+        }
+
+        // Collect finished karaoke splits, per deck → swap AUDIO to the
+        // instrumental stem (video untouched). Keep deck_path on the ORIGINAL so a
+        // re-split still works. load_track_background resets the playhead to 0 and
+        // pauses — the stem shares the original's timeline, so that is harmless.
+        for d in 0..2 {
+            if let Some(rx) = &self.karaoke_rx[d] {
+                if let Ok(result) = rx.try_recv() {
+                    match result {
+                        Ok(instrumental) => {
+                            self.engine.load_track_background(d, instrumental);
+                        }
+                        Err(e) => eprintln!("karaoke (deck {d}) failed: {e}"),
+                    }
+                    self.karaoke_rx[d] = None;
+                    self.busy[d] = None;
+                }
+            }
+        }
+
         // Pull the latest video frame into each deck's GPU texture, but only when
         // its worker reports a new generation (no per-repaint re-upload).
         for d in 0..2 {
@@ -670,6 +787,38 @@ impl eframe::App for App {
                 ui.toggle_value(&mut self.snap, "⊞ Snap to beats");
                 // Pop out the controls-free OUTPUT WINDOW for OBS to capture.
                 ui.toggle_value(&mut self.output_open, "🖥 Output");
+            });
+
+            // Shared URL import: one box, two deck targets. Downloads a ≤720p mp4
+            // (audio+video) via yt-dlp on a worker thread, then loads it into the
+            // chosen deck. Disabled (with a hint) when yt-dlp is missing or the
+            // target deck is busy.
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("🔗 URL");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.import_url)
+                        .hint_text("paste a video/audio URL")
+                        .desired_width(360.0),
+                );
+                let has_url = !self.import_url.trim().is_empty();
+                for d in 0..2 {
+                    let label = if d == 0 { "⬇A" } else { "⬇B" };
+                    let can = self.ytdlp_ok && has_url && self.busy[d].is_none();
+                    let btn = ui.add_enabled(can, egui::Button::new(label));
+                    let btn = if self.ytdlp_ok {
+                        btn.on_hover_text(if d == 0 {
+                            "import → Deck A"
+                        } else {
+                            "import → Deck B"
+                        })
+                    } else {
+                        btn.on_disabled_hover_text("install yt-dlp: uv tool install yt-dlp")
+                    };
+                    if btn.clicked() {
+                        self.start_import(d);
+                    }
+                }
             });
 
             ui.add_space(6.0);

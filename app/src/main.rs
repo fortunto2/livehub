@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod gui;
+mod import;
 mod video;
 
 #[derive(Parser)]
@@ -130,6 +131,20 @@ enum Cmd {
         /// File B (gets retempo'd to match A).
         file_b: String,
     },
+    /// Download a deck's media from a URL via yt-dlp (≤720p mp4, audio+video) into
+    /// the import scratch dir and print the resulting file path. Mirrors the GUI's
+    /// 🔗 import worker, so the download is verifiable headlessly.
+    Import {
+        /// Media URL (YouTube, etc.) to download.
+        url: String,
+    },
+    /// OPTIONAL karaoke split: run demucs (`--two-stems=vocals`) on a file and
+    /// print the instrumental (`no_vocals.wav`) path. Degrades gracefully — if
+    /// demucs is not installed it prints the install hint and exits 0.
+    Karaoke {
+        /// Audio/video file to split into vocals + instrumental.
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -199,7 +214,37 @@ fn main() -> Result<()> {
         }
         Some(Cmd::SelftestFx { plugin }) => selftest_fx(&plugin),
         Some(Cmd::SelftestSync { file_a, file_b }) => selftest_sync(&file_a, &file_b),
+        Some(Cmd::Import { url }) => import_cmd(&url),
+        Some(Cmd::Karaoke { file }) => karaoke_cmd(&file),
     }
+}
+
+/// Headless URL import: download `url` to the import scratch dir via yt-dlp and
+/// print the resulting mp4 path (or the error). Same `import::yt_dlp_download` the
+/// GUI worker calls — so the download is testable without a window.
+fn import_cmd(url: &str) -> Result<()> {
+    println!("== livehub import: {url} ==");
+    match import::yt_dlp_download(url, &import::import_dir()) {
+        Ok(path) => println!("  downloaded: {}", path.display()),
+        Err(e) => println!("  import FAILED: {e:#}"),
+    }
+    Ok(())
+}
+
+/// Headless karaoke split. If demucs is absent, print the install hint and exit
+/// cleanly (the feature is OPTIONAL). Otherwise split via the SAME
+/// `import::demucs_split` the GUI worker calls and print the instrumental path.
+fn karaoke_cmd(file: &str) -> Result<()> {
+    println!("== livehub karaoke: {file} ==");
+    if !import::demucs_available() {
+        println!("  demucs not installed — uv tool install demucs");
+        return Ok(());
+    }
+    match import::demucs_split(std::path::Path::new(file), &import::import_dir()) {
+        Ok(path) => println!("  instrumental: {}", path.display()),
+        Err(e) => println!("  karaoke FAILED: {e:#}"),
+    }
+    Ok(())
 }
 
 /// Headless beatmatch (SYNC) test. Decodes both files for their detected BPMs,
