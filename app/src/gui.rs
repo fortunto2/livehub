@@ -53,6 +53,8 @@ struct App {
     crossfade: f32,
     mic_gain: f32,
     aux_gain: f32,
+    /// Shared headphone CUE / PFL bus level (pre-fader listen for cued decks).
+    cue_gain: f32,
     /// Per-deck video source: a paced file deck (frame = f(playhead)), a live
     /// webcam, or a static image. `None` until something is loaded into that deck.
     video: [Option<VideoSource>; 2],
@@ -107,6 +109,7 @@ impl App {
             crossfade: 0.5,
             mic_gain: 1.0,
             aux_gain: 1.0,
+            cue_gain: 1.0,
             video: [None, None],
             video_tex: [None, None],
             last_gen: [0, 0],
@@ -349,6 +352,17 @@ impl App {
             let label = if self.engine.is_playing(d) { "⏸" } else { "▶" };
             if ui.button(label).clicked() {
                 self.engine.toggle(d);
+            }
+            // 🎧 = headphone CUE / PFL: preview this deck pre-fader in the
+            // headphones (Arrow out 3/4) before crossfading it into the master.
+            // A lit toggle = cued; the master mix is unaffected either way.
+            let mut cued = self.engine.is_cued(d);
+            if ui
+                .toggle_value(&mut cued, "🎧")
+                .on_hover_text("cue (pre-fader headphone listen)")
+                .changed()
+            {
+                self.engine.set_cue(d, cued);
             }
             if loading {
                 ui.spinner();
@@ -615,6 +629,19 @@ impl eframe::App for App {
                     }
                 });
             }
+
+            // Shared headphone CUE bus level. Drives whatever decks have their 🎧
+            // toggle lit; harmless when nothing is cued.
+            ui.horizontal(|ui| {
+                ui.label("cue ");
+                if ui
+                    .add(egui::Slider::new(&mut self.cue_gain, 0.0..=1.5))
+                    .changed()
+                {
+                    self.engine.set_cue_gain(self.cue_gain);
+                }
+            });
+            ui.weak("🎧 cue needs a 4+ output device (Arrow out 3/4); ignored on a 2ch output.");
 
             ui.add_space(8.0);
             ui.separator();

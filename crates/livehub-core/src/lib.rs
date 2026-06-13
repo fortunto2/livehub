@@ -20,13 +20,18 @@ pub enum BusId {
     Deck(DeckId),
 }
 
-/// Which interleaved channel indices the master (and optional cue) feed on the
-/// chosen output device.
+/// Which interleaved channel indices the master (and optional cue/PFL) feed on
+/// the chosen output device.
 ///
 /// On a CoreAudio aggregate ("Mixx Rig") the channel order is empirical — there
 /// is no API to query "which index is the Arrow line-out". Keep it a runtime
-/// config, resolved by the M0 tone-sweep. Defaults assume the Arrow is first in
-/// the aggregate: MON L/R = 0/1, HP L/R = 4/5.
+/// config, resolved by the M0 tone-sweep. Defaults: MASTER L/R = 0/1 (the Arrow
+/// monitor pair), CUE/headphone L/R = 2/3 (the Arrow's second output pair =
+/// physical outs 3/4, where the DJ's headphones live).
+///
+/// `cue_l`/`cue_r` are `Option`: on a 2-channel device those indices don't
+/// exist, so the engine's per-sample `out.get_mut(base + cue)` simply returns
+/// `None` and the cue write is silently skipped — no panic, master unaffected.
 #[derive(Debug, Clone, Copy)]
 pub struct OutputRouting {
     pub master_l: usize,
@@ -37,6 +42,6 @@ pub struct OutputRouting {
 
 impl Default for OutputRouting {
     fn default() -> Self {
-        Self { master_l: 0, master_r: 1, cue_l: Some(4), cue_r: Some(5) }
+        Self { master_l: 0, master_r: 1, cue_l: Some(2), cue_r: Some(3) }
     }
 }

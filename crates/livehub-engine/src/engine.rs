@@ -40,6 +40,7 @@ struct Deck {
     gain: AtomicF32,
     loop_start: AtomicI64,   // beat-loop start frame, or -1 (no loop)
     loop_end: AtomicI64,     // beat-loop end frame (exclusive), or -1 (no loop)
+    cue: AtomicBool,         // headphone CUE / PFL engaged for this deck
 }
 
 impl Deck {
@@ -54,6 +55,7 @@ impl Deck {
             gain: AtomicF32::new(1.0),
             loop_start: AtomicI64::new(-1),
             loop_end: AtomicI64::new(-1),
+            cue: AtomicBool::new(false),
         }
     }
 }
@@ -63,6 +65,7 @@ struct Shared {
     crossfade: AtomicF32, // 0.0 = full deck A, 1.0 = full deck B
     mic_gain: AtomicF32,
     aux_gain: AtomicF32,
+    cue_gain: AtomicF32,  // headphone CUE bus level (shared across cued decks)
     underruns: AtomicU64,
     device_sr: u32,
     out_ch: usize,
@@ -137,6 +140,11 @@ fn build_output_stream(
     // thread, at build time) — never touched if `fx` is None.
     let mut mbuf_l = vec![0.0f32; MAX_FX_BLOCK];
     let mut mbuf_r = vec![0.0f32; MAX_FX_BLOCK];
+    // CUE / PFL scratch, same lifetime + capture as the master scratch. The cue
+    // bus is PRE-crossfade and PRE-master-FX: it never runs through `fx`, so it
+    // is filled in phase 1 and scattered straight to the headphone channels.
+    let mut cbuf_l = vec![0.0f32; MAX_FX_BLOCK];
+    let mut cbuf_r = vec![0.0f32; MAX_FX_BLOCK];
 
     let sh = shared;
     let out_stream_cfg: cpal::StreamConfig = out_cfg.clone().into();
@@ -158,6 +166,8 @@ fn build_output_stream(
                 let mut p = [0usize; 2];
                 let mut playing = [false; 2];
                 let mut dg = [0.0f32; 2];
+                // Per-deck headphone CUE / PFL flag, snapshotted once per block.
+                let mut cue = [false; 2];
                 // Per-deck beat-loop region (frames); -1 = no loop. Snapshotted
                 // once per block, used to wrap the playhead in the inner loop.
                 let mut lstart = [-1i64; 2];
@@ -175,6 +185,7 @@ fn build_output_stream(
                     dg[d] = sh.decks[d].gain.load(Ordering::Relaxed);
                     lstart[d] = sh.decks[d].loop_start.load(Ordering::Relaxed);
                     lend[d] = sh.decks[d].loop_end.load(Ordering::Relaxed);
+                    cue[d] = sh.decks[d].cue.load(Ordering::Relaxed);
                 }
                 // Equal-power crossfade: cos/sin keeps constant power across
                 // the sweep (no -6 dB center dip a linear fade would cause).
@@ -187,6 +198,14 @@ fn build_output_stream(
                 let ag = sh.aux_gain.load(Ordering::Relaxed);
                 let out_ch = sh.out_ch;
                 let (ml, mr) = (sh.routing.master_l, sh.routing.master_r);
+                // CUE / PFL: a concrete (l, r) channel pair only when BOTH are
+                // configured, else None (2ch device → no headphone pair → cue is
+                // a no-op). `cg` is the shared headphone bus level.
+                let cue_ch = sh.routing.cue_l.zip(sh.routing.cue_r);
+                let cg = sh.cue_gain.load(Ordering::Relaxed);
+                // Any deck cued this block? Skip the whole cue path otherwise so
+                // an idle headphone bus costs nothing on the hot path.
+                let any_cue = cue_ch.is_some() && (cue[0] || cue[1]);
                 let frames = out.len() / out_ch;
 
                 // Phase 1: fill the stereo master scratch (mbuf_l/mbuf_r) for the
@@ -216,6 +235,10 @@ fn build_output_stream(
                         let aux_r = aux_cons.pop().unwrap_or(0.0);
 
                         let (mut dl, mut dr) = (0.0_f32, 0.0_f32);
+                        // CUE / PFL accumulator: each cued deck's RAW stereo with
+                        // its own deck gain applied, but WITHOUT the crossfade
+                        // weight (pre-fader listen) and WITHOUT the master FX.
+                        let (mut cl, mut cr) = (0.0_f32, 0.0_f32);
                         for d in 0..2 {
                             if playing[d] {
                                 if let Some(t) = tracks[d].as_ref() {
@@ -225,6 +248,11 @@ fn build_output_stream(
                                         let w = dg[d] * xw[d];
                                         dl += a * w;
                                         dr += b * w;
+                                        // PFL tap: deck-gain applied, crossfade NOT.
+                                        if any_cue && cue[d] {
+                                            cl += a * dg[d];
+                                            cr += b * dg[d];
+                                        }
                                         p[d] += 1;
                                         // Beat-loop wrap: a valid loop is ls>=0 &&
                                         // le>ls; on reaching the end, snap back to
@@ -242,6 +270,12 @@ fn build_output_stream(
 
                         mbuf_l[i] = dl + mic_l * mg + aux_l * ag;
                         mbuf_r[i] = dr + mic_r * mg + aux_r * ag;
+                        // Cue bus: soloed deck(s) only, scaled by the shared
+                        // headphone level. Filled here (NOT through `fx`).
+                        if any_cue {
+                            cbuf_l[i] = cl * cg;
+                            cbuf_r[i] = cr * cg;
+                        }
                     }
 
                     // The master-bus insert: process the whole mix in place.
@@ -249,7 +283,8 @@ fn build_output_stream(
                         fx.process(&mut mbuf_l[..chunk], &mut mbuf_r[..chunk]);
                     }
 
-                    // Phase 2: scatter the (post-FX) master pair to the device.
+                    // Phase 2: scatter the (post-FX) master pair to the device,
+                    // plus the (FX-bypassed) cue pair to the headphone channels.
                     for i in 0..chunk {
                         let base = (done + i) * out_ch;
                         if let Some(slot) = out.get_mut(base + ml) {
@@ -257,6 +292,19 @@ fn build_output_stream(
                         }
                         if let Some(slot) = out.get_mut(base + mr) {
                             *slot = mbuf_r[i];
+                        }
+                        // Cue write: only when a deck is cued; the headphone
+                        // channels were already zeroed for this frame in phase 1,
+                        // and `out.get_mut` guards a missing pair on a 2ch device.
+                        if any_cue {
+                            if let Some((cl_ch, cr_ch)) = cue_ch {
+                                if let Some(slot) = out.get_mut(base + cl_ch) {
+                                    *slot = cbuf_l[i];
+                                }
+                                if let Some(slot) = out.get_mut(base + cr_ch) {
+                                    *slot = cbuf_r[i];
+                                }
+                            }
                         }
                     }
                     done += chunk;
@@ -354,6 +402,23 @@ impl Engine {
         if routing.master_l >= out_ch || routing.master_r >= out_ch {
             return Err(anyhow!("master channels out of range for a {out_ch}ch device"));
         }
+        // Cue/PFL is optional: a 2ch device simply has no headphone pair. If a
+        // cue index is configured but out of range for this device, drop it to
+        // `None` so the per-sample write is a silent no-op (vs. a hard error
+        // that would block running on a stereo-only output).
+        let routing = {
+            let mut r = routing;
+            let oob = |c: Option<usize>| c.is_some_and(|i| i >= out_ch);
+            if oob(r.cue_l) || oob(r.cue_r) {
+                eprintln!(
+                    "engine: cue channels {:?}/{:?} out of range for a {out_ch}ch device — cue disabled",
+                    r.cue_l, r.cue_r
+                );
+                r.cue_l = None;
+                r.cue_r = None;
+            }
+            r
+        };
         if let Some((al, ar)) = aux {
             if al >= in_ch || ar >= in_ch {
                 return Err(anyhow!("aux channels {al}/{ar} out of range for a {in_ch}ch input"));
@@ -370,6 +435,7 @@ impl Engine {
             crossfade: AtomicF32::new(0.0),
             mic_gain: AtomicF32::new(1.0),
             aux_gain: AtomicF32::new(1.0),
+            cue_gain: AtomicF32::new(1.0),
             underruns: AtomicU64::new(0),
             device_sr,
             out_ch,
@@ -540,6 +606,23 @@ impl Engine {
     }
     pub fn set_deck_gain(&self, deck: usize, g: f32) {
         self.shared.decks[deck_idx(deck)].gain.store(g, Ordering::Relaxed);
+    }
+    /// Toggle headphone CUE / PFL (pre-fader listen) on `deck`. A cued deck's raw
+    /// stereo (its deck gain, but pre-crossfade and pre-master-FX) is summed onto
+    /// the cue bus and sent to the headphone channels — silent on a device with
+    /// no cue pair (e.g. a 2ch output). The master path is unaffected.
+    pub fn set_cue(&self, deck: usize, on: bool) {
+        self.shared.decks[deck_idx(deck)].cue.store(on, Ordering::Relaxed);
+    }
+    pub fn is_cued(&self, deck: usize) -> bool {
+        self.shared.decks[deck_idx(deck)].cue.load(Ordering::Relaxed)
+    }
+    /// Shared headphone CUE bus level (applied to all cued decks together).
+    pub fn set_cue_gain(&self, g: f32) {
+        self.shared.cue_gain.store(g, Ordering::Relaxed);
+    }
+    pub fn cue_gain(&self) -> f32 {
+        self.shared.cue_gain.load(Ordering::Relaxed)
     }
     /// Engage a beat loop on `deck` over `[start_frame, end_frame)` (frame indices
     /// into the deck's resampled buffer, same units as the playhead). Ignored if
