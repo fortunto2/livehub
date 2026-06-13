@@ -89,6 +89,13 @@ enum Cmd {
         /// Video file to measure.
         file: String,
     },
+    /// Headless loop-geometry test: for each loop size, print the region it would
+    /// engage (length in beats & seconds vs nominal) and assert it's exactly k
+    /// beats and that halving the size halves the length. No GUI, no audio device.
+    SelftestLoops {
+        /// Media file (its beat grid is analyzed) to test.
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -118,7 +125,83 @@ fn main() -> Result<()> {
             println!("{}", video::seek_test(std::path::Path::new(&file)));
             Ok(())
         }
+        Some(Cmd::SelftestLoops { file }) => selftest_loops(&file),
     }
+}
+
+/// Headless check that the loop sizes (`gui::LOOP_SIZES`) produce correct
+/// regions: each is exactly `k` beats long, the start sits on the beat
+/// at-or-before the playhead, and halving the size halves the length. Decodes
+/// the file for its real beat grid, then exercises the same pure helper the GUI
+/// calls — so loop math is verified without a window or audio device.
+fn selftest_loops(file: &str) -> Result<()> {
+    let path = std::path::Path::new(file);
+    println!("== livehub loop test: {file} ==");
+    let t = livehub_engine::decode_track(path, 48_000)?;
+    println!(
+        "  grid : bpm={:.1}, {} beats, {} downbeats, sr={}",
+        t.bpm,
+        t.beats.len(),
+        t.downbeats.len(),
+        t.sample_rate
+    );
+    if t.beats.len() < 2 {
+        println!("  SKIP: no beat grid");
+        return Ok(());
+    }
+    let sr = t.sample_rate as f64;
+    let nominal_beat = if t.bpm > 0.0 { 60.0 / t.bpm } else { f64::NAN };
+    // Engage from a fixed early playhead so every size has room to fit.
+    let ph = t.beats[1];
+    println!("  playhead = {ph:.3}s");
+    println!(
+        "  {:>4} {:>5} {:>13} {:>8} {:>8}  {}",
+        "size", "beats", "frames", "len(s)", "nom(s)", "result"
+    );
+
+    let mut prev_len: Option<f64> = None;
+    let mut all_ok = true;
+    for (label, k) in gui::LOOP_SIZES {
+        match livehub_engine::beat_loop_region(&t.beats, ph, k, t.sample_rate) {
+            Some((s, e)) => {
+                let (start_sec, end_sec) = (s as f64 / sr, e as f64 / sr);
+                let len_s = end_sec - start_sec;
+                let nom = nominal_beat * k as f64;
+                // Independent recount: beats inside [start, end) must be exactly k.
+                let span = t
+                    .beats
+                    .iter()
+                    .filter(|&&b| b >= start_sec - 1e-3 && b < end_sec - 1e-3)
+                    .count();
+                let exact = span == k;
+                // Each size (except the first) should be ~2× the previous one.
+                let doubles = match prev_len {
+                    Some(p) => (len_s - 2.0 * p).abs() <= 0.6 * p,
+                    None => true,
+                };
+                let ok = exact && doubles && e > s;
+                all_ok &= ok;
+                let note = if ok {
+                    "PASS".to_string()
+                } else {
+                    format!("FAIL (span={span}, doubles={doubles})")
+                };
+                println!(
+                    "  {label:>4} {k:>5} {:>13} {len_s:>8.3} {nom:>8.3}  {note}",
+                    format!("{s}..{e}")
+                );
+                prev_len = Some(len_s);
+            }
+            None => {
+                println!(
+                    "  {label:>4} {k:>5} {:>13} {:>8} {:>8}  no-op (not enough beats left)",
+                    "—", "—", "—"
+                );
+            }
+        }
+    }
+    println!("  overall: {}", if all_ok { "PASS" } else { "FAIL" });
+    Ok(())
 }
 
 /// Headless pipeline check: decode + beat-analyze the audio and probe the video,

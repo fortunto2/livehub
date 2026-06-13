@@ -10,6 +10,7 @@ mod decoder;
 mod device;
 mod engine;
 mod link;
+mod loops;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
@@ -17,6 +18,7 @@ pub use decoder::decode_track;
 pub use device::list_devices;
 pub use engine::{Engine, Transport};
 pub use link::LinkHub;
+pub use loops::beat_loop_region;
 pub use track::TrackBuf;
 
 // Exercise the reuse path at build time; used for real in M2.5 (beatgrid).

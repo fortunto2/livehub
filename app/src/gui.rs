@@ -12,6 +12,12 @@ use livehub_engine::{Engine, LinkHub, TrackBuf};
 
 use crate::video::VideoDeck;
 
+/// Loop sizes as `(bar-fraction label, beats)`. One bar = 4 beats, so `¼` = 1
+/// beat: short enough for rolls, while reading musically. At 80 BPM these span
+/// ~0.75 s (¼) to ~12 s (4 bars).
+pub(crate) const LOOP_SIZES: [(&str, usize); 5] =
+    [("¼", 1), ("½", 2), ("1", 4), ("2", 8), ("4", 16)];
+
 /// Launch the GUI. Builds the audio engine first, then hands it to eframe.
 pub fn run(
     device: &str,
@@ -203,16 +209,17 @@ impl App {
             self.engine.seek_secs(d, target);
         }
 
-        // Bar-loop row: engage a loop of N bars from the downbeat at-or-before the
-        // playhead; ✕ clears it. Active size is highlighted.
+        // Loop row: sizes are fractions/multiples of a bar (4 beats) so they read
+        // musically (¼ bar = 1 beat) while resolving down to short loops. The loop
+        // starts on the beat at-or-before the playhead; ✕ clears it.
         ui.horizontal(|ui| {
-            ui.label("loop (bars)");
-            for n in [1usize, 2, 4, 8, 16] {
+            ui.label("loop");
+            for (label, k) in LOOP_SIZES {
                 if ui
-                    .selectable_label(self.loop_len[d] == Some(n), n.to_string())
+                    .selectable_label(self.loop_len[d] == Some(k), label)
                     .clicked()
                 {
-                    self.engage_loop(d, n);
+                    self.engage_loop(d, k);
                 }
             }
             if ui.button("✕").clicked() {
@@ -271,33 +278,20 @@ impl App {
         }
     }
 
-    /// Engage an `n`-BAR loop on `deck`, snapped to the downbeat grid (one unit =
-    /// one bar = the span between consecutive downbeats), starting at the downbeat
-    /// at-or-before the playhead. Falls back to the plain beat grid when downbeats
-    /// weren't detected. No-op if fewer than `n` units remain ahead.
-    fn engage_loop(&mut self, d: usize, n: usize) {
+    /// Engage a `k`-beat loop on `deck` (the loop buttons pass `k` as beats; the
+    /// label is the bar-fraction). The region — start on the beat at-or-before the
+    /// playhead, exactly `k` beats long — comes from the shared pure helper, so the
+    /// GUI and the headless `selftest-loops` agree. No-op if fewer than `k` beats
+    /// remain ahead.
+    fn engage_loop(&mut self, d: usize, k: usize) {
         let Some(track) = self.engine.current_track(d) else { return };
-        // Prefer the bar grid (downbeats, ~every 4 beats); fall back to beats.
-        let grid: &[f64] = if track.downbeats.len() >= 2 {
-            &track.downbeats
-        } else {
-            &track.beats
-        };
-        if grid.len() < 2 {
-            return;
-        }
         let ph = self.engine.playhead_secs(d);
-        // First grid line at-or-before the playhead (clamped to a valid index).
-        let i = grid.partition_point(|&b| b <= ph).saturating_sub(1);
-        let end_idx = i + n;
-        if end_idx >= grid.len() {
-            return; // fewer than n bars left → don't engage a short loop.
+        if let Some((start, end)) =
+            livehub_engine::beat_loop_region(&track.beats, ph, k, track.sample_rate)
+        {
+            self.engine.set_loop(d, start, end);
+            self.loop_len[d] = Some(k);
         }
-        let sr = track.sample_rate as f64;
-        let start_frame = (grid[i] * sr) as usize;
-        let end_frame = (grid[end_idx] * sr) as usize;
-        self.engine.set_loop(d, start_frame, end_frame);
-        self.loop_len[d] = Some(n);
     }
 }
 
