@@ -18,6 +18,15 @@ use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource, Visualizer};
 pub(crate) const LOOP_SIZES: [(&str, usize); 5] =
     [("¼", 1), ("½", 2), ("1", 4), ("2", 8), ("4", 16)];
 
+/// Per-deck accent colour: A = blue, B = red. Used for deck headers, big BPM
+/// readouts, the stacked-overview tints, and the channel faders — so a glance
+/// always tells A from B.
+const DECK_COLOR: [Color32; 2] =
+    [Color32::from_rgb(80, 150, 235), Color32::from_rgb(235, 90, 90)];
+
+/// Mixer column width (px). Narrow on purpose — two vertical faders + cue.
+const MIXER_W: f32 = 150.0;
+
 /// Output-stage (canvas) aspect, switchable live. `Auto` follows the loaded
 /// clips' orientation; the fixed modes force a shape regardless of the sources.
 #[derive(Clone, Copy, PartialEq)]
@@ -87,17 +96,55 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let engine = Engine::new(device, OutputRouting::default(), aux)?;
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 820.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 900.0]),
         ..Default::default()
     };
     eframe::run_native(
         "livehub",
         options,
-        Box::new(move |_cc| -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
+        Box::new(move |cc| -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
+            apply_console_style(&cc.egui_ctx);
             Ok(Box::new(App::new(engine, open, open_b, autoplay)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+}
+
+/// Flat, high-contrast dark theme — Ableton/Linn vibe: a panel fill that's a
+/// touch above pure black, bright text, subtle rounding, a hair more breathing
+/// room between widgets. No skeuomorphism, no grey-on-grey.
+fn apply_console_style(ctx: &egui::Context) {
+    use egui::{CornerRadius, Stroke};
+    let mut visuals = egui::Visuals::dark();
+    let panel = Color32::from_gray(24);
+    let widget = Color32::from_gray(38);
+    let widget_hover = Color32::from_gray(52);
+    let widget_active = Color32::from_gray(64);
+    let radius = CornerRadius::same(4);
+    visuals.panel_fill = panel;
+    visuals.window_fill = panel;
+    visuals.extreme_bg_color = Color32::from_gray(14); // slider troughs / text edits
+    visuals.faint_bg_color = Color32::from_gray(30);
+    visuals.override_text_color = Some(Color32::from_gray(225));
+    visuals.widgets.noninteractive.bg_fill = panel;
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_gray(200));
+    visuals.widgets.inactive.bg_fill = widget;
+    visuals.widgets.inactive.weak_bg_fill = widget;
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.bg_fill = widget_hover;
+    visuals.widgets.hovered.weak_bg_fill = widget_hover;
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.bg_fill = widget_active;
+    visuals.widgets.active.weak_bg_fill = widget_active;
+    visuals.widgets.active.corner_radius = radius;
+    visuals.selection.bg_fill = DECK_COLOR[0].linear_multiply(0.55);
+    visuals.selection.stroke = Stroke::new(1.0, DECK_COLOR[0]);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    ctx.set_style(style);
 }
 
 struct App {
@@ -412,6 +459,70 @@ impl App {
         ui.add_space(8.0);
     }
 
+    /// Stacked A/B match overview: one full-width rect split into a TOP half
+    /// (deck A, blue) and BOTTOM half (deck B, red). Each half draws that deck's
+    /// peak envelope, beat ticks, engaged-loop band, and a vertical playhead —
+    /// the primary beat-match view, replacing the per-deck full waveforms.
+    /// Clicking the top half seeks deck A, the bottom half seeks deck B (with
+    /// beat-snap when `self.snap`).
+    fn draw_stacked_overview(&mut self, ui: &mut egui::Ui, height: f32) {
+        let (response, painter) =
+            ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::click());
+        let rect = response.rect;
+        painter.rect_filled(rect, 4.0, Color32::from_gray(16));
+
+        let half_h = rect.height() * 0.5;
+        let lanes = [
+            Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), rect.top() + half_h)),
+            Rect::from_min_max(Pos2::new(rect.left(), rect.top() + half_h), rect.right_bottom()),
+        ];
+        // Hairline between the two lanes.
+        painter.line_segment(
+            [
+                Pos2::new(rect.left(), rect.center().y),
+                Pos2::new(rect.right(), rect.center().y),
+            ],
+            Stroke::new(1.0, Color32::from_gray(40)),
+        );
+
+        for d in 0..2 {
+            let lane = lanes[d];
+            let track = self.engine.current_track(d);
+            let dur = self.engine.duration_secs(d);
+            let playhead = self.engine.playhead_secs(d);
+            let sr = track.as_deref().map(|t| t.sample_rate as f64).unwrap_or(1.0);
+            let loop_region = self
+                .engine
+                .loop_region(d)
+                .map(|(s, e)| (s as f64 / sr, e as f64 / sr));
+            draw_overview_lane(
+                &painter,
+                lane,
+                track.as_deref(),
+                dur,
+                playhead,
+                loop_region,
+                DECK_COLOR[d],
+            );
+        }
+
+        // Click-to-seek: top half → deck A, bottom half → deck B.
+        if response.clicked() && rect.width() > 0.0 {
+            if let Some(p) = response.interact_pointer_pos() {
+                let d = if p.y < rect.center().y { 0 } else { 1 };
+                let dur = self.engine.duration_secs(d);
+                let frac = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                let seek = frac * dur.max(f64::MIN_POSITIVE);
+                let track = self.engine.current_track(d);
+                let target = match track.as_deref() {
+                    Some(t) if self.snap && !t.beats.is_empty() => snap_to_beat(&t.beats, seek),
+                    _ => seek,
+                };
+                self.engine.seek_secs(d, target);
+            }
+        }
+    }
+
     /// Shared composite renderer used by BOTH the in-app strip and the standalone
     /// output window — one implementation of the A-over-B alpha-dissolve blend.
     ///
@@ -472,12 +583,47 @@ impl App {
         let dur = self.engine.duration_secs(d);
         let loading = self.engine.is_loading(d);
 
+        let accent = DECK_COLOR[d];
+
+        // Header: coloured deck label + source-kind tag.
         ui.horizontal(|ui| {
-            ui.strong(if d == 0 { "Deck A" } else { "Deck B" });
+            ui.colored_label(accent, egui::RichText::new(if d == 0 {
+                "DECK A"
+            } else {
+                "DECK B"
+            }).strong());
             // Tiny tag showing the current picture source kind (file/cam/image).
             if let Some(src) = &self.video[d] {
                 ui.weak(src.kind());
             }
+            if loading {
+                ui.spinner();
+            }
+            // Background-task (download / split) progress for this deck.
+            if let Some(status) = self.busy[d] {
+                ui.spinner();
+                ui.weak(status);
+            }
+        });
+
+        // BIG BPM readout — heading-size, deck-coloured. Shows the effective BPM
+        // (grid × live rate) when the tempo fader is off 1.00×, else the grid BPM.
+        self.deck_rate[d] = self.engine.rate(d);
+        let bpm = self.engine.bpm(d);
+        let rate = self.deck_rate[d];
+        let bpm_text = if bpm > 0.0 {
+            if (rate - 1.0).abs() > 0.0005 {
+                format!("{:.1} BPM", bpm * rate as f64)
+            } else {
+                format!("{bpm:.1} BPM")
+            }
+        } else {
+            "— BPM".to_string()
+        };
+        ui.label(egui::RichText::new(bpm_text).color(accent).heading());
+
+        // Source buttons + transport.
+        ui.horizontal(|ui| {
             if ui.button("📂 Load").clicked() && self.file_rx[d].is_none() {
                 self.open_file_dialog(d);
             }
@@ -510,17 +656,6 @@ impl App {
             if ui.button(label).clicked() {
                 self.engine.toggle(d);
             }
-            // 🎧 = headphone CUE / PFL: preview this deck pre-fader in the
-            // headphones (Arrow out 3/4) before crossfading it into the master.
-            // A lit toggle = cued; the master mix is unaffected either way.
-            let mut cued = self.engine.is_cued(d);
-            if ui
-                .toggle_value(&mut cued, "🎧")
-                .on_hover_text("cue (pre-fader headphone listen)")
-                .changed()
-            {
-                self.engine.set_cue(d, cued);
-            }
             // 🎤 = OPTIONAL karaoke split (demucs): swap this deck's AUDIO to the
             // instrumental stem while its video keeps playing. Needs a source file
             // to split, demucs installed, and the deck idle. When demucs is missing
@@ -536,33 +671,11 @@ impl App {
             if karaoke_btn.clicked() {
                 self.start_karaoke(d);
             }
-            if loading {
-                ui.spinner();
-            }
-            // Background-task (download / split) progress for this deck.
-            if let Some(status) = self.busy[d] {
-                ui.spinner();
-                ui.weak(status);
-            }
         });
 
-        // Waveform strip + loop band + beat ticks + playhead. One cheap Arc clone
-        // per frame; click the strip to seek this deck.
+        // (The full waveform now lives in the shared stacked overview above —
+        // click its top/bottom half to seek this deck.)
         let track = self.engine.current_track(d);
-        let playhead = self.engine.playhead_secs(d);
-        // Convert the engine's frame-based loop region to seconds for drawing.
-        let sr = track.as_deref().map(|t| t.sample_rate as f64).unwrap_or(1.0);
-        let loop_region = self
-            .engine
-            .loop_region(d)
-            .map(|(s, e)| (s as f64 / sr, e as f64 / sr));
-        if let Some(seek) = draw_waveform(ui, track.as_deref(), dur, playhead, loop_region) {
-            let target = match track.as_deref() {
-                Some(t) if self.snap && !t.beats.is_empty() => snap_to_beat(&t.beats, seek),
-                _ => seek,
-            };
-            self.engine.seek_secs(d, target);
-        }
 
         // Loop row: sizes are fractions/multiples of a bar (4 beats) so they read
         // musically (¼ bar = 1 beat) while resolving down to short loops. The loop
@@ -583,15 +696,8 @@ impl App {
             }
         });
 
-        // BPM readout (detected at load time).
-        let bpm = self.engine.bpm(d);
-        if bpm > 0.0 {
-            ui.label(format!("{bpm:.1} BPM"));
-        } else {
-            ui.label("— BPM");
-        }
-
-        // Seek slider follows the playhead; dragging it seeks.
+        // Seek slider follows the playhead; dragging it seeks. (Gain + cue live
+        // in the centre MIXER column; deck gain is no longer drawn here.)
         let mut ph = self.engine.playhead_secs(d);
         let resp = ui.add(
             egui::Slider::new(&mut ph, 0.0..=dur.max(0.001))
@@ -607,20 +713,10 @@ impl App {
         }
         ui.label(format!("{:>6.1} / {:>6.1} s", self.engine.playhead_secs(d), dur));
 
-        ui.horizontal(|ui| {
-            ui.label("gain");
-            if ui
-                .add(egui::Slider::new(&mut self.deck_gain[d], 0.0..=1.5))
-                .changed()
-            {
-                self.engine.set_deck_gain(d, self.deck_gain[d]);
-            }
-        });
-
         // TEMPO row: a ±8% variable-rate (vinyl) fader, an effective-BPM readout,
         // a reset-to-1.00 affordance, and SYNC (match the other deck's tempo).
-        // Mirror the engine's rate first so SYNC's new value shows on the slider.
-        self.deck_rate[d] = self.engine.rate(d);
+        // `deck_rate[d]` is already mirrored from the engine above (for the big
+        // BPM readout), so SYNC's new value shows on the slider.
         ui.horizontal(|ui| {
             ui.label("tempo");
             // ±8% beatmatch range. Pitch shift over this span is negligible
@@ -678,6 +774,60 @@ impl App {
         }
     }
 
+    /// Centre MIXER column: deck A and deck B GAIN as two tall vertical faders
+    /// (tinted A/B), a 🎧 cue toggle under each fader, and the shared headphone
+    /// CUE level. Narrow on purpose. Every control reaches the same engine method
+    /// it did in the old horizontal layout.
+    fn mixer_panel(&mut self, ui: &mut egui::Ui, fader_h: f32) {
+        ui.vertical_centered(|ui| {
+            ui.colored_label(Color32::from_gray(170), egui::RichText::new("MIX").strong());
+        });
+        ui.add_space(4.0);
+
+        // Two vertical gain faders side by side, each with its deck's cue toggle.
+        // The vertical slider's LENGTH is `spacing.slider_width`, so set it here.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = fader_h;
+            for (d, &accent) in DECK_COLOR.iter().enumerate() {
+                ui.vertical_centered(|ui| {
+                    ui.colored_label(accent, if d == 0 { "A" } else { "B" });
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.deck_gain[d], 0.0..=1.5)
+                                .vertical()
+                                .show_value(false),
+                        )
+                        .changed()
+                    {
+                        self.engine.set_deck_gain(d, self.deck_gain[d]);
+                    }
+                    // 🎧 cue toggle (pre-fader headphone listen) under the fader.
+                    let mut cued = self.engine.is_cued(d);
+                    if ui
+                        .toggle_value(&mut cued, "🎧")
+                        .on_hover_text("cue (pre-fader headphone listen)")
+                        .changed()
+                    {
+                        self.engine.set_cue(d, cued);
+                    }
+                });
+                if d == 0 {
+                    ui.add_space(8.0);
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        // Shared headphone CUE bus level (full-width within the narrow column).
+        ui.label("cue");
+        if ui
+            .add(egui::Slider::new(&mut self.cue_gain, 0.0..=1.5).show_value(false))
+            .changed()
+        {
+            self.engine.set_cue_gain(self.cue_gain);
+        }
+    }
+
     /// Engage a `k`-beat loop on `deck` (the loop buttons pass `k` as beats; the
     /// label is the bar-fraction). The region — start on the beat at-or-before the
     /// playhead, exactly `k` beats long — comes from the shared pure helper, so the
@@ -692,6 +842,146 @@ impl App {
             self.engine.set_loop(d, start, end);
             self.loop_len[d] = Some(k);
         }
+    }
+
+    /// TOP BAR: title · BPM-A ⇄ BPM-B with a "matched" lamp (GREEN when the two
+    /// decks' effective BPM are within 0.1) · canvas selector · Output · Snap.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("livehub");
+            ui.add_space(12.0);
+
+            // BPM-A ⇄ BPM-B with a match lamp. Effective BPM = grid × live rate.
+            let eff = [
+                self.engine.bpm(0) * self.engine.rate(0) as f64,
+                self.engine.bpm(1) * self.engine.rate(1) as f64,
+            ];
+            let fmt = |b: f64| if b > 0.0 { format!("{b:.1}") } else { "—".to_string() };
+            ui.colored_label(DECK_COLOR[0], egui::RichText::new(fmt(eff[0])).strong());
+            let matched = eff[0] > 0.0 && eff[1] > 0.0 && (eff[0] - eff[1]).abs() <= 0.1;
+            let lamp = if matched {
+                Color32::from_rgb(60, 220, 110)
+            } else {
+                Color32::from_gray(90)
+            };
+            ui.colored_label(lamp, "⇄");
+            ui.colored_label(DECK_COLOR[1], egui::RichText::new(fmt(eff[1])).strong());
+
+            // Right-aligned: canvas selector, Output, Snap.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.toggle_value(&mut self.snap, "⊞ Snap");
+                ui.toggle_value(&mut self.output_open, "🖥 Output");
+                ui.separator();
+                // Canvas selector (Auto follows the loaded clips' orientation).
+                if self.canvas_mode == CanvasMode::Auto {
+                    let a = CanvasMode::Auto.aspect(&self.video_tex);
+                    ui.weak(if a > 1.05 {
+                        "→16:9"
+                    } else if a < 0.95 {
+                        "→9:16"
+                    } else {
+                        "→1:1"
+                    });
+                }
+                // right_to_left reverses visual order, so iterate reversed to keep
+                // Auto/16:9/9:16/1:1 reading left-to-right on screen.
+                for m in CanvasMode::ALL.into_iter().rev() {
+                    if ui.selectable_label(self.canvas_mode == m, m.label()).clicked() {
+                        self.canvas_mode = m;
+                    }
+                }
+                ui.label("canvas:");
+            });
+        });
+    }
+
+    /// URL import row (shared box, two deck targets). Lives in the Advanced drawer.
+    fn url_import_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("🔗 URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.import_url)
+                    .hint_text("paste a video/audio URL")
+                    .desired_width(360.0),
+            );
+            let has_url = !self.import_url.trim().is_empty();
+            for d in 0..2 {
+                let label = if d == 0 { "⬇A" } else { "⬇B" };
+                let can = self.ytdlp_ok && has_url && self.busy[d].is_none();
+                let btn = ui.add_enabled(can, egui::Button::new(label));
+                let btn = if self.ytdlp_ok {
+                    btn.on_hover_text(if d == 0 { "import → Deck A" } else { "import → Deck B" })
+                } else {
+                    btn.on_disabled_hover_text("install yt-dlp: uv tool install yt-dlp")
+                };
+                if btn.clicked() {
+                    self.start_import(d);
+                }
+            }
+        });
+    }
+
+    /// Shared mic / aux gain + cue note. Lives in the Advanced drawer.
+    fn shared_gains(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("mic ");
+            if ui
+                .add(egui::Slider::new(&mut self.mic_gain, 0.0..=1.5))
+                .changed()
+            {
+                self.engine.set_mic_gain(self.mic_gain);
+            }
+        });
+        if self.engine.has_aux() {
+            ui.horizontal(|ui| {
+                ui.label("aux ");
+                if ui
+                    .add(egui::Slider::new(&mut self.aux_gain, 0.0..=1.5))
+                    .changed()
+                {
+                    self.engine.set_aux_gain(self.aux_gain);
+                }
+            });
+        }
+        ui.weak("🎧 cue needs a 4+ output device (Arrow out 3/4); ignored on a 2ch output.");
+    }
+
+    /// Ableton Link panel. Lives in the Advanced drawer.
+    fn link_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("⛓ Ableton Link");
+        ui.horizontal(|ui| {
+            ui.label(format!("peers: {}", self.link.num_peers()));
+            let mut bpm = self.link.tempo();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut bpm)
+                        .speed(0.1)
+                        .range(20.0..=300.0)
+                        .suffix(" BPM"),
+                )
+                .changed()
+            {
+                self.link.set_tempo(bpm);
+            }
+            let playing = self.link.is_playing();
+            if ui.button(if playing { "⏸ stop" } else { "▶ start" }).clicked() {
+                self.link.set_playing(!playing);
+            }
+        });
+        let mut sss = self.link.start_stop_sync();
+        if ui
+            .checkbox(&mut sss, "transport sync (start/stop shared with peers)")
+            .changed()
+        {
+            self.link.set_start_stop_sync(sss);
+        }
+        let q = self.link.quantum();
+        let phase = self.link.beat_phase();
+        let beat_num = phase.floor() as u32 + 1;
+        ui.add(
+            egui::ProgressBar::new((phase / q) as f32)
+                .text(format!("beat {} / {}", beat_num, q as u32)),
+        );
     }
 }
 
@@ -827,180 +1117,89 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("livehub");
+            // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
+            self.top_bar(ui);
             ui.add_space(6.0);
 
-            // Output-stage (canvas) aspect — switches the composite + output
-            // window live. Auto follows the loaded clips' orientation.
-            ui.horizontal(|ui| {
-                ui.label("canvas:");
-                for m in CanvasMode::ALL {
-                    if ui.selectable_label(self.canvas_mode == m, m.label()).clicked() {
-                        self.canvas_mode = m;
-                    }
-                }
-                if self.canvas_mode == CanvasMode::Auto {
-                    let a = CanvasMode::Auto.aspect(&self.video_tex);
-                    ui.weak(if a > 1.05 {
-                        "→ 16:9"
-                    } else if a < 0.95 {
-                        "→ 9:16"
-                    } else {
-                        "→ 1:1"
-                    });
-                }
-            });
+            // 2. STACKED A/B OVERVIEW — the primary beat-match view (blue over
+            // red). Click the top half to seek A, the bottom half to seek B.
+            self.draw_stacked_overview(ui, 110.0);
+            ui.add_space(8.0);
 
-            // Video COMPOSITE: deck A under deck B, blended by the crossfader.
+            // 3. VIDEO COMPOSITE (hero): deck A under deck B, blended by the
+            // crossfader. Canvas-aware, ~300 px cap.
             self.video_composite(ui);
 
-            // Two deck strips side by side.
-            ui.columns(2, |cols| {
-                self.deck_panel(&mut cols[0], 0);
-                self.deck_panel(&mut cols[1], 1);
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                // Global beat-snap toggle: when ON, every seek rounds to the
-                // nearest beat (applies to both decks' waveform clicks + seek).
-                ui.toggle_value(&mut self.snap, "⊞ Snap to beats");
-                // Pop out the controls-free OUTPUT WINDOW for OBS to capture.
-                ui.toggle_value(&mut self.output_open, "🖥 Output");
-            });
-
-            // Shared URL import: one box, two deck targets. Downloads a ≤720p mp4
-            // (audio+video) via yt-dlp on a worker thread, then loads it into the
-            // chosen deck. Disabled (with a hint) when yt-dlp is missing or the
-            // target deck is busy.
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("🔗 URL");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_url)
-                        .hint_text("paste a video/audio URL")
-                        .desired_width(360.0),
+            // 4. THREE COLUMNS: DECK A | MIXER | DECK B. Manual split — decks
+            // flex, the mixer is a fixed narrow column.
+            let full_w = ui.available_width();
+            let spacing = ui.spacing().item_spacing.x;
+            let deck_w = ((full_w - MIXER_W - 2.0 * spacing) * 0.5).max(120.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(deck_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(deck_w);
+                        self.deck_panel(ui, 0);
+                    },
                 );
-                let has_url = !self.import_url.trim().is_empty();
-                for d in 0..2 {
-                    let label = if d == 0 { "⬇A" } else { "⬇B" };
-                    let can = self.ytdlp_ok && has_url && self.busy[d].is_none();
-                    let btn = ui.add_enabled(can, egui::Button::new(label));
-                    let btn = if self.ytdlp_ok {
-                        btn.on_hover_text(if d == 0 {
-                            "import → Deck A"
-                        } else {
-                            "import → Deck B"
-                        })
-                    } else {
-                        btn.on_disabled_hover_text("install yt-dlp: uv tool install yt-dlp")
-                    };
-                    if btn.clicked() {
-                        self.start_import(d);
-                    }
-                }
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(MIXER_W, 0.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(MIXER_W);
+                        self.mixer_panel(ui, 130.0);
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(deck_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(deck_w);
+                        self.deck_panel(ui, 1);
+                    },
+                );
             });
-
-            ui.add_space(6.0);
-            // The crossfader, full width, between the decks and the shared section.
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.crossfade, 0.0..=1.0)
-                        .show_value(false)
-                        .text("A  ⟷  B"),
-                )
-                .changed()
-            {
-                self.engine.set_crossfade(self.crossfade);
-            }
 
             ui.add_space(8.0);
-            ui.separator();
 
-            // Shared mic / aux gain.
+            // 5. CROSSFADER — full width, prominent, below the columns.
             ui.horizontal(|ui| {
-                ui.label("mic ");
-                if ui
-                    .add(egui::Slider::new(&mut self.mic_gain, 0.0..=1.5))
-                    .changed()
-                {
-                    self.engine.set_mic_gain(self.mic_gain);
+                ui.colored_label(DECK_COLOR[0], egui::RichText::new("A").strong());
+                let xfade = egui::Slider::new(&mut self.crossfade, 0.0..=1.0)
+                    .show_value(false);
+                let avail = ui.available_width() - 24.0;
+                ui.spacing_mut().slider_width = avail.max(80.0);
+                if ui.add(xfade).changed() {
+                    self.engine.set_crossfade(self.crossfade);
                 }
+                ui.colored_label(DECK_COLOR[1], egui::RichText::new("B").strong());
             });
-            if self.engine.has_aux() {
-                ui.horizontal(|ui| {
-                    ui.label("aux ");
-                    if ui
-                        .add(egui::Slider::new(&mut self.aux_gain, 0.0..=1.5))
-                        .changed()
-                    {
-                        self.engine.set_aux_gain(self.aux_gain);
-                    }
+
+            ui.add_space(8.0);
+
+            // 6. ADVANCED DRAWER — collapsed during a set: Master FX, URL import,
+            // mic/aux gains, Ableton Link, and the device/underruns label.
+            egui::CollapsingHeader::new("⚙ Advanced")
+                .default_open(false)
+                .show(ui, |ui| {
+                    self.master_fx_panel(ui);
+                    ui.separator();
+                    self.url_import_row(ui);
+                    ui.separator();
+                    self.shared_gains(ui);
+                    ui.separator();
+                    self.link_panel(ui);
+                    ui.separator();
+                    ui.label(format!(
+                        "device {} Hz · underruns {}",
+                        self.engine.device_sr(),
+                        self.engine.underruns()
+                    ));
                 });
-            }
-
-            // Shared headphone CUE bus level. Drives whatever decks have their 🎧
-            // toggle lit; harmless when nothing is cued.
-            ui.horizontal(|ui| {
-                ui.label("cue ");
-                if ui
-                    .add(egui::Slider::new(&mut self.cue_gain, 0.0..=1.5))
-                    .changed()
-                {
-                    self.engine.set_cue_gain(self.cue_gain);
-                }
-            });
-            ui.weak("🎧 cue needs a 4+ output device (Arrow out 3/4); ignored on a 2ch output.");
-
-            ui.add_space(8.0);
-            ui.separator();
-            // Master-bus CLAP insert: the whole mix passes through one effect.
-            self.master_fx_panel(ui);
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label("⛓ Ableton Link");
-            ui.horizontal(|ui| {
-                ui.label(format!("peers: {}", self.link.num_peers()));
-                let mut bpm = self.link.tempo();
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut bpm)
-                            .speed(0.1)
-                            .range(20.0..=300.0)
-                            .suffix(" BPM"),
-                    )
-                    .changed()
-                {
-                    self.link.set_tempo(bpm);
-                }
-                let playing = self.link.is_playing();
-                if ui.button(if playing { "⏸ stop" } else { "▶ start" }).clicked() {
-                    self.link.set_playing(!playing);
-                }
-            });
-            let mut sss = self.link.start_stop_sync();
-            if ui
-                .checkbox(&mut sss, "transport sync (start/stop shared with peers)")
-                .changed()
-            {
-                self.link.set_start_stop_sync(sss);
-            }
-            let q = self.link.quantum();
-            let phase = self.link.beat_phase();
-            let beat_num = phase.floor() as u32 + 1;
-            ui.add(
-                egui::ProgressBar::new((phase / q) as f32)
-                    .text(format!("beat {} / {}", beat_num, q as u32)),
-            );
-
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label(format!(
-                "device {} Hz · underruns {}",
-                self.engine.device_sr(),
-                self.engine.underruns()
-            ));
         });
 
         // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live
@@ -1072,84 +1271,67 @@ fn snap_to_beat(beats: &[f64], t: f64) -> f64 {
         .unwrap_or(t)
 }
 
-/// Draw the deck waveform strip: peak envelope, an engaged-loop band, beat ticks
-/// (downbeats brighter and thicker), and a moving playhead. Returns a seek
-/// target in seconds when the user clicks the strip. `loop_region` is the active
-/// beat loop in seconds. Handles `None`/empty/zero-duration without panic.
-fn draw_waveform(
-    ui: &mut egui::Ui,
+/// Draw ONE deck's lane of the stacked overview into `lane`: peak envelope
+/// (tinted `accent`), an engaged-loop band, beat ticks (downbeats brighter),
+/// and a moving playhead. Pure painting — interaction (click-to-seek) is owned
+/// by the caller, which knows which half maps to which deck. No-ops on
+/// empty/zero-duration tracks.
+fn draw_overview_lane(
+    painter: &egui::Painter,
+    lane: Rect,
     track: Option<&TrackBuf>,
     duration: f64,
     playhead: f64,
     loop_region: Option<(f64, f64)>,
-) -> Option<f64> {
-    let (response, painter) =
-        ui.allocate_painter(Vec2::new(ui.available_width(), 80.0), Sense::click());
-    let rect: Rect = response.rect;
+    accent: Color32,
+) {
+    let map_x = |nx: f32| lane.left() + nx.clamp(0.0, 1.0) * lane.width();
 
-    painter.rect_filled(rect, 0.0, Color32::from_gray(20));
-
-    let map_x = |nx: f32| rect.left() + nx.clamp(0.0, 1.0) * rect.width();
-
-    let track = track?;
+    let Some(track) = track else { return };
     let dur = duration.max(f64::MIN_POSITIVE);
 
-    // Reserve a thin beat lane at the bottom; the waveform owns the area above it
-    // so grid ticks never cross it.
-    let lane_h = 14.0_f32;
-    let wave_bottom = rect.bottom() - lane_h;
-    let wave_mid = (rect.top() + wave_bottom) * 0.5;
-    let wave_half = (wave_bottom - rect.top()) * 0.5;
+    // Reserve a thin beat lane at the bottom; the waveform owns the area above.
+    let lane_h = 10.0_f32;
+    let wave_bottom = lane.bottom() - lane_h;
+    let wave_mid = (lane.top() + wave_bottom) * 0.5;
+    let wave_half = (wave_bottom - lane.top()) * 0.5;
     let map_y = |v: f32| wave_mid - v.clamp(-1.0, 1.0) * wave_half;
 
-    // Waveform — clean, nothing drawn over it.
-    let wave_stroke = Stroke::new(1.0, Color32::from_rgb(120, 200, 255));
+    // Engaged beat-loop band, under the waveform but over the background.
+    if let Some((ls, le)) = loop_region {
+        let band = Rect::from_min_max(
+            Pos2::new(map_x((ls / dur) as f32), lane.top()),
+            Pos2::new(map_x((le / dur) as f32), wave_bottom),
+        );
+        painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 210, 40, 40));
+    }
+
+    // Peak envelope, tinted with the deck accent.
+    let wave_stroke = Stroke::new(1.0, accent);
     let n = track.waveform.len().max(1);
     for (i, &(lo, hi)) in track.waveform.iter().enumerate() {
         let x = map_x(i as f32 / n as f32);
         painter.line_segment([Pos2::new(x, map_y(hi)), Pos2::new(x, map_y(lo))], wave_stroke);
     }
 
-    // Engaged beat-loop band: a translucent amber rect over the active region,
-    // painted above the waveform but under the ticks + playhead.
-    if let Some((ls, le)) = loop_region {
-        let x0 = map_x((ls / dur) as f32);
-        let x1 = map_x((le / dur) as f32);
-        let band = Rect::from_min_max(
-            Pos2::new(x0, rect.top()),
-            Pos2::new(x1, wave_bottom),
-        );
-        painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 210, 40, 40));
-    }
-
-    // Beat lane at the bottom: a short tick per beat, taller brighter ticks on
-    // downbeats — a rhythm ruler that never touches the waveform.
-    let beat_stroke = Stroke::new(1.0, Color32::from_gray(120));
-    let beat_top = rect.bottom() - 5.0;
+    // Beat ruler: short ticks per beat, taller brighter ticks on downbeats.
+    let beat_stroke = Stroke::new(1.0, Color32::from_gray(110));
+    let beat_top = lane.bottom() - 4.0;
     for &t in &track.beats {
         let x = map_x((t / dur) as f32);
-        painter.line_segment([Pos2::new(x, beat_top), Pos2::new(x, rect.bottom())], beat_stroke);
+        painter.line_segment([Pos2::new(x, beat_top), Pos2::new(x, lane.bottom())], beat_stroke);
     }
     let down_stroke = Stroke::new(1.5, Color32::from_rgb(255, 205, 110));
-    let down_top = rect.bottom() - lane_h;
+    let down_top = lane.bottom() - lane_h;
     for &t in &track.downbeats {
         let x = map_x((t / dur) as f32);
-        painter.line_segment([Pos2::new(x, down_top), Pos2::new(x, rect.bottom())], down_stroke);
+        painter.line_segment([Pos2::new(x, down_top), Pos2::new(x, lane.bottom())], down_stroke);
     }
 
-    // Playhead cursor on top of everything (full height).
+    // Playhead cursor on top (full lane height).
     let px = map_x((playhead / dur) as f32);
     painter.line_segment(
-        [Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())],
-        Stroke::new(2.0, Color32::RED),
+        [Pos2::new(px, lane.top()), Pos2::new(px, lane.bottom())],
+        Stroke::new(2.0, Color32::WHITE),
     );
-
-    // Click-to-seek (guard against a zero-width strip → NaN).
-    if response.clicked() && rect.width() > 0.0 {
-        if let Some(p) = response.interact_pointer_pos() {
-            let frac = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-            return Some(frac * dur);
-        }
-    }
-    None
 }
