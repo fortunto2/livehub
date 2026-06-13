@@ -1,0 +1,17 @@
+[package]
+name = "livehub-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+livehub-core = { path = "../livehub-core" }
+video-audio = { workspace = true }
+video-core = { workspace = true }
+anyhow = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+atomic_float = { workspace = true }
+arc-swap = { workspace = true }
+symphonia = { workspace = true }
+rusty_link = { workspace = true }

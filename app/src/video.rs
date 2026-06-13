@@ -1,0 +1,814 @@
+//! M3 video deck — ONE video deck whose displayed frame = f(audio playhead).
+//!
+//! The loaded media file's AUDIO already drives the engine playhead (symphonia
+//! decodes the mp4/mov AAC stream via `load_track_background`). Here a worker
+//! thread decodes that same file's VIDEO frames IN-PROCESS via `ffmpeg-next`
+//! (libav* 8) and PACES them to the audio playhead via a [`Transport`] handle,
+//! so play/seek of the audio make the video follow. Frame = f(playhead).
+//!
+//! Decode is in-process (no `ffmpeg` CLI child, no rawvideo pipe): the worker
+//! owns an open `ffmpeg::format::Input`, a `decoder`, and a swscale `scaler` to
+//! RGBA at the fit-box size. A transport discontinuity (seek / load) is served
+//! by `ictx.seek(...)` + `decoder.flush()` on the ALREADY-OPEN container — a
+//! frame-accurate, near-instant seek with no process respawn (the win over the
+//! old CLI pipe, where a backward seek cost ~50-90ms to re-launch ffmpeg).
+//!
+//! `ffprobe` (CLI) is still used for the lightweight dims/fps/duration probe.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
+
+use ffmpeg_next as ffmpeg;
+use ffmpeg::format::Pixel;
+
+use livehub_engine::Transport;
+
+/// Only a genuine large stall — not the normal seek latency, which the in-process
+/// `ictx.seek` now serves near-instantly — should trigger a hard re-seek. Set well
+/// above typical jitter to avoid a re-seek storm.
+const MAX_DRIFT_SECS: f64 = 2.0;
+
+/// Drop (skip presenting) and pull the next frame only when the video is more
+/// than this far behind the compensated playhead — generous enough that normal
+/// jitter doesn't cause periodic drop-freezes ("залип").
+const DROP_TOL_SECS: f64 = 0.10;
+
+/// Default display-pipeline compensation (ms): the video frame for content-time
+/// `t` is shown slightly before the audio reaches `t`, so that after the GUI →
+/// texture → GPU → display delay it lands in sync. User-tunable at runtime.
+const DEFAULT_OFFSET_MS: i64 = 80;
+
+/// Cap on wall-clock extrapolation when smoothing the stepped audio playhead into
+/// a continuous one — must exceed the audio buffer step, and bounds how far the
+/// estimate runs ahead while paused.
+const SMOOTH_MAX_EXTRAP: f64 = 0.10;
+
+/// One-time `ffmpeg::init()` for the whole process (registers codecs / formats).
+fn ensure_ffmpeg_init() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Err(e) = ffmpeg::init() {
+            eprintln!("video: ffmpeg init failed: {e}");
+        }
+    });
+}
+
+/// A monotonic playhead source for the video worker, so it can run against the
+/// real audio engine (`Transport`) or a synthetic clock in the headless pace test.
+pub trait VideoClock: Send + 'static {
+    fn pos_secs(&self) -> f64;
+    fn epoch(&self) -> u64;
+}
+
+impl VideoClock for Transport {
+    fn pos_secs(&self) -> f64 {
+        self.playhead_secs()
+    }
+    fn epoch(&self) -> u64 {
+        self.seek_epoch()
+    }
+}
+
+/// One decoded RGBA video frame, ready for upload to a GPU texture.
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Lock-light shared slot the worker writes and the GUI reads. The GUI only
+/// re-uploads to the GPU when `generation` changes, so it never re-reads an
+/// unchanged frame.
+#[derive(Default)]
+struct FrameSlot {
+    frame: Mutex<Option<VideoFrame>>,
+    generation: AtomicU64,
+    /// Content time (seconds, f64 bits) of the latest presented frame — lets the
+    /// headless pace test measure sync error against the playhead.
+    pts_bits: AtomicU64,
+}
+
+/// A live video deck: an in-process ffmpeg-driven worker thread plus the shared
+/// frame slot it feeds. Dropping the deck signals the worker to stop and joins
+/// it; the worker owns the decode context, which drops cleanly (RAII).
+pub struct VideoDeck {
+    slot: Arc<FrameSlot>,
+    running: Arc<AtomicBool>,
+    /// Display-pipeline compensation in ms (present this much before content-time).
+    /// Shared with the worker; the GUI exposes it as a slider.
+    offset_ms: Arc<AtomicI64>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Video stream metadata pulled from `ffprobe`.
+struct Probe {
+    width: u32,
+    height: u32,
+    fps: f64,
+}
+
+impl VideoDeck {
+    /// Probe `path` for a video stream and, if present, spawn the sync worker.
+    /// Returns `None` when the file has no video stream (audio-only) or ffprobe
+    /// fails — the caller then runs audio-only with no picture.
+    pub fn open<C: VideoClock>(path: PathBuf, clock: C) -> Option<VideoDeck> {
+        let probe = match ffprobe(&path) {
+            Some(p) => p,
+            None => {
+                eprintln!("video: no video stream in {} (audio-only)", path.display());
+                return None;
+            }
+        };
+
+        // Decode at a modest size (fit within a 480×480 box, only downscale, even
+        // dims) so each RGBA frame stays light and the worker sustains real time;
+        // the GUI shows it ≤300px tall anyway.
+        let (width, height) = fit_box(probe.width, probe.height, 480, 480);
+        // Clamp the paced fps to something sane; ffprobe can report 0/0.
+        let fps = if probe.fps.is_finite() && probe.fps > 0.0 {
+            probe.fps.clamp(1.0, 120.0)
+        } else {
+            25.0
+        };
+
+        let slot = Arc::new(FrameSlot::default());
+        let running = Arc::new(AtomicBool::new(true));
+        let offset_ms = Arc::new(AtomicI64::new(DEFAULT_OFFSET_MS));
+
+        let worker = {
+            let slot = slot.clone();
+            let running = running.clone();
+            let offset_ms = offset_ms.clone();
+            std::thread::Builder::new()
+                .name("video-worker".into())
+                .spawn(move || {
+                    worker_loop(path, clock, slot, running, offset_ms, width, height, fps);
+                })
+                .ok()?
+        };
+
+        Some(VideoDeck { slot, running, offset_ms, worker: Some(worker) })
+    }
+
+    /// The worker's monotonic frame generation. The GUI compares this to its own
+    /// last-seen value to decide whether to re-upload the texture.
+    pub fn generation(&self) -> u64 {
+        self.slot.generation.load(Ordering::Acquire)
+    }
+
+    /// Content time (seconds) of the latest presented frame.
+    pub fn frame_pts(&self) -> f64 {
+        f64::from_bits(self.slot.pts_bits.load(Ordering::Acquire))
+    }
+
+    /// Run `f` over the latest frame, if any. Returns `None` when no frame has
+    /// been produced yet. Keeps the lock held only for the closure's duration.
+    pub fn with_latest<R>(&self, f: impl FnOnce(&VideoFrame) -> R) -> Option<R> {
+        let guard = self.slot.frame.lock().ok()?;
+        guard.as_ref().map(f)
+    }
+
+    /// Display-pipeline compensation in ms (positive = show the video earlier).
+    pub fn offset_ms(&self) -> i64 {
+        self.offset_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_offset_ms(&self, ms: i64) {
+        self.offset_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+impl Drop for VideoDeck {
+    fn drop(&mut self) {
+        // The worker checks `running` each iteration and never blocks on I/O for
+        // more than one packet read (no child process to park on), so flipping
+        // the flag and joining is a clean, prompt shutdown; the worker owns the
+        // ffmpeg context and drops it on exit (RAII).
+        self.running.store(false, Ordering::Release);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// In-process video decoder: an open container + decoder + RGBA scaler, with
+/// frame-accurate `seek` on the ALREADY-OPEN container and a one-packet-at-a-time
+/// `next_frame` pull (so seeks can interleave between reads without a respawn).
+struct Decoder {
+    ictx: ffmpeg::format::context::Input,
+    decoder: ffmpeg::decoder::Video,
+    scaler: ffmpeg::software::scaling::Context,
+    stream_index: usize,
+    /// Seconds per stream time-base tick — converts a frame's raw PTS to seconds.
+    tb_f64: f64,
+    /// Reusable decode + scale frames, allocated once.
+    raw: ffmpeg::frame::Video,
+    rgba: ffmpeg::frame::Video,
+    /// Set once `next_frame` has drained all packets and the decoder is empty.
+    eof: bool,
+    /// Frames with PTS strictly below this are decoded but skipped (the keyframe
+    /// lead-in after a fast-seek), so the first PRESENTED frame is at/after the
+    /// seek target — reproducing the old CLI `-ss` fast-seek trim.
+    min_pts: f64,
+}
+
+impl Decoder {
+    /// Open `path`, select the best video stream, and build a decoder + a swscale
+    /// scaler to RGBA at `(out_w, out_h)`. Returns `None` on any failure.
+    fn open(path: &Path, out_w: u32, out_h: u32) -> Option<Decoder> {
+        let ictx = ffmpeg::format::input(&path).ok()?;
+
+        let stream = ictx.streams().best(ffmpeg::media::Type::Video)?;
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+        let tb_f64 = f64::from(time_base.0) / f64::from(time_base.1);
+
+        let mut codec_ctx =
+            ffmpeg::codec::context::Context::from_parameters(stream.parameters()).ok()?;
+        codec_ctx.set_threading(ffmpeg::threading::Config {
+            kind: ffmpeg::threading::Type::Frame,
+            count: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        });
+        let decoder = codec_ctx.decoder().video().ok()?;
+
+        let scaler = ffmpeg::software::scaling::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            Pixel::RGBA,
+            out_w,
+            out_h,
+            ffmpeg::software::scaling::Flags::FAST_BILINEAR,
+        )
+        .ok()?;
+
+        Some(Decoder {
+            ictx,
+            decoder,
+            scaler,
+            stream_index,
+            tb_f64,
+            raw: ffmpeg::frame::Video::empty(),
+            rgba: ffmpeg::frame::Video::empty(),
+            eof: false,
+            min_pts: -f64::INFINITY,
+        })
+    }
+
+    /// Frame-accurate fast-seek to `t` seconds on the OPEN container: jump to the
+    /// keyframe at/before `t`, flush the decoder's stale reference frames, and arm
+    /// the post-seek PTS trim so the next presented frame is at/after `t`. This is
+    /// the near-instant path that replaces the old kill+respawn.
+    fn seek(&mut self, t: f64) {
+        // `ictx.seek` units are AV_TIME_BASE (microseconds), NOT stream time-base.
+        // `..seek_us` = "land on a keyframe at/before seek_us". Seek a touch before
+        // `t` so the wanted frame is reached after the keyframe lead-in.
+        let seek_us = ((t - 0.5).max(0.0) * 1_000_000.0) as i64;
+        let _ = self.ictx.seek(seek_us, ..seek_us);
+        self.decoder.flush();
+        self.eof = false;
+        self.min_pts = t;
+    }
+
+    /// Pull, decode, and scale ONE RGBA frame at/after the current position.
+    /// Returns `(pts_secs, &rgba_frame)`, or `None` at end-of-stream. Reads packets
+    /// one at a time so a `seek` can interleave between calls. Skips frames whose
+    /// PTS is below `min_pts` (the fast-seek keyframe lead-in).
+    fn next_frame(&mut self) -> Option<(f64, &ffmpeg::frame::Video)> {
+        loop {
+            // Drain any frames the decoder already has buffered from prior packets.
+            while self.decoder.receive_frame(&mut self.raw).is_ok() {
+                let pts = self
+                    .raw
+                    .timestamp()
+                    .map(|t| t as f64 * self.tb_f64)
+                    .unwrap_or(-1.0);
+                if pts < 0.0 || pts < self.min_pts {
+                    continue; // negative/pre-seek-target frame → decode but skip.
+                }
+                self.scaler.run(&self.raw, &mut self.rgba).ok()?;
+                return Some((pts, &self.rgba));
+            }
+
+            if self.eof {
+                return None;
+            }
+
+            // Feed the next packet for our stream (one av_read_frame at a time).
+            let mut packet = ffmpeg::Packet::empty();
+            match packet.read(&mut self.ictx) {
+                Ok(()) => {
+                    if packet.stream() == self.stream_index {
+                        let _ = self.decoder.send_packet(&packet);
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => {
+                    let _ = self.decoder.send_eof();
+                    self.eof = true; // drain remaining buffered frames, then stop.
+                }
+                Err(_) => {
+                    self.eof = true;
+                    let _ = self.decoder.send_eof();
+                }
+            }
+        }
+    }
+}
+
+/// Worker thread: decode frames in-process via `ffmpeg-next`, pace each to the
+/// audio playhead by its REAL PTS, and frame-accurately re-seek the open
+/// container whenever the transport reports a discontinuity (no respawn).
+#[allow(clippy::too_many_arguments)]
+fn worker_loop<C: VideoClock>(
+    path: PathBuf,
+    clock: C,
+    slot: Arc<FrameSlot>,
+    running: Arc<AtomicBool>,
+    offset_ms: Arc<AtomicI64>,
+    w: u32,
+    h: u32,
+    fps: f64,
+) {
+    ensure_ffmpeg_init();
+
+    let mut epoch = clock.epoch();
+    let start_t = clock.pos_secs().max(0.0);
+
+    let mut dec = match Decoder::open(&path, w, h) {
+        Some(d) => d,
+        None => {
+            eprintln!("video: in-process decoder open failed for {}", path.display());
+            return;
+        }
+    };
+    dec.seek(start_t);
+
+    // `pending` holds the next decoded frame (pts, rgba bytes) waiting to be paced
+    // in: we decode AHEAD of the playhead by one frame, present it when the
+    // playhead reaches its pts, and only pull the next once it's consumed.
+    let mut pending: Option<(f64, Vec<u8>)> = pull_packed(&mut dec, w, h);
+
+    // Continuous-playhead reconstruction: anchor to the raw (stepped) audio clock
+    // when it advances, extrapolate with wall-clock in between (capped). Kills the
+    // step-induced judder a coarse audio-callback playhead would otherwise cause.
+    let mut sm_raw = clock.pos_secs();
+    let mut sm_wall = Instant::now();
+
+    while running.load(Ordering::Acquire) {
+        // --- handle a discontinuity (seek / load) → frame-accurate re-seek ---
+        let cur_epoch = clock.epoch();
+        if cur_epoch != epoch {
+            epoch = cur_epoch;
+            let target = clock.pos_secs().max(0.0);
+            dec.seek(target); // INSTANT on the open container — the big win.
+            pending = pull_packed(&mut dec, w, h);
+            // Re-anchor the smoothing so we don't snap-drop right after the seek.
+            sm_raw = clock.pos_secs();
+            sm_wall = Instant::now();
+            continue;
+        }
+
+        // Content time of the frame currently waiting to be presented.
+        let (vt, _) = match pending {
+            Some((pts, _)) => (pts, ()),
+            None => {
+                // EOF (or decode exhausted) → hold the last frame, idle until seek.
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+
+        // Smooth the stepped audio clock into a continuous playhead.
+        let raw = clock.pos_secs();
+        let now = Instant::now();
+        if raw > sm_raw + 1e-6 || raw < sm_raw - 0.05 {
+            sm_raw = raw; // advanced a step (or seeked) → re-anchor
+            sm_wall = now;
+        }
+        let smoothed = sm_raw + (now - sm_wall).as_secs_f64().min(SMOOTH_MAX_EXTRAP);
+        // Compensate the display pipeline: aim `offset` ahead so the frame is
+        // presented early enough to land on screen in sync with the audio.
+        let offset = offset_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+        let ph = smoothed + offset;
+
+        // Present when the (compensated) playhead reaches vt; drop stale frames if
+        // the audio ran ahead; hold (sleep) if we're early or paused.
+        let lead = ph - vt; // >0: audio ahead of this frame; <0: frame is early.
+
+        // Fell too far behind (drift, or a heavy stretch the worker couldn't keep
+        // up with) → snap to the playhead with one re-seek, not hundreds of drops.
+        if lead > MAX_DRIFT_SECS {
+            dec.seek(ph.max(0.0));
+            pending = pull_packed(&mut dec, w, h);
+            continue;
+        }
+
+        if lead < -0.5 / fps {
+            // Frame is in the future (or transport paused/behind) → hold it, wait.
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        // Audio is well ahead (> DROP_TOL): the pending frame is stale — discard it
+        // and pull the next to catch up, content-accurately, WITHOUT presenting.
+        // Small jitter does NOT drop (avoids periodic freezes).
+        if lead > DROP_TOL_SECS {
+            pending = pull_packed(&mut dec, w, h);
+            continue;
+        }
+
+        // In the present window → show the pending frame, then pull the next.
+        if let Some((pts, bytes)) = pending.take() {
+            present_frame(&slot, &bytes, w, h, pts);
+        }
+        pending = pull_packed(&mut dec, w, h);
+    }
+    // `dec` drops here → container/decoder/scaler freed (RAII).
+}
+
+/// Pull one decoded+scaled frame from `dec` and copy its RGBA plane into a tight
+/// `w*h*4` buffer (stripping swscale's row-stride padding). Returns `None` at EOF.
+fn pull_packed(dec: &mut Decoder, w: u32, h: u32) -> Option<(f64, Vec<u8>)> {
+    let (pts, frame) = dec.next_frame()?;
+    let bytes = pack_rgba(frame, w, h);
+    Some((pts, bytes))
+}
+
+/// Copy an RGBA `frame`'s plane 0 into a tight `w*h*4` `Vec`, stripping the
+/// swscale row-stride padding (`stride` may exceed `w*4`).
+fn pack_rgba(frame: &ffmpeg::frame::Video, w: u32, h: u32) -> Vec<u8> {
+    let row_bytes = w as usize * 4;
+    let frame_bytes = row_bytes * h as usize;
+    let data = frame.data(0);
+    let stride = frame.stride(0);
+
+    let mut packed: Vec<u8> = Vec::with_capacity(frame_bytes);
+    if stride == row_bytes {
+        packed.extend_from_slice(&data[..frame_bytes.min(data.len())]);
+    } else {
+        for y in 0..h as usize {
+            let start = y * stride;
+            packed.extend_from_slice(&data[start..start + row_bytes]);
+        }
+    }
+    packed
+}
+
+/// Copy one RGBA frame into the shared slot (reusing its buffer when the size
+/// matches) and bump the generation so the GUI re-uploads it.
+fn present_frame(slot: &FrameSlot, buf: &[u8], w: u32, h: u32, pts: f64) {
+    if let Ok(mut g) = slot.frame.lock() {
+        match g.as_mut() {
+            Some(fr) if fr.width == w && fr.height == h => fr.rgba.copy_from_slice(buf),
+            _ => {
+                *g = Some(VideoFrame { width: w, height: h, rgba: buf.to_vec() });
+            }
+        }
+    }
+    slot.pts_bits.store(pts.to_bits(), Ordering::Release);
+    slot.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Scale `(w, h)` to fit within `(max_w, max_h)`, only downscaling, even dims ≥2.
+fn fit_box(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let s = (max_w as f64 / w.max(1) as f64)
+        .min(max_h as f64 / h.max(1) as f64)
+        .min(1.0);
+    let sw = (((w as f64 * s) as u32).max(2)) & !1;
+    let sh = (((h as f64 * s) as u32).max(2)) & !1;
+    (sw, sh)
+}
+
+/// `ffprobe` the first video stream for width / height / fps. Returns `None` for
+/// audio-only files, missing streams, or any parse failure.
+fn ffprobe(path: &PathBuf) -> Option<Probe> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // CSV line: `WIDTH,HEIGHT,NUM/DEN` (empty when there is no video stream).
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut it = line.splitn(3, ',');
+    let width: u32 = it.next()?.trim().parse().ok()?;
+    let height: u32 = it.next()?.trim().parse().ok()?;
+    let rate = it.next()?.trim(); // "num/den"
+    let fps = parse_rational(rate);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Probe { width, height, fps })
+}
+
+/// Headless smoke test of the video path (no GUI, no audio device): probe, read
+/// a frame at t=0 and a few frames later (verify they differ → real motion), and
+/// a seek read at mid-duration. Returns a human-readable report.
+pub fn selftest_video(path: &Path) -> String {
+    let pb = path.to_path_buf();
+    let probe = match ffprobe(&pb) {
+        Some(p) => p,
+        None => return "  video : none (audio-only)".to_string(),
+    };
+    let (w, h) = fit_box(probe.width, probe.height, 480, 480);
+    let fps = if probe.fps.is_finite() && probe.fps > 0.0 {
+        probe.fps.clamp(1.0, 120.0)
+    } else {
+        25.0
+    };
+    let mut out = format!(
+        "  video : {}x{} @ {:.2}fps  (scaled {w}x{h}, {} B/frame)",
+        probe.width,
+        probe.height,
+        fps,
+        (w as usize) * (h as usize) * 4
+    );
+    let t_late = 10.0 / fps;
+    match (
+        read_frame_luma(&pb, 0.0, w, h, fps),
+        read_frame_luma(&pb, t_late, w, h, fps),
+    ) {
+        (Some(a), Some(b)) => {
+            let verdict = if (a - b).abs() > 0.3 {
+                "differ ✓ (real motion)"
+            } else {
+                "near-identical"
+            };
+            out.push_str(&format!(
+                "\n  frames: t=0 luma={a:.1}, t={t_late:.2}s luma={b:.1}  → {verdict}"
+            ));
+        }
+        _ => out.push_str("\n  frames: ERROR reading frames"),
+    }
+    if let Some(dur) = ffprobe_duration(&pb) {
+        match read_frame_luma(&pb, dur / 2.0, w, h, fps) {
+            Some(m) => out.push_str(&format!(
+                "\n  seek  : t={:.1}s read OK (luma={m:.1}) ✓",
+                dur / 2.0
+            )),
+            None => out.push_str("\n  seek  : ERROR reading frame after seek"),
+        }
+    }
+    out
+}
+
+/// In-process decode of a single RGBA frame at time `t`, returning its mean luma
+/// (0..255), or `None` on failure. (`fps` is unused now that PTS drives timing,
+/// but kept in the signature so the selftest call sites stay unchanged.)
+fn read_frame_luma(path: &Path, t: f64, w: u32, h: u32, _fps: f64) -> Option<f64> {
+    ensure_ffmpeg_init();
+    let mut dec = Decoder::open(path, w, h)?;
+    if t > 0.0 {
+        dec.seek(t);
+    }
+    let (_pts, frame) = dec.next_frame()?;
+    let buf = pack_rgba(frame, w, h);
+    let px = (w as usize) * (h as usize);
+    let mut sum = 0.0f64;
+    for p in buf.chunks_exact(4) {
+        sum += 0.30 * p[0] as f64 + 0.59 * p[1] as f64 + 0.11 * p[2] as f64;
+    }
+    Some(sum / px as f64)
+}
+
+/// A wall-clock playhead for the headless pace test. `step_s > 0` quantizes the
+/// reported time into steps, simulating a coarse audio-callback playhead (which
+/// only advances once per output buffer); `0` is perfectly smooth. Never seeks.
+#[derive(Clone, Copy)]
+struct SyntheticClock {
+    start: Instant,
+    step_s: f64,
+}
+
+impl VideoClock for SyntheticClock {
+    fn pos_secs(&self) -> f64 {
+        let e = self.start.elapsed().as_secs_f64();
+        if self.step_s > 0.0 {
+            (e / self.step_s).floor() * self.step_s
+        } else {
+            e
+        }
+    }
+    fn epoch(&self) -> u64 {
+        0
+    }
+}
+
+/// Headless A/V pacing measurement: run the real video worker against a synthetic
+/// playhead and report cadence (smoothness) + sync stats. Runs twice — a smooth
+/// playhead and a 43 ms-stepped one (a coarse audio-callback clock) — to see if a
+/// coarse playhead is what causes the judder. No GUI, no audio device.
+pub fn pace_test(path: &Path) -> String {
+    let smooth = measure_pace(path, 0.0);
+    let stepped = measure_pace(path, 0.043);
+    format!(
+        "{smooth}\n  --- same, but a 43ms-STEPPED (coarse audio-callback) playhead ---\n{stepped}"
+    )
+}
+
+fn measure_pace(path: &Path, step_s: f64) -> String {
+    const DUR_S: f64 = 8.0;
+    let start = Instant::now();
+    let deck = match VideoDeck::open(path.to_path_buf(), SyntheticClock { start, step_s }) {
+        Some(d) => d,
+        None => return "  pace : no video stream".to_string(),
+    };
+
+    // Record (present_time, content_pts) for each newly presented frame.
+    let mut presents: Vec<(f64, f64)> = Vec::new();
+    let mut last_gen = 0u64;
+    while start.elapsed().as_secs_f64() < DUR_S {
+        let gen = deck.generation();
+        if gen != last_gen {
+            last_gen = gen;
+            presents.push((start.elapsed().as_secs_f64(), deck.frame_pts()));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let offset = deck.offset_ms();
+    drop(deck); // stop the worker / free the decode context
+
+    if presents.len() < 3 {
+        return format!("  pace : only {} frames in {DUR_S:.0}s — broken", presents.len());
+    }
+
+    // Cadence: inter-present gaps (smoothness).
+    let mut gaps: Vec<f64> = presents.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = gaps.len();
+    let mean_gap = gaps.iter().sum::<f64>() / n as f64;
+    let median = gaps[n / 2];
+    let p95 = gaps[((n as f64 * 0.95) as usize).min(n - 1)];
+    let max_gap = *gaps.last().unwrap();
+    let freezes = gaps.iter().filter(|&&g| g > 2.5 * median).count();
+
+    // Sync: present_time − content_pts. With offset comp the worker shows each
+    // frame ~`offset` early, so this is ≈ −offset; stddev is the pacing wobble.
+    let errs: Vec<f64> = presents.iter().map(|&(t, p)| (t - p) * 1000.0).collect();
+    let mean_err = errs.iter().sum::<f64>() / errs.len() as f64;
+    let std_err =
+        (errs.iter().map(|e| (e - mean_err).powi(2)).sum::<f64>() / errs.len() as f64).sqrt();
+
+    format!(
+        "  pace : {} frames in {DUR_S:.0}s (~{:.0} fps presented)\n  \
+cadence: median {:.0}ms, mean {:.0}ms, p95 {:.0}ms, max {:.0}ms, freezes(>2.5×) {}\n  \
+sync   : mean {:+.0}ms, stddev {:.0}ms  (display-comp offset {offset}ms)",
+        presents.len(),
+        presents.len() as f64 / DUR_S,
+        median * 1000.0,
+        mean_gap * 1000.0,
+        p95 * 1000.0,
+        max_gap * 1000.0,
+        freezes,
+        mean_err,
+        std_err,
+    )
+}
+
+/// A scriptable playhead for the seek-stress test: advances in real time and can
+/// be jumped (forward or backward) by the test thread, bumping the seek epoch.
+#[derive(Clone)]
+struct ScriptedClock {
+    base: Arc<Mutex<(Instant, f64)>>, // (anchor instant, playhead at anchor)
+    epoch: Arc<AtomicU64>,
+}
+
+impl ScriptedClock {
+    fn new(pos: f64) -> Self {
+        Self {
+            base: Arc::new(Mutex::new((Instant::now(), pos))),
+            epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    fn seek(&self, pos: f64) {
+        if let Ok(mut g) = self.base.lock() {
+            *g = (Instant::now(), pos);
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl VideoClock for ScriptedClock {
+    fn pos_secs(&self) -> f64 {
+        match self.base.lock() {
+            Ok(g) => g.1 + g.0.elapsed().as_secs_f64(),
+            Err(_) => 0.0,
+        }
+    }
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+}
+
+/// Headless seek-stress test: script a sequence of forward and backward seeks and
+/// measure how long each takes to produce a fresh frame (recovery latency), so a
+/// backward-seek bug or stall shows up as a long/"STUCK" entry. No GUI/audio.
+pub fn seek_test(path: &Path) -> String {
+    let dur = ffprobe_duration(&path.to_path_buf()).unwrap_or(20.0).max(2.0);
+    let clock = ScriptedClock::new(dur * 0.5);
+    let deck = match VideoDeck::open(path.to_path_buf(), clock.clone()) {
+        Some(d) => d,
+        None => return "  seek : no video stream".to_string(),
+    };
+    // Wait for the first frame so the deck is warm.
+    let warm = Instant::now();
+    while deck.generation() == 0 && warm.elapsed().as_secs_f64() < 3.0 {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // forward, backward, far-forward, to-start, mid, to-start again, far-back…
+    let targets = [
+        dur * 0.7,
+        dur * 0.2,
+        dur * 0.9,
+        0.0,
+        dur * 0.4,
+        0.0,
+        dur * 0.95,
+        dur * 0.1,
+    ];
+    let mut out = String::from("  seek : recovery (seek → next fresh frame):");
+    let mut prev = dur * 0.5;
+    for &t in &targets {
+        let pre_gen = deck.generation();
+        clock.seek(t);
+        let t0 = Instant::now();
+        let mut recov = None;
+        while t0.elapsed().as_secs_f64() < 2.5 {
+            // +2: skip a possibly in-flight pre-reseek frame.
+            if deck.generation() >= pre_gen + 2 {
+                recov = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let dir = if t < prev { "back" } else { "fwd " };
+        prev = t;
+        std::thread::sleep(Duration::from_millis(250)); // let it play a beat
+        out.push_str(&format!(
+            "\n    {dir} →{t:6.1}s : {}",
+            match recov {
+                Some(ms) => format!("{ms:.0}ms"),
+                None => "STUCK (no frame in 2.5s)".into(),
+            }
+        ));
+    }
+    drop(deck);
+    out
+}
+
+/// `ffprobe` the container duration in seconds.
+fn ffprobe_duration(path: &PathBuf) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Parse ffprobe's rational frame-rate string `"num/den"` → f64. Guards the
+/// `0/0` (VFR/undefined) case by returning `0.0`, which the caller defaults.
+fn parse_rational(s: &str) -> f64 {
+    match s.split_once('/') {
+        Some((n, d)) => {
+            let n: f64 = n.trim().parse().unwrap_or(0.0);
+            let d: f64 = d.trim().parse().unwrap_or(0.0);
+            if d == 0.0 {
+                0.0
+            } else {
+                n / d
+            }
+        }
+        None => s.trim().parse().unwrap_or(0.0),
+    }
+}

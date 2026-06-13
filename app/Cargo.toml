@@ -1,0 +1,19 @@
+[package]
+name = "livehub-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "livehub"
+path = "src/main.rs"
+
+[dependencies]
+livehub-engine = { path = "../crates/livehub-engine" }
+livehub-core = { path = "../crates/livehub-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rfd = { workspace = true }
+ffmpeg-next = "8"
