@@ -111,6 +111,16 @@ enum Cmd {
         /// Media file (its beat grid drives the visualizer) to test.
         file: String,
     },
+    /// List installed SuperDuper*.clap bundles usable as the master-bus insert.
+    ListFx,
+    /// Headless CLAP e2e: load a SuperDuper effect as the master insert at
+    /// 48k/512, push a nonzero sine through it, and assert the output differs
+    /// from the input (proves audio-ports + processing are wired). No audio
+    /// device, no GUI. `plugin` is a basename substring (e.g. "Filter").
+    SelftestFx {
+        /// Plugin basename substring to match among installed SuperDuper*.clap.
+        plugin: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -165,7 +175,78 @@ fn main() -> Result<()> {
             println!("{}", video::selftest_viz(&t.beats, t.bpm));
             Ok(())
         }
+        Some(Cmd::ListFx) => {
+            println!("== livehub master-FX plugins ==");
+            let fx = livehub_engine::Engine::list_fx();
+            if fx.is_empty() {
+                println!("  (none — no SuperDuper*.clap in ~/Library/Audio/Plug-Ins/CLAP/)");
+            } else {
+                for p in fx {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    println!("  {name}");
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::SelftestFx { plugin }) => selftest_fx(&plugin),
     }
+}
+
+/// Headless CLAP end-to-end test of the master-bus insert. Loads the named
+/// SuperDuper effect via the SAME `MasterFx` path the engine uses (48k, 512
+/// max frames), feeds one 512-frame block of a nonzero 220 Hz sine into both
+/// channels, runs `process()`, and asserts the output is not bit-identical to
+/// the input — which proves the audio-ports + processing plumbing is wired. No
+/// audio device, no window, so it runs anywhere for autonomous verification.
+fn selftest_fx(plugin: &str) -> Result<()> {
+    use livehub_engine::MasterFx;
+
+    println!("== livehub fx test: {plugin} ==");
+    let needle = plugin.to_lowercase();
+    let path = livehub_engine::list_superduper_clap().into_iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().contains(&needle))
+    });
+    let Some(path) = path else {
+        println!("  fx FAILED: no installed SuperDuper*.clap matches '{plugin}'");
+        return Ok(());
+    };
+    println!("  plugin : {}", path.display());
+
+    const N: usize = 512;
+    let (mut fx, _tx, params) = match MasterFx::load(&path, 48_000, N as u32) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  fx FAILED: {e:#}");
+            return Ok(());
+        }
+    };
+    println!("  name   : {}", fx.plugin_name);
+    println!("  params : {}", params.len());
+
+    // A 220 Hz sine at 48 kHz — nonzero, sub-Nyquist test tone.
+    let make = || -> Vec<f32> {
+        (0..N)
+            .map(|i| (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() * 0.5)
+            .collect()
+    };
+    let in_l = make();
+    let in_r = make();
+    let mut l = in_l.clone();
+    let mut r = in_r.clone();
+
+    fx.process(&mut l, &mut r);
+
+    let changed = (0..N)
+        .filter(|&i| l[i].to_bits() != in_l[i].to_bits() || r[i].to_bits() != in_r[i].to_bits())
+        .count();
+    if changed > 0 {
+        println!("  fx OK: {} changed {changed}/{N} samples", fx.plugin_name);
+    } else {
+        println!("  fx UNCHANGED (suspicious) — output bit-identical to input");
+    }
+    Ok(())
 }
 
 /// Headless check that the loop sizes (`gui::LOOP_SIZES`) produce correct

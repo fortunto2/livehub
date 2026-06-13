@@ -15,13 +15,19 @@ use core::f32::consts::FRAC_PI_2;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use livehub_core::OutputRouting;
 
+use crate::clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 use crate::decoder::decode_track;
 use crate::device::{best_input_config, best_output_config, pick_input, pick_output};
 use crate::track::TrackBuf;
+
+/// Largest output block we ever sub-block the master FX into. The cpal callback
+/// hands variable-size buffers; we process the master FX in chunks of at most
+/// this many frames so the plugin's activated `max_frames` is never exceeded.
+const MAX_FX_BLOCK: usize = 2048;
 
 /// One independent deck: its own track, playhead, seek state, play flag and gain.
 struct Deck {
@@ -62,6 +68,13 @@ struct Shared {
     out_ch: usize,
     routing: OutputRouting,
     aux: Option<(usize, usize)>,
+    /// Mic + aux ring consumers, parked here so the OUTPUT stream can be rebuilt
+    /// (to load/unload a master FX) without disturbing the INPUT stream or the
+    /// rings. `build_output_stream` `.take()`s them into its callback; the next
+    /// rebuild puts them back here when the old output stream's callback drops.
+    /// The producers stay owned by the live input stream and never move.
+    mic_cons: Mutex<Option<rtrb::Consumer<f32>>>,
+    aux_cons: Mutex<Option<rtrb::Consumer<f32>>>,
 }
 
 /// Clamp a public deck index to the valid range `{0, 1}`.
@@ -70,11 +83,221 @@ fn deck_idx(deck: usize) -> usize {
     deck.min(1)
 }
 
+/// Owns the mic/aux ring consumers inside the output callback and returns them
+/// to [`Shared`] when the callback is dropped (i.e. when the output stream is
+/// torn down for an FX reload). This lets us rebuild ONLY the output stream:
+/// the input stream + ring producers stay alive, and the next
+/// `build_output_stream` re-`take()`s the parked consumers. The consumers are
+/// single-consumer and not `Clone`, so this hand-back is how the new callback
+/// gets them without recreating the rings.
+struct RingLease {
+    mic: Option<rtrb::Consumer<f32>>,
+    aux: Option<rtrb::Consumer<f32>>,
+    shared: Arc<Shared>,
+}
+
+impl Drop for RingLease {
+    fn drop(&mut self) {
+        // Park the consumers back in Shared for the next output-stream build.
+        if let (Ok(mut m), Ok(mut a)) =
+            (self.shared.mic_cons.lock(), self.shared.aux_cons.lock())
+        {
+            *m = self.mic.take();
+            *a = self.aux.take();
+        }
+    }
+}
+
+/// Build the master OUTPUT stream: mixes both decks + mic + aux into the master
+/// pair, optionally running the whole mix through a master-bus CLAP insert
+/// (`fx`) just before it hits the device. The mic/aux ring consumers are
+/// `.take()`n out of `shared` (parked there by [`Engine::new`] / the previous
+/// stream's [`RingLease`] drop) and owned by the callback via a `RingLease`,
+/// so this can be called repeatedly to load/unload an FX while the INPUT stream
+/// and the rings stay alive.
+///
+/// The callback stays alloc/lock-free on the hot path: it fills a fixed stereo
+/// scratch for the block, runs `fx.process()` (a wait-free rtrb drain + the
+/// plugin's own `process()`), then scatters to the device channels. The only
+/// lock is taken ONCE at build time (`mic_cons.lock()` to take the consumers),
+/// never inside the audio callback.
+fn build_output_stream(
+    out_dev: &cpal::Device,
+    out_cfg: &cpal::SupportedStreamConfig,
+    shared: Arc<Shared>,
+    mut fx: Option<MasterFx>,
+) -> Result<cpal::Stream> {
+    // Take the parked ring consumers; the RingLease returns them on drop.
+    let mic = shared.mic_cons.lock().unwrap().take();
+    let aux = shared.aux_cons.lock().unwrap().take();
+    let mut lease = RingLease { mic, aux, shared: shared.clone() };
+
+    // Block-sized stereo scratch for the master FX: the cpal buffer is variable
+    // size, so we sub-block it to MAX_FX_BLOCK frames. Pre-allocated here (main
+    // thread, at build time) — never touched if `fx` is None.
+    let mut mbuf_l = vec![0.0f32; MAX_FX_BLOCK];
+    let mut mbuf_r = vec![0.0f32; MAX_FX_BLOCK];
+
+    let sh = shared;
+    let out_stream_cfg: cpal::StreamConfig = out_cfg.clone().into();
+    let stream = out_dev
+        .build_output_stream(
+            &out_stream_cfg,
+            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                // The lease owns the consumers; touch them through it. (Keeping
+                // `lease` captured is what makes the hand-back-on-drop work.)
+                let (cons, aux_cons) = match (&mut lease.mic, &mut lease.aux) {
+                    (Some(c), Some(a)) => (c, a),
+                    _ => return,
+                };
+
+                // Per-deck: apply a pending seek at the block boundary, then
+                // snapshot the track Arc / playhead / play flag / gain ONCE.
+                // Fixed [_; 2] stack arrays only — no heap, no lock.
+                let tracks = [sh.decks[0].track.load(), sh.decks[1].track.load()];
+                let mut p = [0usize; 2];
+                let mut playing = [false; 2];
+                let mut dg = [0.0f32; 2];
+                // Per-deck beat-loop region (frames); -1 = no loop. Snapshotted
+                // once per block, used to wrap the playhead in the inner loop.
+                let mut lstart = [-1i64; 2];
+                let mut lend = [-1i64; 2];
+                // Set true if a deck's playhead wrapped this block → bump its
+                // seek_epoch ONCE after the block so its video re-seeks too.
+                let mut wrapped = [false; 2];
+                for d in 0..2 {
+                    let s = sh.decks[d].seek_to.swap(-1, Ordering::AcqRel);
+                    if s >= 0 {
+                        sh.decks[d].pos.store(s as usize, Ordering::Relaxed);
+                    }
+                    p[d] = sh.decks[d].pos.load(Ordering::Relaxed);
+                    playing[d] = sh.decks[d].playing.load(Ordering::Relaxed);
+                    dg[d] = sh.decks[d].gain.load(Ordering::Relaxed);
+                    lstart[d] = sh.decks[d].loop_start.load(Ordering::Relaxed);
+                    lend[d] = sh.decks[d].loop_end.load(Ordering::Relaxed);
+                }
+                // Equal-power crossfade: cos/sin keeps constant power across
+                // the sweep (no -6 dB center dip a linear fade would cause).
+                let xf = sh.crossfade.load(Ordering::Relaxed).clamp(0.0, 1.0);
+                let g_a = (xf * FRAC_PI_2).cos();
+                let g_b = (xf * FRAC_PI_2).sin();
+                let xw = [g_a, g_b];
+
+                let mg = sh.mic_gain.load(Ordering::Relaxed);
+                let ag = sh.aux_gain.load(Ordering::Relaxed);
+                let out_ch = sh.out_ch;
+                let (ml, mr) = (sh.routing.master_l, sh.routing.master_r);
+                let frames = out.len() / out_ch;
+
+                // Phase 1: fill the stereo master scratch (mbuf_l/mbuf_r) for the
+                // whole block, sub-blocking to MAX_FX_BLOCK so the FX never sees
+                // more than its activated max_frames. Decks + mic + aux summed
+                // here, exactly as before; the device-channel scatter happens in
+                // phase 2 (after the optional FX) so the FX processes the SAME
+                // master mix that used to be written straight to the device.
+                let mut done = 0usize;
+                while done < frames {
+                    let chunk = (frames - done).min(MAX_FX_BLOCK);
+                    for i in 0..chunk {
+                        let f = done + i;
+                        let base = f * out_ch;
+                        // Clear all device channels for this frame up front.
+                        for c in 0..out_ch {
+                            if let Some(slot) = out.get_mut(base + c) {
+                                *slot = 0.0;
+                            }
+                        }
+                        let mic_l = cons.pop().unwrap_or_else(|_| {
+                            sh.underruns.fetch_add(1, Ordering::Relaxed);
+                            0.0
+                        });
+                        let mic_r = cons.pop().unwrap_or(0.0);
+                        let aux_l = aux_cons.pop().unwrap_or(0.0);
+                        let aux_r = aux_cons.pop().unwrap_or(0.0);
+
+                        let (mut dl, mut dr) = (0.0_f32, 0.0_f32);
+                        for d in 0..2 {
+                            if playing[d] {
+                                if let Some(t) = tracks[d].as_ref() {
+                                    if let (Some(&a), Some(&b)) =
+                                        (t.samples.get(p[d] * 2), t.samples.get(p[d] * 2 + 1))
+                                    {
+                                        let w = dg[d] * xw[d];
+                                        dl += a * w;
+                                        dr += b * w;
+                                        p[d] += 1;
+                                        // Beat-loop wrap: a valid loop is ls>=0 &&
+                                        // le>ls; on reaching the end, snap back to
+                                        // start. Flag the wrap so we bump the epoch
+                                        // once per block (not per sample).
+                                        let (ls, le) = (lstart[d], lend[d]);
+                                        if ls >= 0 && le > ls && p[d] as i64 >= le {
+                                            p[d] = ls as usize;
+                                            wrapped[d] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        mbuf_l[i] = dl + mic_l * mg + aux_l * ag;
+                        mbuf_r[i] = dr + mic_r * mg + aux_r * ag;
+                    }
+
+                    // The master-bus insert: process the whole mix in place.
+                    if let Some(fx) = fx.as_mut() {
+                        fx.process(&mut mbuf_l[..chunk], &mut mbuf_r[..chunk]);
+                    }
+
+                    // Phase 2: scatter the (post-FX) master pair to the device.
+                    for i in 0..chunk {
+                        let base = (done + i) * out_ch;
+                        if let Some(slot) = out.get_mut(base + ml) {
+                            *slot = mbuf_l[i];
+                        }
+                        if let Some(slot) = out.get_mut(base + mr) {
+                            *slot = mbuf_r[i];
+                        }
+                    }
+                    done += chunk;
+                }
+
+                for (deck, &pd) in sh.decks.iter().zip(p.iter()) {
+                    deck.pos.store(pd, Ordering::Relaxed);
+                }
+                // One epoch bump per deck that looped this block, so the video
+                // worker re-seeks and the picture loops with the audio.
+                for (deck, &w) in sh.decks.iter().zip(wrapped.iter()) {
+                    if w {
+                        deck.seek_epoch.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            },
+            |e| eprintln!("output stream error: {e}"),
+            None,
+        )
+        .context("build_output_stream")?;
+    Ok(stream)
+}
+
 /// Owns the live audio streams and the shared transport state.
 pub struct Engine {
     _in_stream: cpal::Stream,
-    _out_stream: cpal::Stream,
+    /// The output stream is REBUILT (not hot-swapped) to load/unload a master
+    /// FX — the started CLAP processor is not freely `Send`, so it must be
+    /// created on, and only used on, the audio thread that owns this stream.
+    /// `Option` so `set_master_fx` can `take()` + drop the old stream (parking
+    /// its ring consumers back in `shared`) before building the replacement.
+    out_stream: Option<cpal::Stream>,
+    /// Kept so the output stream can be rebuilt on `set_master_fx`.
+    out_dev: cpal::Device,
+    out_cfg: cpal::SupportedStreamConfig,
     shared: Arc<Shared>,
+    /// Wait-free producer for master-FX param changes; the audio callback drains
+    /// it. `None` when no FX is loaded. Rebuilt with each `set_master_fx`. Behind
+    /// a `Mutex` only so `set_fx_param(&self, …)` (GUI thread) can push without
+    /// `&mut`; the lock is never taken on the audio thread.
+    fx_tx: Mutex<Option<rtrb::Producer<ParamSet>>>,
 }
 
 /// Cheap `Send + Sync` read handle to one deck's live transport, for off-thread
@@ -137,6 +360,11 @@ impl Engine {
             }
         }
 
+        // Mic ring + optional aux ring: input callback (producers) -> output.
+        let mic_ch = 0usize;
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
+        let (mut aux_prod, aux_cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
+
         let shared = Arc::new(Shared {
             decks: [Deck::new(), Deck::new()],
             crossfade: AtomicF32::new(0.0),
@@ -147,12 +375,10 @@ impl Engine {
             out_ch,
             routing,
             aux,
+            // Park the consumers; build_output_stream takes them on first build.
+            mic_cons: Mutex::new(Some(cons)),
+            aux_cons: Mutex::new(Some(aux_cons)),
         });
-
-        // Mic ring + optional aux ring: input callback (producers) -> output.
-        let mic_ch = 0usize;
-        let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
-        let (mut aux_prod, mut aux_cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
 
         let in_stream_cfg: cpal::StreamConfig = in_cfg.into();
         let in_stream = in_dev
@@ -178,119 +404,76 @@ impl Engine {
             )
             .context("build_input_stream")?;
 
-        let sh = shared.clone();
-        let out_stream_cfg: cpal::StreamConfig = out_cfg.into();
-        let out_stream = out_dev
-            .build_output_stream(
-                &out_stream_cfg,
-                move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // Per-deck: apply a pending seek at the block boundary, then
-                    // snapshot the track Arc / playhead / play flag / gain ONCE.
-                    // Fixed [_; 2] stack arrays only — no heap, no lock.
-                    let tracks = [sh.decks[0].track.load(), sh.decks[1].track.load()];
-                    let mut p = [0usize; 2];
-                    let mut playing = [false; 2];
-                    let mut dg = [0.0f32; 2];
-                    // Per-deck beat-loop region (frames); -1 = no loop. Snapshotted
-                    // once per block, used to wrap the playhead in the inner loop.
-                    let mut lstart = [-1i64; 2];
-                    let mut lend = [-1i64; 2];
-                    // Set true if a deck's playhead wrapped this block → bump its
-                    // seek_epoch ONCE after the block so its video re-seeks too.
-                    let mut wrapped = [false; 2];
-                    for d in 0..2 {
-                        let s = sh.decks[d].seek_to.swap(-1, Ordering::AcqRel);
-                        if s >= 0 {
-                            sh.decks[d].pos.store(s as usize, Ordering::Relaxed);
-                        }
-                        p[d] = sh.decks[d].pos.load(Ordering::Relaxed);
-                        playing[d] = sh.decks[d].playing.load(Ordering::Relaxed);
-                        dg[d] = sh.decks[d].gain.load(Ordering::Relaxed);
-                        lstart[d] = sh.decks[d].loop_start.load(Ordering::Relaxed);
-                        lend[d] = sh.decks[d].loop_end.load(Ordering::Relaxed);
-                    }
-                    // Equal-power crossfade: cos/sin keeps constant power across
-                    // the sweep (no -6 dB center dip a linear fade would cause).
-                    let xf = sh.crossfade.load(Ordering::Relaxed).clamp(0.0, 1.0);
-                    let g_a = (xf * FRAC_PI_2).cos();
-                    let g_b = (xf * FRAC_PI_2).sin();
-                    let xw = [g_a, g_b];
-
-                    let mg = sh.mic_gain.load(Ordering::Relaxed);
-                    let ag = sh.aux_gain.load(Ordering::Relaxed);
-                    let out_ch = sh.out_ch;
-                    let (ml, mr) = (sh.routing.master_l, sh.routing.master_r);
-                    let frames = out.len() / out_ch;
-
-                    for f in 0..frames {
-                        let base = f * out_ch;
-                        for c in 0..out_ch {
-                            if let Some(slot) = out.get_mut(base + c) {
-                                *slot = 0.0;
-                            }
-                        }
-                        let mic_l = cons.pop().unwrap_or_else(|_| {
-                            sh.underruns.fetch_add(1, Ordering::Relaxed);
-                            0.0
-                        });
-                        let mic_r = cons.pop().unwrap_or(0.0);
-                        let aux_l = aux_cons.pop().unwrap_or(0.0);
-                        let aux_r = aux_cons.pop().unwrap_or(0.0);
-
-                        let (mut dl, mut dr) = (0.0_f32, 0.0_f32);
-                        for d in 0..2 {
-                            if playing[d] {
-                                if let Some(t) = tracks[d].as_ref() {
-                                    if let (Some(&a), Some(&b)) =
-                                        (t.samples.get(p[d] * 2), t.samples.get(p[d] * 2 + 1))
-                                    {
-                                        let w = dg[d] * xw[d];
-                                        dl += a * w;
-                                        dr += b * w;
-                                        p[d] += 1;
-                                        // Beat-loop wrap: a valid loop is ls>=0 &&
-                                        // le>ls; on reaching the end, snap back to
-                                        // start. Flag the wrap so we bump the epoch
-                                        // once per block (not per sample).
-                                        let (ls, le) = (lstart[d], lend[d]);
-                                        if ls >= 0 && le > ls && p[d] as i64 >= le {
-                                            p[d] = ls as usize;
-                                            wrapped[d] = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let l = dl + mic_l * mg + aux_l * ag;
-                        let r = dr + mic_r * mg + aux_r * ag;
-                        if let Some(slot) = out.get_mut(base + ml) {
-                            *slot = l;
-                        }
-                        if let Some(slot) = out.get_mut(base + mr) {
-                            *slot = r;
-                        }
-                    }
-                    for (deck, &pd) in sh.decks.iter().zip(p.iter()) {
-                        deck.pos.store(pd, Ordering::Relaxed);
-                    }
-                    // One epoch bump per deck that looped this block, so the video
-                    // worker re-seeks and the picture loops with the audio.
-                    for (deck, &w) in sh.decks.iter().zip(wrapped.iter()) {
-                        if w {
-                            deck.seek_epoch.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                },
-                |e| eprintln!("output stream error: {e}"),
-                None,
-            )
-            .context("build_output_stream")?;
+        let out_stream =
+            build_output_stream(&out_dev, &out_cfg, shared.clone(), None)?;
 
         in_stream.play().context("input stream play")?;
         out_stream.play().context("output stream play")?;
 
-        Ok(Self { _in_stream: in_stream, _out_stream: out_stream, shared })
+        Ok(Self {
+            _in_stream: in_stream,
+            out_stream: Some(out_stream),
+            out_dev,
+            out_cfg,
+            shared,
+            fx_tx: Mutex::new(None),
+        })
+    }
+
+    /// Load a master-bus CLAP insert from a `.clap` path (or clear it with
+    /// `None`). The ENTIRE master mix (decks + mic + aux) passes through this one
+    /// effect before hitting the device. Rebuilds ONLY the output stream — the
+    /// mic input stream + the rings + all transport state are untouched; a brief
+    /// audio gap on (re)build is acceptable. Returns the effect's param list (for
+    /// the GUI to build sliders), or `[]` when cleared.
+    ///
+    /// The CLAP processor is constructed here on the main thread and moved into
+    /// the new output callback that owns it; it is never sent to another thread
+    /// once started (it is not freely `Send`).
+    pub fn set_master_fx(&mut self, path: Option<&Path>) -> Result<Vec<ParamInfo>> {
+        // Tear down the current output stream FIRST so its RingLease drops and
+        // parks the consumers back in `shared` for the rebuild below. cpal has no
+        // stable "swap callback" API, so we replace the whole Stream.
+        // Build the new FX (if any) BEFORE tearing the old stream down, so a load
+        // error leaves the current output stream running untouched.
+        let (fx, tx, params) = match path {
+            Some(p) => {
+                let (fx, tx, params) =
+                    MasterFx::load(p, self.shared.device_sr, MAX_FX_BLOCK as u32)?;
+                (Some(fx), Some(tx), params)
+            }
+            None => (None, None, Vec::new()),
+        };
+
+        // Drop the old output stream FIRST: its callback's RingLease drops and
+        // parks the ring consumers back in `shared`, so the rebuild below can
+        // `.take()` them. (cpal has no callback-swap API → replace the Stream.)
+        // The mic INPUT stream + the rings + all transport state stay alive.
+        self.out_stream = None;
+
+        let new_stream =
+            build_output_stream(&self.out_dev, &self.out_cfg, self.shared.clone(), fx)?;
+        new_stream.play().context("output stream play (fx reload)")?;
+        self.out_stream = Some(new_stream);
+        *self.fx_tx.lock().unwrap() = tx;
+        Ok(params)
+    }
+
+    /// Push a master-FX param change (wait-free on the audio side). The audio
+    /// callback drains it on the next block. No-op if no FX is loaded. `value` is
+    /// in the param's plain (un-normalized) range. Called from the GUI thread.
+    pub fn set_fx_param(&self, id: u32, value: f64) {
+        if let Ok(mut guard) = self.fx_tx.lock() {
+            if let Some(tx) = guard.as_mut() {
+                let _ = tx.push(ParamSet { id, value });
+            }
+        }
+    }
+
+    /// List installed `SuperDuper*.clap` bundles the user can pick as the master
+    /// insert (sorted by file name).
+    pub fn list_fx() -> Vec<PathBuf> {
+        list_superduper_clap()
     }
 
     /// Decode a file (on the calling thread) and load it into `deck` at pos 0.

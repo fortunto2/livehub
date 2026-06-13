@@ -6,6 +6,7 @@
 //! locks, no syscalls inside a callback.
 
 mod audio;
+mod clap_fx;
 mod decoder;
 mod device;
 mod engine;
@@ -14,6 +15,7 @@ mod loops;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
+pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;
 pub use device::list_devices;
 pub use engine::{Engine, Transport};

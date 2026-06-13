@@ -15,3 +15,6 @@ atomic_float = { workspace = true }
 arc-swap = { workspace = true }
 symphonia = { workspace = true }
 rusty_link = { workspace = true }
+clack-host = { workspace = true }
+clack-extensions = { workspace = true }
+clack-common = { workspace = true }

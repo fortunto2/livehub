@@ -8,7 +8,7 @@ use std::sync::mpsc::Receiver;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use livehub_core::OutputRouting;
-use livehub_engine::{Engine, LinkHub, TrackBuf};
+use livehub_engine::{Engine, LinkHub, ParamInfo, TrackBuf};
 
 use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource, Visualizer};
 
@@ -75,6 +75,15 @@ struct App {
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
+    /// Installed `SuperDuper*.clap` bundles selectable as the master insert
+    /// (scanned once at startup). The combo shows their basenames + "(none)".
+    fx_choices: Vec<std::path::PathBuf>,
+    /// Index into `fx_choices` of the loaded master FX, or `None` for "(none)".
+    fx_selected: Option<usize>,
+    /// Params of the loaded master FX (one slider each). Empty when none loaded.
+    fx_params: Vec<ParamInfo>,
+    /// Display name of the loaded master FX (for the section header).
+    fx_name: Option<String>,
     // GUI render-time instrumentation (logged to spot repaint hitches).
     gui_frames: u64,
     gui_slow: u64,
@@ -105,9 +114,79 @@ impl App {
             autoplay_pending: autoplay,
             snap: true,
             loop_len: [None, None],
+            fx_choices: Engine::list_fx(),
+            fx_selected: None,
+            fx_params: Vec::new(),
+            fx_name: None,
             gui_frames: 0,
             gui_slow: 0,
             gui_maxdt: 0.0,
+        }
+    }
+
+    /// Render the "Master FX" section: a combo to pick one installed
+    /// `SuperDuper*.clap` as the master-bus insert (or "(none)"), then one slider
+    /// per param. Selecting an effect rebuilds the output stream (brief gap) and
+    /// stashes its param list; moving a slider pushes the change wait-free.
+    fn master_fx_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("🎛 Master FX");
+        let current = self
+            .fx_selected
+            .and_then(|i| self.fx_choices.get(i))
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("(none)")
+            .to_string();
+
+        let mut pick: Option<Option<usize>> = None;
+        egui::ComboBox::from_id_salt("master_fx_combo")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(self.fx_selected.is_none(), "(none)").clicked() {
+                    pick = Some(None);
+                }
+                for (i, path) in self.fx_choices.iter().enumerate() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?");
+                    if ui.selectable_label(self.fx_selected == Some(i), name).clicked() {
+                        pick = Some(Some(i));
+                    }
+                }
+            });
+
+        if let Some(choice) = pick {
+            // Only act on an actual change.
+            if choice != self.fx_selected {
+                let path = choice.and_then(|i| self.fx_choices.get(i).cloned());
+                match self.engine.set_master_fx(path.as_deref()) {
+                    Ok(params) => {
+                        self.fx_selected = choice;
+                        self.fx_params = params;
+                        self.fx_name = choice.and_then(|i| {
+                            self.fx_choices.get(i).and_then(|p| {
+                                p.file_name().and_then(|n| n.to_str()).map(String::from)
+                            })
+                        });
+                    }
+                    Err(e) => eprintln!("set_master_fx failed: {e:#}"),
+                }
+            }
+        }
+
+        if let Some(name) = &self.fx_name {
+            ui.weak(name);
+        }
+        // One slider per param. Pushing a change is wait-free (no rebuild).
+        for p in &mut self.fx_params {
+            let range = if p.max > p.min { p.min..=p.max } else { p.min..=(p.min + 1.0) };
+            if ui
+                .add(egui::Slider::new(&mut p.value, range).text(&p.name))
+                .changed()
+            {
+                self.engine.set_fx_param(p.id, p.value);
+            }
         }
     }
 
@@ -536,6 +615,11 @@ impl eframe::App for App {
                     }
                 });
             }
+
+            ui.add_space(8.0);
+            ui.separator();
+            // Master-bus CLAP insert: the whole mix passes through one effect.
+            self.master_fx_panel(ui);
 
             ui.add_space(8.0);
             ui.separator();
