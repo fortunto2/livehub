@@ -211,6 +211,9 @@ struct App {
     /// Output-stage aspect (Auto / 16:9 / 9:16 / 1:1), switchable live; drives
     /// both the in-app composite and the output window.
     canvas_mode: CanvasMode,
+    /// Which deck the keyboard transport (Spacebar = play/pause) targets, and which
+    /// is highlighted. Set by clicking a deck's overview lane or its Play button.
+    active_deck: usize,
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
@@ -263,6 +266,7 @@ impl App {
             snap: true,
             output_open: false,
             canvas_mode: CanvasMode::Auto,
+            active_deck: 0,
             loop_len: [None, None],
             fx_choices: Engine::list_fx(),
             fx_selected: None,
@@ -537,6 +541,7 @@ impl App {
         if response.clicked() && rect.width() > 0.0 {
             if let Some(p) = response.interact_pointer_pos() {
                 let d = if p.y < rect.center().y { 0 } else { 1 };
+                self.active_deck = d; // clicking a deck's lane makes it active
                 let dur = self.engine.duration_secs(d);
                 let frac = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
                 let seek = frac * dur.max(f64::MIN_POSITIVE);
@@ -616,13 +621,19 @@ impl App {
 
         let accent = DECK_COLOR[d];
 
-        // Header: coloured deck label + source-kind tag.
+        // Header: coloured deck label + active marker + source-kind tag.
         ui.horizontal(|ui| {
             ui.colored_label(accent, egui::RichText::new(if d == 0 {
                 "DECK A"
             } else {
                 "DECK B"
             }).strong());
+            if self.active_deck == d {
+                ui.colored_label(
+                    Color32::from_rgb(60, 220, 110),
+                    egui::RichText::new("● active · Space").small(),
+                );
+            }
             // Tiny tag showing the current picture source kind (file/cam/image).
             if let Some(src) = &self.video[d] {
                 ui.weak(src.kind());
@@ -671,6 +682,7 @@ impl App {
                 )
                 .clicked()
             {
+                self.active_deck = d;
                 self.engine.toggle(d);
             }
             if ui
@@ -1046,6 +1058,11 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // SPACEBAR = play/pause the ACTIVE deck (unless typing in a text box).
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.engine.toggle(self.active_deck);
+        }
+
         // GUI render-time instrumentation: every ~120 repaints, log how many were
         // slow (>25ms = below 40fps) and the worst frame, to spot render hitches.
         let dt = ctx.input(|i| i.unstable_dt);
@@ -1204,7 +1221,9 @@ impl eframe::App for App {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(deck_w);
-                        self.deck_panel(ui, 0);
+                        deck_frame(ui, self.active_deck == 0, DECK_COLOR[0], |ui| {
+                            self.deck_panel(ui, 0);
+                        });
                     },
                 );
                 ui.separator();
@@ -1222,7 +1241,9 @@ impl eframe::App for App {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(deck_w);
-                        self.deck_panel(ui, 1);
+                        deck_frame(ui, self.active_deck == 1, DECK_COLOR[1], |ui| {
+                            self.deck_panel(ui, 1);
+                        });
                     },
                 );
             });
@@ -1293,6 +1314,17 @@ impl eframe::App for App {
         // Keep the playhead/meters live.
         ctx.request_repaint();
     }
+}
+
+/// Wrap a deck panel in a bordered frame: a thick accent border when it's the
+/// ACTIVE deck (the Spacebar target), a dim hairline otherwise.
+fn deck_frame(ui: &mut egui::Ui, active: bool, accent: Color32, body: impl FnOnce(&mut egui::Ui)) {
+    let stroke = if active {
+        Stroke::new(2.0, accent)
+    } else {
+        Stroke::new(1.0, Color32::from_gray(45))
+    };
+    egui::Frame::group(ui.style()).stroke(stroke).show(ui, body);
 }
 
 /// Largest rect of the given width:height `aspect` centered inside `outer`
