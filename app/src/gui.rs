@@ -355,55 +355,49 @@ impl App {
     /// (0 = full A, 1 = full B) tints each layer so the fade is a true alpha
     /// dissolve (A at `1-x`, B at `x`) — no double-bright midpoint.
     ///
-    /// The composite is aspect-fit (letterboxed) inside the row this allocates,
-    /// which spans the full available width. `max_h = Some(h)` caps the row
-    /// height at `h` (the in-app strip); `max_h = None` fills `ui.available_size()`
-    /// entirely (the output window) so OBS captures a full-bleed frame.
+    /// A FIXED 16:9 canvas (the "stage") is centered in the row this allocates;
+    /// each deck's video is then fit INTO that canvas at ITS OWN aspect ratio —
+    /// landscape fills the width, a vertical reel pillarboxes against black — so
+    /// mismatched-format clips are never stretched. `max_h = Some(h)` caps the
+    /// row height (in-app strip); `max_h = None` fills `ui.available_size()` (the
+    /// output window) so OBS captures a full-bleed 16:9 frame.
     fn paint_composite_into(
         ui: &mut egui::Ui,
         video_tex: &[Option<egui::TextureHandle>; 2],
         crossfade: f32,
         max_h: Option<f32>,
     ) {
-        // Pick a composite aspect from whichever deck has a texture (fall back 16:9).
-        let aspect = video_tex
-            .iter()
-            .flatten()
-            .find_map(|t| {
-                let [w, h] = t.size();
-                (w > 0 && h > 0).then(|| w as f32 / h as f32)
-            })
-            .unwrap_or(16.0 / 9.0);
+        // The canvas is a fixed broadcast aspect (the output frame), NOT derived
+        // from the clips — so A and B share one stage and each keeps its shape.
+        const CANVAS_ASPECT: f32 = 16.0 / 9.0;
         let avail_w = ui.available_width();
-        // Row height: capped (in-app) or the whole remaining viewport (output).
         let row_h = match max_h {
-            Some(cap) => (avail_w / aspect).min(cap),
+            Some(cap) => (avail_w / CANVAS_ASPECT).min(cap),
             None => ui.available_size().y.max(1.0),
         };
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(avail_w, row_h), egui::Sense::hover());
 
-        // Aspect-fit the composite inside that row, centered — black letterbox
-        // bars fill the remainder (the output panel paints a BLACK frame behind).
-        let (mut cw, mut ch) = (row_h * aspect, row_h);
-        if cw > avail_w {
-            cw = avail_w;
-            ch = avail_w / aspect;
-        }
-        let composite = Rect::from_center_size(rect.center(), egui::vec2(cw, ch));
+        // The 16:9 canvas, aspect-fit + centered in the allocated row, painted
+        // black so every clip letterboxes/pillarboxes against a clean stage.
+        let canvas = fit_aspect(rect, CANVAS_ASPECT);
+        ui.painter().rect_filled(canvas, 0.0, Color32::BLACK);
 
         let xb = crossfade.clamp(0.0, 1.0);
-        let a_alpha = ((1.0 - xb) * 255.0) as u8;
-        let b_alpha = (xb * 255.0) as u8;
-        if let Some(tex) = &video_tex[0] {
-            egui::Image::new((tex.id(), composite.size()))
-                .tint(Color32::from_white_alpha(a_alpha))
-                .paint_at(ui, composite);
-        }
-        if let Some(tex) = &video_tex[1] {
-            egui::Image::new((tex.id(), composite.size()))
-                .tint(Color32::from_white_alpha(b_alpha))
-                .paint_at(ui, composite);
+        let alpha = [((1.0 - xb) * 255.0) as u8, (xb * 255.0) as u8];
+        // Deck 0 under deck 1; each fit into the canvas at its OWN aspect (no
+        // stretch) and tinted so the crossfader is a true alpha dissolve.
+        for (d, slot) in video_tex.iter().enumerate() {
+            if let Some(tex) = slot {
+                let [tw, th] = tex.size();
+                if tw == 0 || th == 0 {
+                    continue;
+                }
+                let fit = fit_aspect(canvas, tw as f32 / th as f32);
+                egui::Image::new((tex.id(), fit.size()))
+                    .tint(Color32::from_white_alpha(alpha[d]))
+                    .paint_at(ui, fit);
+            }
         }
     }
 
@@ -959,6 +953,18 @@ impl eframe::App for App {
         // Keep the playhead/meters live.
         ctx.request_repaint();
     }
+}
+
+/// Largest rect of the given width:height `aspect` centered inside `outer`
+/// (letterbox/pillarbox). Used to fit the 16:9 stage in its row and each clip
+/// into the stage at its own shape — so nothing is ever stretched.
+fn fit_aspect(outer: Rect, aspect: f32) -> Rect {
+    let (mut w, mut h) = (outer.width(), outer.width() / aspect.max(0.0001));
+    if h > outer.height() {
+        h = outer.height();
+        w = outer.height() * aspect;
+    }
+    Rect::from_center_size(outer.center(), egui::vec2(w, h))
 }
 
 /// Round `t` (seconds) to the nearest beat time. Returns `t` unchanged when the
