@@ -59,6 +59,11 @@ struct App {
     pending_open: [Option<PathBuf>; 2],
     /// Start playback once the auto-loaded files have decoded (`--play`).
     autoplay_pending: bool,
+    /// Snap seeks to the nearest beat when ON (global, applies to both decks).
+    snap: bool,
+    /// Per-deck engaged beat-loop size in beats, to highlight the active button.
+    /// `None` = no loop on that deck.
+    loop_len: [Option<usize>; 2],
     // GUI render-time instrumentation (logged to spot repaint hitches).
     gui_frames: u64,
     gui_slow: u64,
@@ -85,6 +90,8 @@ impl App {
             last_gen: [0, 0],
             pending_open: [open, open_b],
             autoplay_pending: autoplay,
+            snap: true,
+            loop_len: [None, None],
             gui_frames: 0,
             gui_slow: 0,
             gui_maxdt: 0.0,
@@ -178,13 +185,41 @@ impl App {
             }
         });
 
-        // Waveform strip + beat ticks + playhead. One cheap Arc clone per frame;
-        // click the strip to seek this deck.
+        // Waveform strip + loop band + beat ticks + playhead. One cheap Arc clone
+        // per frame; click the strip to seek this deck.
         let track = self.engine.current_track(d);
         let playhead = self.engine.playhead_secs(d);
-        if let Some(seek) = draw_waveform(ui, track.as_deref(), dur, playhead) {
-            self.engine.seek_secs(d, seek);
+        // Convert the engine's frame-based loop region to seconds for drawing.
+        let sr = track.as_deref().map(|t| t.sample_rate as f64).unwrap_or(1.0);
+        let loop_region = self
+            .engine
+            .loop_region(d)
+            .map(|(s, e)| (s as f64 / sr, e as f64 / sr));
+        if let Some(seek) = draw_waveform(ui, track.as_deref(), dur, playhead, loop_region) {
+            let target = match track.as_deref() {
+                Some(t) if self.snap && !t.beats.is_empty() => snap_to_beat(&t.beats, seek),
+                _ => seek,
+            };
+            self.engine.seek_secs(d, target);
         }
+
+        // Beat-loop row: engage a loop of N beats from the beat at-or-before the
+        // playhead; ✕ clears it. Active size is highlighted.
+        ui.horizontal(|ui| {
+            ui.label("loop");
+            for n in [1usize, 2, 4, 8, 16] {
+                if ui
+                    .selectable_label(self.loop_len[d] == Some(n), n.to_string())
+                    .clicked()
+                {
+                    self.engage_loop(d, n);
+                }
+            }
+            if ui.button("✕").clicked() {
+                self.engine.clear_loop(d);
+                self.loop_len[d] = None;
+            }
+        });
 
         // BPM readout (detected at load time).
         let bpm = self.engine.bpm(d);
@@ -202,7 +237,11 @@ impl App {
                 .text("position"),
         );
         if resp.dragged() || resp.changed() {
-            self.engine.seek_secs(d, ph);
+            let target = match track.as_deref() {
+                Some(t) if self.snap && !t.beats.is_empty() => snap_to_beat(&t.beats, ph),
+                _ => ph,
+            };
+            self.engine.seek_secs(d, target);
         }
         ui.label(format!("{:>6.1} / {:>6.1} s", self.engine.playhead_secs(d), dur));
 
@@ -230,6 +269,29 @@ impl App {
                 }
             });
         }
+    }
+
+    /// Engage an `n`-beat loop on `deck` starting at the beat at-or-before the
+    /// current playhead. No-op if the track has fewer than two beats or the loop
+    /// would run off the end of the grid.
+    fn engage_loop(&mut self, d: usize, n: usize) {
+        let Some(track) = self.engine.current_track(d) else { return };
+        let beats = &track.beats;
+        if beats.len() < 2 {
+            return;
+        }
+        let ph = self.engine.playhead_secs(d);
+        // First beat at-or-before the playhead (clamped to a valid index).
+        let i = beats.partition_point(|&b| b <= ph).saturating_sub(1);
+        let end_idx = i + n;
+        if end_idx >= beats.len() {
+            return; // fewer than n beats left → don't engage a short loop.
+        }
+        let sr = track.sample_rate as f64;
+        let start_frame = (beats[i] * sr) as usize;
+        let end_frame = (beats[end_idx] * sr) as usize;
+        self.engine.set_loop(d, start_frame, end_frame);
+        self.loop_len[d] = Some(n);
     }
 }
 
@@ -332,6 +394,11 @@ impl eframe::App for App {
             });
 
             ui.add_space(6.0);
+            // Global beat-snap toggle: when ON, every seek rounds to the nearest
+            // beat (applies to both decks' waveform clicks and seek sliders).
+            ui.toggle_value(&mut self.snap, "⊞ Snap to beats");
+
+            ui.add_space(6.0);
             // The crossfader, full width, between the decks and the shared section.
             if ui
                 .add(
@@ -420,14 +487,28 @@ impl eframe::App for App {
     }
 }
 
-/// Draw the deck waveform strip: peak envelope, beat ticks (downbeats brighter
-/// and thicker), and a moving playhead. Returns a seek target in seconds when
-/// the user clicks the strip. Handles `None`/empty/zero-duration without panic.
+/// Round `t` (seconds) to the nearest beat time. Returns `t` unchanged when the
+/// beatgrid is empty.
+fn snap_to_beat(beats: &[f64], t: f64) -> f64 {
+    beats
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a - t).abs().partial_cmp(&(b - t).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(t)
+}
+
+/// Draw the deck waveform strip: peak envelope, an engaged-loop band, beat ticks
+/// (downbeats brighter and thicker), and a moving playhead. Returns a seek
+/// target in seconds when the user clicks the strip. `loop_region` is the active
+/// beat loop in seconds. Handles `None`/empty/zero-duration without panic.
 fn draw_waveform(
     ui: &mut egui::Ui,
     track: Option<&TrackBuf>,
     duration: f64,
     playhead: f64,
+    loop_region: Option<(f64, f64)>,
 ) -> Option<f64> {
     let (response, painter) =
         ui.allocate_painter(Vec2::new(ui.available_width(), 80.0), Sense::click());
@@ -454,6 +535,18 @@ fn draw_waveform(
     for (i, &(lo, hi)) in track.waveform.iter().enumerate() {
         let x = map_x(i as f32 / n as f32);
         painter.line_segment([Pos2::new(x, map_y(hi)), Pos2::new(x, map_y(lo))], wave_stroke);
+    }
+
+    // Engaged beat-loop band: a translucent amber rect over the active region,
+    // painted above the waveform but under the ticks + playhead.
+    if let Some((ls, le)) = loop_region {
+        let x0 = map_x((ls / dur) as f32);
+        let x1 = map_x((le / dur) as f32);
+        let band = Rect::from_min_max(
+            Pos2::new(x0, rect.top()),
+            Pos2::new(x1, wave_bottom),
+        );
+        painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 210, 40, 40));
     }
 
     // Beat lane at the bottom: a short tick per beat, taller brighter ticks on

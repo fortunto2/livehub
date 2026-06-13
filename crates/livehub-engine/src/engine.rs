@@ -32,6 +32,8 @@ struct Deck {
     playing: AtomicBool,
     loading: AtomicBool,     // a background decode is in flight
     gain: AtomicF32,
+    loop_start: AtomicI64,   // beat-loop start frame, or -1 (no loop)
+    loop_end: AtomicI64,     // beat-loop end frame (exclusive), or -1 (no loop)
 }
 
 impl Deck {
@@ -44,6 +46,8 @@ impl Deck {
             playing: AtomicBool::new(false),
             loading: AtomicBool::new(false),
             gain: AtomicF32::new(1.0),
+            loop_start: AtomicI64::new(-1),
+            loop_end: AtomicI64::new(-1),
         }
     }
 }
@@ -187,6 +191,13 @@ impl Engine {
                     let mut p = [0usize; 2];
                     let mut playing = [false; 2];
                     let mut dg = [0.0f32; 2];
+                    // Per-deck beat-loop region (frames); -1 = no loop. Snapshotted
+                    // once per block, used to wrap the playhead in the inner loop.
+                    let mut lstart = [-1i64; 2];
+                    let mut lend = [-1i64; 2];
+                    // Set true if a deck's playhead wrapped this block → bump its
+                    // seek_epoch ONCE after the block so its video re-seeks too.
+                    let mut wrapped = [false; 2];
                     for d in 0..2 {
                         let s = sh.decks[d].seek_to.swap(-1, Ordering::AcqRel);
                         if s >= 0 {
@@ -195,6 +206,8 @@ impl Engine {
                         p[d] = sh.decks[d].pos.load(Ordering::Relaxed);
                         playing[d] = sh.decks[d].playing.load(Ordering::Relaxed);
                         dg[d] = sh.decks[d].gain.load(Ordering::Relaxed);
+                        lstart[d] = sh.decks[d].loop_start.load(Ordering::Relaxed);
+                        lend[d] = sh.decks[d].loop_end.load(Ordering::Relaxed);
                     }
                     // Equal-power crossfade: cos/sin keeps constant power across
                     // the sweep (no -6 dB center dip a linear fade would cause).
@@ -235,6 +248,15 @@ impl Engine {
                                         dl += a * w;
                                         dr += b * w;
                                         p[d] += 1;
+                                        // Beat-loop wrap: a valid loop is ls>=0 &&
+                                        // le>ls; on reaching the end, snap back to
+                                        // start. Flag the wrap so we bump the epoch
+                                        // once per block (not per sample).
+                                        let (ls, le) = (lstart[d], lend[d]);
+                                        if ls >= 0 && le > ls && p[d] as i64 >= le {
+                                            p[d] = ls as usize;
+                                            wrapped[d] = true;
+                                        }
                                     }
                                 }
                             }
@@ -251,6 +273,13 @@ impl Engine {
                     }
                     for (deck, &pd) in sh.decks.iter().zip(p.iter()) {
                         deck.pos.store(pd, Ordering::Relaxed);
+                    }
+                    // One epoch bump per deck that looped this block, so the video
+                    // worker re-seeks and the picture loops with the audio.
+                    for (deck, &w) in sh.decks.iter().zip(wrapped.iter()) {
+                        if w {
+                            deck.seek_epoch.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 |e| eprintln!("output stream error: {e}"),
@@ -328,6 +357,31 @@ impl Engine {
     }
     pub fn set_deck_gain(&self, deck: usize, g: f32) {
         self.shared.decks[deck_idx(deck)].gain.store(g, Ordering::Relaxed);
+    }
+    /// Engage a beat loop on `deck` over `[start_frame, end_frame)` (frame indices
+    /// into the deck's resampled buffer, same units as the playhead). Ignored if
+    /// `end <= start` (an empty/inverted region).
+    pub fn set_loop(&self, deck: usize, start_frame: usize, end_frame: usize) {
+        if end_frame <= start_frame {
+            return;
+        }
+        let d = &self.shared.decks[deck_idx(deck)];
+        d.loop_start.store(start_frame as i64, Ordering::Relaxed);
+        d.loop_end.store(end_frame as i64, Ordering::Relaxed);
+    }
+    /// Disengage `deck`'s beat loop (playback continues past the old region).
+    pub fn clear_loop(&self, deck: usize) {
+        let d = &self.shared.decks[deck_idx(deck)];
+        d.loop_start.store(-1, Ordering::Relaxed);
+        d.loop_end.store(-1, Ordering::Relaxed);
+    }
+    /// `deck`'s active beat loop as `(start_frame, end_frame)`, or `None` if no
+    /// valid loop is engaged. For the GUI to draw + highlight the region.
+    pub fn loop_region(&self, deck: usize) -> Option<(usize, usize)> {
+        let d = &self.shared.decks[deck_idx(deck)];
+        let s = d.loop_start.load(Ordering::Relaxed);
+        let e = d.loop_end.load(Ordering::Relaxed);
+        (s >= 0 && e > s).then_some((s as usize, e as usize))
     }
     /// Crossfader position: `0.0` = full deck A, `1.0` = full deck B (equal-power).
     pub fn set_crossfade(&self, x: f32) {
