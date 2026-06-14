@@ -1256,9 +1256,43 @@ impl eframe::App for App {
             }
         }
 
+        // TOP MENU BAR — always-visible dropdowns for the "settings" controls
+        // (FX, broadcast, mix levels, import, Link) so nothing is buried below the
+        // decks. Sliders/combos work inside egui menu dropdowns.
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("🎛 FX", |ui| {
+                    ui.set_min_width(300.0);
+                    self.master_fx_panel(ui);
+                });
+                ui.menu_button("📡 Broadcast", |ui| {
+                    ui.set_min_width(320.0);
+                    self.broadcast_row(ui);
+                });
+                ui.menu_button("🎚 Mix", |ui| {
+                    ui.set_min_width(240.0);
+                    self.shared_gains(ui);
+                });
+                ui.menu_button("⬇ Import", |ui| {
+                    ui.set_min_width(320.0);
+                    self.url_import_row(ui);
+                });
+                ui.menu_button("🔗 Link", |ui| {
+                    ui.set_min_width(240.0);
+                    self.link_panel(ui);
+                });
+                ui.separator();
+                ui.weak(format!(
+                    "{} Hz · underruns {}",
+                    self.engine.device_sr(),
+                    self.engine.underruns()
+                ));
+            });
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
           // Scroll via wheel/scrollbar only (NOT drag), so the add_sized sliders
-          // still drag freely AND the ⚙ Advanced drawer below the decks is reachable.
+          // still drag freely AND any overflow below the decks is reachable.
           egui::ScrollArea::vertical()
               .auto_shrink([false, false])
               .scroll_source(egui::scroll_area::ScrollSource {
@@ -1321,29 +1355,7 @@ impl eframe::App for App {
                 );
             });
 
-            ui.add_space(8.0);
-
-            // 6. ADVANCED — open by default so nothing looks "removed"; collapse it
-            // for a clean set view. Holds Master FX, URL import, mic/aux, Link.
-            egui::CollapsingHeader::new("⚙ Advanced — Master FX · Import · 📡 Broadcast · Mic/Aux · Link")
-                .default_open(true)
-                .show(ui, |ui| {
-                    self.master_fx_panel(ui);
-                    ui.separator();
-                    self.url_import_row(ui);
-                    ui.separator();
-                    self.broadcast_row(ui);
-                    ui.separator();
-                    self.shared_gains(ui);
-                    ui.separator();
-                    self.link_panel(ui);
-                    ui.separator();
-                    ui.label(format!(
-                        "device {} Hz · underruns {}",
-                        self.engine.device_sr(),
-                        self.engine.underruns()
-                    ));
-                });
+            // (FX · Broadcast · Mix · Import · Link moved to the top menu bar.)
           }); // ScrollArea
         });
 
