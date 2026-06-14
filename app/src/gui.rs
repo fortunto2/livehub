@@ -214,6 +214,15 @@ struct App {
     /// Which deck the keyboard transport (Spacebar = play/pause) targets, and which
     /// is highlighted. Set by clicking a deck's overview lane or its Play button.
     active_deck: usize,
+    /// 📡 Broadcast: capture an input device → UDP audio to the phone (reelcam).
+    /// `Some` while streaming (drop = stop). Source-agnostic — pick any input.
+    broadcaster: Option<livehub_engine::Broadcaster>,
+    /// Cached input-device names for the broadcast source picker (startup probe).
+    input_devs: Vec<String>,
+    /// Selected broadcast source device + the phone target `ip:port`.
+    bcast_device: String,
+    bcast_ip: String,
+    bcast_status: String,
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
@@ -267,6 +276,11 @@ impl App {
             output_open: false,
             canvas_mode: CanvasMode::Auto,
             active_deck: 0,
+            broadcaster: None,
+            input_devs: livehub_engine::input_device_names(),
+            bcast_device: "BlackHole".to_string(),
+            bcast_ip: String::new(),
+            bcast_status: String::new(),
             loop_len: [None, None],
             fx_choices: Engine::list_fx(),
             fx_selected: None,
@@ -892,6 +906,56 @@ impl App {
         self.engine.set_cue_gain(self.cue_gain);
     }
 
+    /// 📡 Broadcast row: capture an input device (BlackHole loopback carrying
+    /// REAPER/livehub/system, or hardware) and UDP-stream it to the phone (reelcam).
+    /// Source-agnostic — pick any input. Drop the handle (■ stop) to stop.
+    fn broadcast_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("📡 broadcast");
+            let on = self.broadcaster.is_some();
+            egui::ComboBox::from_id_salt("bcast_dev")
+                .selected_text(if self.bcast_device.is_empty() {
+                    "device"
+                } else {
+                    self.bcast_device.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for d in &self.input_devs {
+                        ui.selectable_value(&mut self.bcast_device, d.clone(), d.as_str());
+                    }
+                });
+            ui.add_enabled(
+                !on,
+                egui::TextEdit::singleline(&mut self.bcast_ip)
+                    .hint_text("phone ip:port")
+                    .desired_width(150.0),
+            );
+            if ui.button(if on { "■ stop" } else { "▶ start" }).clicked() {
+                if on {
+                    self.broadcaster = None; // drop → stop capture + sender
+                    self.bcast_status = "stopped".into();
+                } else {
+                    match self.bcast_ip.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => match livehub_engine::Broadcaster::start(&self.bcast_device, addr)
+                        {
+                            Ok(b) => {
+                                self.broadcaster = Some(b);
+                                self.bcast_status = format!("streaming → {addr}");
+                            }
+                            Err(e) => self.bcast_status = format!("error: {e}"),
+                        },
+                        Err(_) => {
+                            self.bcast_status = "bad ip:port (e.g. 172.20.10.2:9000)".into()
+                        }
+                    }
+                }
+            }
+            if !self.bcast_status.is_empty() {
+                ui.weak(self.bcast_status.as_str());
+            }
+        });
+    }
+
     /// Engage a `k`-beat loop on `deck` (the loop buttons pass `k` as beats; the
     /// label is the bar-fraction). The region — start on the beat at-or-before the
     /// playhead, exactly `k` beats long — comes from the shared pure helper, so the
@@ -1252,12 +1316,14 @@ impl eframe::App for App {
 
             // 6. ADVANCED — open by default so nothing looks "removed"; collapse it
             // for a clean set view. Holds Master FX, URL import, mic/aux, Link.
-            egui::CollapsingHeader::new("⚙ Advanced — Master FX · Import · Mic/Aux · Link")
+            egui::CollapsingHeader::new("⚙ Advanced — Master FX · Import · 📡 Broadcast · Mic/Aux · Link")
                 .default_open(true)
                 .show(ui, |ui| {
                     self.master_fx_panel(ui);
                     ui.separator();
                     self.url_import_row(ui);
+                    ui.separator();
+                    self.broadcast_row(ui);
                     ui.separator();
                     self.shared_gains(ui);
                     ui.separator();

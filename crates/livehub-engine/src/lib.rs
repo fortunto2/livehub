@@ -18,7 +18,8 @@ mod loops;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
-pub use broadcast::run_broadcast;
+pub use broadcast::{run_broadcast, Broadcaster};
+pub use device::input_device_names;
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;
 pub use device::list_devices;

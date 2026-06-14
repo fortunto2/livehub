@@ -12,6 +12,15 @@ use cpal::traits::{DeviceTrait, HostTrait};
 
 /// Print every input + output device with default vs max channel count, default
 /// rate and format. The M0 `--list-devices` acceptance helper.
+/// Input device names (for the GUI broadcast source picker). Empty on failure.
+pub fn input_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn list_devices() -> Result<()> {
     let host = cpal::default_host();
     println!("== OUTPUT devices ==");
