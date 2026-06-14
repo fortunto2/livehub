@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/livehub-core", "crates/livehub-engine", "app"]
+members = ["crates/livehub-core", "crates/livehub-engine", "app", "beam"]
 
 [workspace.package]
 version = "0.1.0"
