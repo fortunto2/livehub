@@ -8,7 +8,7 @@
 //! (and stops the stream); ⌘H tucks it away while it keeps broadcasting.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use livehub_engine::{
     input_device_names, send_control, Broadcaster, Discovery, Peer, PreviewReceiver,
@@ -47,6 +47,7 @@ struct Beam {
     preview: Option<PreviewReceiver>,
     preview_tex: Option<egui::TextureHandle>,
     preview_seq: u32, // last frame seq we uploaded → detect new frames
+    last_heartbeat: Instant, // re-arm the phone's preview watchdog
 }
 
 impl Beam {
@@ -73,6 +74,7 @@ impl Beam {
             preview: None,
             preview_tex: None,
             preview_seq: 0,
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -178,6 +180,16 @@ impl eframe::App for Beam {
 
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
+
+        // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
+        // it keeps streaming; if we crash, it self-stops after the timeout.
+        if self.preview.is_some() && self.last_heartbeat.elapsed() >= Duration::from_secs(2) {
+            self.last_heartbeat = Instant::now();
+            let port = self.preview.as_ref().map(|r| r.port());
+            if let (Some(addr), Some(port)) = (self.phone(), port) {
+                let _ = send_control(addr, CMD_PREVIEW_START, port);
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
