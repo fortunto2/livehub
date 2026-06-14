@@ -22,16 +22,40 @@ pub const CMD_REC_TOGGLE: u8 = 3;
 pub const CMD_PREVIEW_START: u8 = 4;
 pub const CMD_PREVIEW_STOP: u8 = 5;
 
-/// Send one control packet to the phone (its audio/control port, usually :9000).
-/// `preview_port` is where the phone should send preview frames (0 if none).
-pub fn send_control(to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
+/// Build the 7-byte control packet.
+fn control_packet(cmd: u8, preview_port: u16) -> [u8; 7] {
     let mut buf = [0u8; 7];
     buf[0..4].copy_from_slice(&CTRL_MAGIC.to_le_bytes());
     buf[4] = cmd;
     buf[5..7].copy_from_slice(&preview_port.to_le_bytes());
-    sock.send_to(&buf, to)?;
+    buf
+}
+
+/// Send one control packet from a throwaway socket. Fine for one-offs; for
+/// repeated sends use [`RemoteControl`] so the phone sees a STABLE source port
+/// (one connection) instead of a new flow per packet.
+pub fn send_control(to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.send_to(&control_packet(cmd, preview_port), to)?;
     Ok(())
+}
+
+/// A persistent control sender: one UDP socket reused for every command, so the
+/// phone receives all control packets on a SINGLE connection (no per-packet flow
+/// churn — important since the phone listens on every flow).
+pub struct RemoteControl {
+    sock: UdpSocket,
+}
+
+impl RemoteControl {
+    pub fn new() -> std::io::Result<RemoteControl> {
+        Ok(RemoteControl { sock: UdpSocket::bind("0.0.0.0:0")? })
+    }
+
+    pub fn send(&self, to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
+        self.sock.send_to(&control_packet(cmd, preview_port), to)?;
+        Ok(())
+    }
 }
 
 /// Receives low-res JPEG preview frames from the phone on an ephemeral UDP port.

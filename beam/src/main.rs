@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, send_control, Broadcaster, Discovery, Peer, PreviewReceiver,
+    input_device_names, Broadcaster, Discovery, Peer, PreviewReceiver, RemoteControl,
     CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
 };
 
@@ -48,6 +48,7 @@ struct Beam {
     preview_tex: Option<egui::TextureHandle>,
     preview_seq: u32, // last frame seq we uploaded → detect new frames
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
+    control: Option<RemoteControl>, // persistent control socket (stable port)
 }
 
 impl Beam {
@@ -75,7 +76,15 @@ impl Beam {
             preview_tex: None,
             preview_seq: 0,
             last_heartbeat: Instant::now(),
+            control: RemoteControl::new().ok(),
         }
+    }
+
+    /// Send a control command to the phone over the persistent socket (stable
+    /// source port = one connection on the phone; no flow churn). Returns whether
+    /// the datagram went out.
+    fn ctl(&self, to: SocketAddr, cmd: u8, port: u16) -> bool {
+        self.control.as_ref().is_some_and(|c| c.send(to, cmd, port).is_ok())
     }
 
     fn on(&self) -> bool {
@@ -90,7 +99,7 @@ impl Beam {
     /// Toggle recording ON THE PHONE (no ack — we track intent locally).
     fn toggle_remote_record(&mut self) {
         if let Some(addr) = self.phone() {
-            if send_control(addr, CMD_REC_TOGGLE, 0).is_ok() {
+            if self.ctl(addr, CMD_REC_TOGGLE, 0) {
                 self.remote_rec = !self.remote_rec;
             }
         }
@@ -100,7 +109,7 @@ impl Beam {
     fn toggle_preview(&mut self) {
         if self.preview.is_some() {
             if let Some(addr) = self.phone() {
-                let _ = send_control(addr, CMD_PREVIEW_STOP, 0);
+                self.ctl(addr, CMD_PREVIEW_STOP, 0);
             }
             self.preview = None;
             self.preview_tex = None; // drop the texture → free GPU memory
@@ -108,7 +117,7 @@ impl Beam {
         }
         // Start a receiver on an ephemeral port, tell the phone to send there.
         if let (Some(addr), Ok(rx)) = (self.phone(), PreviewReceiver::start()) {
-            let _ = send_control(addr, CMD_PREVIEW_START, rx.port());
+            self.ctl(addr, CMD_PREVIEW_START, rx.port());
             self.preview = Some(rx);
         }
     }
@@ -187,7 +196,7 @@ impl eframe::App for Beam {
             self.last_heartbeat = Instant::now();
             let port = self.preview.as_ref().map(|r| r.port());
             if let (Some(addr), Some(port)) = (self.phone(), port) {
-                let _ = send_control(addr, CMD_PREVIEW_START, port);
+                self.ctl(addr, CMD_PREVIEW_START, port);
             }
         }
 
@@ -354,7 +363,7 @@ impl Drop for Beam {
         // port after we quit. (The phone also self-stops on a control timeout.)
         if self.preview.is_some() {
             if let Some(addr) = self.phone() {
-                let _ = send_control(addr, CMD_PREVIEW_STOP, 0);
+                self.ctl(addr, CMD_PREVIEW_STOP, 0);
             }
         }
     }
