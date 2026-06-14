@@ -41,6 +41,10 @@ pub struct Broadcaster {
     /// lets you SEE that the source is actually carrying signal (e.g. confirm
     /// system audio is reaching BlackHole before you blame the network).
     level: Arc<AtomicF32>,
+    /// A/V-sync test: when set, the next captured block is replaced by a sharp
+    /// full-scale CLICK. Paired with a screen flash, the offset between them in the
+    /// phone's recording = the audio-vs-video latency. See `pulse()`.
+    pulse: Arc<AtomicBool>,
 }
 
 impl Broadcaster {
@@ -59,18 +63,36 @@ impl Broadcaster {
         let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(sr as usize * 2); // ~1 s stereo
         let level = Arc::new(AtomicF32::new(0.0));
         let cb_level = level.clone();
+        let pulse = Arc::new(AtomicBool::new(false));
+        let cb_pulse = pulse.clone();
         let stream_cfg: cpal::StreamConfig = cfg.clone().into();
         let stream = dev
             .build_input_stream(
                 &stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let frames = data.len() / in_ch;
+                    // A/V-sync click: replace this block with a sharp impulse.
+                    let click = cb_pulse.swap(false, Ordering::Relaxed);
                     let mut peak = 0.0f32;
                     for f in 0..frames {
                         let base = f * in_ch;
-                        let l = data.get(base).copied().unwrap_or(0.0);
-                        let r =
-                            if in_ch >= 2 { data.get(base + 1).copied().unwrap_or(0.0) } else { l };
+                        let (l, r) = if click {
+                            // ~1 ms square at full scale → a sharp, easy-to-detect click.
+                            let v = if f < (sr as usize / 1000).max(8) {
+                                if f % 8 < 4 { 1.0 } else { -1.0 }
+                            } else {
+                                0.0
+                            };
+                            (v, v)
+                        } else {
+                            let l = data.get(base).copied().unwrap_or(0.0);
+                            let r = if in_ch >= 2 {
+                                data.get(base + 1).copied().unwrap_or(0.0)
+                            } else {
+                                l
+                            };
+                            (l, r)
+                        };
                         peak = peak.max(l.abs()).max(r.abs());
                         let _ = prod.push(l); // drop on overflow — a live monitor can skip
                         let _ = prod.push(r);
@@ -94,7 +116,14 @@ impl Broadcaster {
                 .spawn(move || sender_loop(cons, sr, to, running))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, level })
+        Ok(Broadcaster { _stream: stream, running, sender, level, pulse })
+    }
+
+    /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
+    /// it with a screen flash the phone films; the click↔flash offset in the
+    /// recording is the audio-vs-video latency.
+    pub fn pulse(&self) {
+        self.pulse.store(true, Ordering::Relaxed);
     }
 
     /// Smoothed 0..1 capture level for a UI meter.

@@ -49,6 +49,10 @@ struct Beam {
     preview_seq: u32, // last frame seq we uploaded → detect new frames
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
     control: Option<RemoteControl>, // persistent control socket (stable port)
+    // A/V-sync test: periodically flash the window + click the audio together.
+    sync_test: bool,
+    last_pulse: Instant,
+    flash: bool,
 }
 
 impl Beam {
@@ -77,6 +81,9 @@ impl Beam {
             preview_seq: 0,
             last_heartbeat: Instant::now(),
             control: RemoteControl::new().ok(),
+            sync_test: false,
+            last_pulse: Instant::now(),
+            flash: false,
         }
     }
 
@@ -200,6 +207,18 @@ impl eframe::App for Beam {
             }
         }
 
+        // A/V-sync pulse: every ~1.5 s flash the window AND click the audio at the
+        // same instant. Film this window + record the audio, then analyse the clip:
+        // the flash↔click offset is the audio-vs-video latency.
+        self.flash = false;
+        if self.sync_test && self.on() && self.last_pulse.elapsed() >= Duration::from_millis(1500) {
+            self.last_pulse = Instant::now();
+            self.flash = true;
+            if let Some(b) = &self.broadcaster {
+                b.pulse();
+            }
+        }
+
         // ── LEFT: controls ────────────────────────────────────────────────────
         egui::SidePanel::left("controls")
             .resizable(false)
@@ -309,6 +328,22 @@ impl eframe::App for Beam {
                         self.toggle_preview();
                     }
 
+                    // A/V-sync test pulse (needs broadcast running).
+                    ui.add_space(4.0);
+                    let st = if self.sync_test { "🎬 sync test: ON" } else { "🎬 sync test" };
+                    if ui
+                        .add_enabled(
+                            self.on(),
+                            egui::Button::new(st).min_size(egui::vec2(300.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.sync_test = !self.sync_test;
+                    }
+                    if self.sync_test {
+                        ui.weak("film THIS window + record audio, then: avsync.py clip.mov");
+                    }
+
                     ui.add_space(8.0);
                     ui.separator();
                     ui.weak(
@@ -350,9 +385,22 @@ impl eframe::App for Beam {
                 }
             });
 
-        // Idle-friendly heartbeat. Faster while showing the live preview so frames
-        // flow (~6 fps); otherwise 2 fps just to refresh the phone list + meter.
-        let ms = if self.preview.is_some() { 160 } else { 500 };
+        // Full-screen white flash for the A/V-sync test (drawn on top of all panels).
+        if self.flash {
+            let painter = ctx
+                .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("flash")));
+            painter.rect_filled(ctx.content_rect(), 0.0, egui::Color32::WHITE);
+        }
+
+        // Repaint cadence: crisp 60 fps during the sync test (well-timed flash),
+        // ~6 fps while previewing, else a lazy 2 fps heartbeat.
+        let ms = if self.sync_test {
+            16
+        } else if self.preview.is_some() {
+            160
+        } else {
+            500
+        };
         ctx.request_repaint_after(Duration::from_millis(ms));
     }
 }
