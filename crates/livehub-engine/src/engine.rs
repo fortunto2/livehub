@@ -13,6 +13,7 @@ use arc_swap::ArcSwapOption;
 use atomic_float::AtomicF32;
 use core::f32::consts::FRAC_PI_2;
 use cpal::traits::{DeviceTrait, StreamTrait};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,6 +100,12 @@ struct Shared {
     /// The producers stay owned by the live input stream and never move.
     mic_cons: Mutex<Option<rtrb::Consumer<f32>>>,
     aux_cons: Mutex<Option<rtrb::Consumer<f32>>>,
+    /// Master broadcast TAP: when `bcast_on`, the output callback tees the post-FX
+    /// master pair into `bcast_prod` for the gated UDP sender thread (livehub's own
+    /// mix → phone, no loopback device). Parked/taken like the mic consumer so the
+    /// output stream can rebuild for an FX swap without disturbing the tap.
+    bcast_on: Arc<AtomicBool>,
+    bcast_prod: Mutex<Option<rtrb::Producer<f32>>>,
 }
 
 /// Clamp a public deck index to the valid range `{0, 1}`.
@@ -117,6 +124,7 @@ fn deck_idx(deck: usize) -> usize {
 struct RingLease {
     mic: Option<rtrb::Consumer<f32>>,
     aux: Option<rtrb::Consumer<f32>>,
+    bcast: Option<rtrb::Producer<f32>>,
     shared: Arc<Shared>,
 }
 
@@ -128,6 +136,10 @@ impl Drop for RingLease {
         {
             *m = self.mic.take();
             *a = self.aux.take();
+        }
+        // Park the broadcast tap producer back too.
+        if let Ok(mut b) = self.shared.bcast_prod.lock() {
+            *b = self.bcast.take();
         }
     }
 }
@@ -151,10 +163,11 @@ fn build_output_stream(
     shared: Arc<Shared>,
     mut fx: Option<MasterFx>,
 ) -> Result<cpal::Stream> {
-    // Take the parked ring consumers; the RingLease returns them on drop.
+    // Take the parked ring consumers + broadcast producer; RingLease returns them on drop.
     let mic = shared.mic_cons.lock().unwrap().take();
     let aux = shared.aux_cons.lock().unwrap().take();
-    let mut lease = RingLease { mic, aux, shared: shared.clone() };
+    let bcast = shared.bcast_prod.lock().unwrap().take();
+    let mut lease = RingLease { mic, aux, bcast, shared: shared.clone() };
 
     // Block-sized stereo scratch for the master FX: the cpal buffer is variable
     // size, so we sub-block it to MAX_FX_BLOCK frames. Pre-allocated here (main
@@ -179,6 +192,10 @@ fn build_output_stream(
                     (Some(c), Some(a)) => (c, a),
                     _ => return,
                 };
+                // Master broadcast tap (disjoint field borrow): tee the post-FX
+                // master pair into this ring in phase 2 when broadcasting.
+                let bcast = &mut lease.bcast;
+                let bcast_on = sh.bcast_on.load(Ordering::Relaxed);
 
                 // Per-deck: apply a pending seek at the block boundary, then
                 // snapshot the track Arc / playhead / play flag / gain ONCE.
@@ -357,6 +374,14 @@ fn build_output_stream(
                         if let Some(slot) = out.get_mut(base + mr) {
                             *slot = mbuf_r[i];
                         }
+                        // Tee the master pair to the broadcast ring (wait-free,
+                        // drop-on-full). Off → no push, the sender drains+discards.
+                        if bcast_on {
+                            if let Some(bp) = bcast.as_mut() {
+                                let _ = bp.push(mbuf_l[i]);
+                                let _ = bp.push(mbuf_r[i]);
+                            }
+                        }
                         // Cue write: only when a deck is cued; the headphone
                         // channels were already zeroed for this frame in phase 1,
                         // and `out.get_mut` guards a missing pair on a 2ch device.
@@ -413,6 +438,21 @@ pub struct Engine {
     /// a `Mutex` only so `set_fx_param(&self, …)` (GUI thread) can push without
     /// `&mut`; the lock is never taken on the audio thread.
     fx_tx: Mutex<Option<rtrb::Producer<ParamSet>>>,
+    /// Master-tap UDP sender: live target + on flag + lifetime flag + the thread.
+    bcast_target: Arc<Mutex<Option<SocketAddr>>>,
+    bcast_on: Arc<AtomicBool>,
+    bcast_alive: Arc<AtomicBool>,
+    bcast_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Stop the master-tap sender thread so it doesn't outlive the engine.
+        self.bcast_alive.store(false, Ordering::Relaxed);
+        if let Some(h) = self.bcast_thread.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Cheap `Send + Sync` read handle to one deck's live transport, for off-thread
@@ -498,6 +538,9 @@ impl Engine {
         let mic_ch = 0usize;
         let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
         let (mut aux_prod, aux_cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
+        // Master broadcast tap ring: output callback (producer) -> sender thread.
+        let bcast_on = Arc::new(AtomicBool::new(false));
+        let (bcast_prod, bcast_cons) = rtrb::RingBuffer::<f32>::new(device_sr as usize * 2);
 
         let shared = Arc::new(Shared {
             decks: [Deck::new(), Deck::new()],
@@ -513,6 +556,8 @@ impl Engine {
             // Park the consumers; build_output_stream takes them on first build.
             mic_cons: Mutex::new(Some(cons)),
             aux_cons: Mutex::new(Some(aux_cons)),
+            bcast_on: bcast_on.clone(),
+            bcast_prod: Mutex::new(Some(bcast_prod)),
         });
 
         let in_stream_cfg: cpal::StreamConfig = in_cfg.into();
@@ -545,6 +590,20 @@ impl Engine {
         in_stream.play().context("input stream play")?;
         out_stream.play().context("output stream play")?;
 
+        // Persistent gated UDP sender for the master tap (livehub mix → phone).
+        let bcast_target: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let bcast_alive = Arc::new(AtomicBool::new(true));
+        let bcast_thread = {
+            let (target, on, alive) =
+                (bcast_target.clone(), bcast_on.clone(), bcast_alive.clone());
+            std::thread::Builder::new()
+                .name("master-bcast".into())
+                .spawn(move || {
+                    crate::broadcast::master_sender_loop(bcast_cons, device_sr, target, on, alive)
+                })
+                .ok()
+        };
+
         Ok(Self {
             _in_stream: in_stream,
             out_stream: Some(out_stream),
@@ -552,7 +611,33 @@ impl Engine {
             out_cfg,
             shared,
             fx_tx: Mutex::new(None),
+            bcast_target,
+            bcast_on,
+            bcast_alive,
+            bcast_thread,
         })
+    }
+
+    /// Start streaming livehub's OWN master mix (post-FX) to `to` over UDP — no
+    /// loopback device needed. Idempotent; changing `to` re-targets live.
+    pub fn start_master_broadcast(&self, to: SocketAddr) {
+        if let Ok(mut t) = self.bcast_target.lock() {
+            *t = Some(to);
+        }
+        self.bcast_on.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop the master-mix broadcast (the tap thread keeps running, idle).
+    pub fn stop_master_broadcast(&self) {
+        self.bcast_on.store(false, Ordering::Relaxed);
+        if let Ok(mut t) = self.bcast_target.lock() {
+            *t = None;
+        }
+    }
+
+    /// Whether the master-mix broadcast is currently on.
+    pub fn is_master_broadcasting(&self) -> bool {
+        self.bcast_on.load(Ordering::Relaxed)
     }
 
     /// Load a master-bus CLAP insert from a `.clap` path (or clear it with

@@ -27,6 +27,10 @@ const DECK_COLOR: [Color32; 2] =
 /// Mixer column width (px). Narrow on purpose — two vertical faders + cue.
 const MIXER_W: f32 = 150.0;
 
+/// Sentinel broadcast "source" meaning livehub's OWN master mix (the engine's
+/// internal tap), as opposed to capturing a hardware/loopback input device.
+pub(crate) const MASTER_SRC: &str = "🎚 livehub master (this mix)";
+
 /// Output-stage (canvas) aspect, switchable live. `Auto` follows the loaded
 /// clips' orientation; the fixed modes force a shape regardless of the sources.
 #[derive(Clone, Copy, PartialEq)]
@@ -173,6 +177,10 @@ struct App {
     /// knows what to split. Set by `load_path` and on a finished import; left
     /// `None` for camera/image/visualizer sources (they have no audio file).
     deck_path: [Option<PathBuf>; 2],
+    /// Per-deck "this file had no video → attach the beat visualizer once its track
+    /// finishes decoding" flag, so loading an audio-only file doesn't leave a dead
+    /// black composite. Polled + cleared in `update()`. Set by `load_path`.
+    auto_viz: [bool; 2],
     /// Shared URL text box feeding the `⬇A` / `⬇B` import buttons (one URL, either
     /// deck) — the source is global, not per-deck.
     import_url: String,
@@ -268,6 +276,7 @@ impl App {
             file_rx: [None, None],
             image_rx: [None, None],
             deck_path: [None, None],
+            auto_viz: [false, false],
             import_url: String::new(),
             import_rx: [None, None],
             karaoke_rx: [None, None],
@@ -292,7 +301,7 @@ impl App {
             active_deck: 0,
             broadcaster: None,
             input_devs: livehub_engine::input_device_names(),
-            bcast_device: "BlackHole".to_string(),
+            bcast_device: MASTER_SRC.to_string(),
             bcast_ip: saved_phone.1,
             bcast_status: String::new(),
             discovery: livehub_engine::Discovery::start().ok(),
@@ -400,6 +409,9 @@ impl App {
         self.deck_path[deck] = Some(path.clone()); // remember the source for karaoke.
         self.video[deck] =
             VideoDeck::open(path.clone(), self.engine.transport(deck)).map(VideoSource::File);
+        // Audio-only file (no video stream) → attach the beat visualizer once the
+        // track decodes, so the composite isn't a dead black rectangle.
+        self.auto_viz[deck] = self.video[deck].is_none();
         self.engine.load_track_background(deck, path);
     }
 
@@ -473,6 +485,7 @@ impl App {
         self.video[deck] = None;
         self.video_tex[deck] = None;
         self.last_gen[deck] = 0;
+        self.auto_viz[deck] = false; // cancel any pending auto-visualizer.
     }
 
     /// Open a native image-file picker on a worker thread; the result is drained in
@@ -931,7 +944,9 @@ impl App {
     /// REAPER/livehub/system, or hardware) and UDP-stream it to the phone (reelcam).
     /// Source-agnostic — pick any input. Drop the handle (■ stop) to stop.
     fn broadcast_row(&mut self, ui: &mut egui::Ui) {
-        let on = self.broadcaster.is_some();
+        // "On" covers BOTH paths: a device-capture Broadcaster or the engine's
+        // internal master tap (livehub's own mix → phone, no loopback device).
+        let on = self.broadcaster.is_some() || self.engine.is_master_broadcasting();
         // Auto-discovered reelcam phones (mDNS/Bonjour) — click to target.
         let peers = self.discovery.as_ref().map(|d| d.peers()).unwrap_or_default();
         // Auto-re-target the remembered phone when it reappears (IP may have changed).
@@ -967,7 +982,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.label("Source device (captured → sent to the phone):");
+        ui.label("Source (what the phone receives):");
         egui::ComboBox::from_id_salt("bcast_dev")
             .selected_text(if self.bcast_device.is_empty() {
                 "device"
@@ -976,10 +991,19 @@ impl App {
             })
             .width(280.0)
             .show_ui(ui, |ui| {
+                // The common case: livehub's OWN mix (decks + mic + master FX), no
+                // loopback device needed. Listed first + the default.
+                ui.selectable_value(&mut self.bcast_device, MASTER_SRC.to_string(), MASTER_SRC);
+                ui.separator();
                 for d in &self.input_devs {
                     ui.selectable_value(&mut self.bcast_device, d.clone(), d.as_str());
                 }
             });
+        if self.bcast_device == MASTER_SRC {
+            ui.weak("↪ streams exactly what you hear in livehub — load a track & play.");
+        } else {
+            ui.weak("↪ captures this input device (e.g. BlackHole carrying REAPER).");
+        }
         ui.add_space(4.0);
         ui.label("Phone address (shown in reelcam):");
         ui.add_enabled(
@@ -992,28 +1016,39 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button(if on { "■ stop" } else { "▶ start" }).clicked() {
                 if on {
-                    self.broadcaster = None; // drop → stop capture + sender
+                    self.engine.stop_master_broadcast(); // no-op if not master
+                    self.broadcaster = None; // drop → stop device capture + sender
                     self.bcast_status = "stopped".into();
                 } else {
+                    let master = self.bcast_device == MASTER_SRC;
                     match self.bcast_ip.parse::<std::net::SocketAddr>() {
-                        Ok(addr) => match livehub_engine::Broadcaster::start(&self.bcast_device, addr)
-                        {
-                            Ok(b) => {
-                                self.broadcaster = Some(b);
-                                self.bcast_status = format!("streaming → {addr}");
-                                // Remember this target (name if a discovered peer matches).
-                                let name = peers
-                                    .iter()
-                                    .find(|p| p.addr == addr)
-                                    .map(|p| p.name.clone())
-                                    .or_else(|| self.remembered_phone.clone())
-                                    .unwrap_or_default();
-                                self.remembered_phone =
-                                    if name.is_empty() { None } else { Some(name.clone()) };
-                                save_last_phone(&name, &addr.to_string());
+                        Ok(addr) => {
+                            // Master = engine's internal tap; otherwise capture a device.
+                            let started: Result<(), String> = if master {
+                                self.engine.start_master_broadcast(addr);
+                                Ok(())
+                            } else {
+                                livehub_engine::Broadcaster::start(&self.bcast_device, addr)
+                                    .map(|b| self.broadcaster = Some(b))
+                                    .map_err(|e| e.to_string())
+                            };
+                            match started {
+                                Ok(()) => {
+                                    self.bcast_status = format!("streaming → {addr}");
+                                    // Remember the target (name if a discovered peer matches).
+                                    let name = peers
+                                        .iter()
+                                        .find(|p| p.addr == addr)
+                                        .map(|p| p.name.clone())
+                                        .or_else(|| self.remembered_phone.clone())
+                                        .unwrap_or_default();
+                                    self.remembered_phone =
+                                        if name.is_empty() { None } else { Some(name.clone()) };
+                                    save_last_phone(&name, &addr.to_string());
+                                }
+                                Err(e) => self.bcast_status = format!("error: {e}"),
                             }
-                            Err(e) => self.bcast_status = format!("error: {e}"),
-                        },
+                        }
                         Err(_) => {
                             self.bcast_status = "bad ip:port (e.g. 172.20.10.2:9000)".into()
                         }
@@ -1261,6 +1296,15 @@ impl eframe::App for App {
         for d in 0..2 {
             if let Some(path) = self.pending_open[d].take() {
                 self.load_path(d, path);
+            }
+        }
+
+        // Audio-only file just finished decoding → attach the beat visualizer so the
+        // composite shows the music reacting instead of a black rectangle.
+        for d in 0..2 {
+            if self.auto_viz[d] && self.video[d].is_none() && self.engine.current_track(d).is_some()
+            {
+                self.load_visualizer(d); // clears auto_viz via reset_video.
             }
         }
 
