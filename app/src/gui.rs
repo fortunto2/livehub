@@ -223,6 +223,13 @@ struct App {
     bcast_device: String,
     bcast_ip: String,
     bcast_status: String,
+    /// Floating tool-window toggles (opened from the top toolbar). Real windows —
+    /// movable, and combos/sliders inside them work (a menu dropdown ate them).
+    show_fx: bool,
+    show_broadcast: bool,
+    show_mix: bool,
+    show_import: bool,
+    show_link: bool,
     /// Per-deck engaged beat-loop size in beats, to highlight the active button.
     /// `None` = no loop on that deck.
     loop_len: [Option<usize>; 2],
@@ -281,6 +288,11 @@ impl App {
             bcast_device: "BlackHole".to_string(),
             bcast_ip: String::new(),
             bcast_status: String::new(),
+            show_fx: false,
+            show_broadcast: false,
+            show_mix: false,
+            show_import: false,
+            show_link: false,
             loop_len: [None, None],
             fx_choices: Engine::list_fx(),
             fx_selected: None,
@@ -910,26 +922,30 @@ impl App {
     /// REAPER/livehub/system, or hardware) and UDP-stream it to the phone (reelcam).
     /// Source-agnostic — pick any input. Drop the handle (■ stop) to stop.
     fn broadcast_row(&mut self, ui: &mut egui::Ui) {
+        let on = self.broadcaster.is_some();
+        ui.label("Source device (captured → sent to the phone):");
+        egui::ComboBox::from_id_salt("bcast_dev")
+            .selected_text(if self.bcast_device.is_empty() {
+                "device"
+            } else {
+                self.bcast_device.as_str()
+            })
+            .width(280.0)
+            .show_ui(ui, |ui| {
+                for d in &self.input_devs {
+                    ui.selectable_value(&mut self.bcast_device, d.clone(), d.as_str());
+                }
+            });
+        ui.add_space(4.0);
+        ui.label("Phone address (shown in reelcam):");
+        ui.add_enabled(
+            !on,
+            egui::TextEdit::singleline(&mut self.bcast_ip)
+                .hint_text("ip:port  e.g. 172.20.10.2:9000")
+                .desired_width(280.0),
+        );
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("📡 broadcast");
-            let on = self.broadcaster.is_some();
-            egui::ComboBox::from_id_salt("bcast_dev")
-                .selected_text(if self.bcast_device.is_empty() {
-                    "device"
-                } else {
-                    self.bcast_device.as_str()
-                })
-                .show_ui(ui, |ui| {
-                    for d in &self.input_devs {
-                        ui.selectable_value(&mut self.bcast_device, d.clone(), d.as_str());
-                    }
-                });
-            ui.add_enabled(
-                !on,
-                egui::TextEdit::singleline(&mut self.bcast_ip)
-                    .hint_text("phone ip:port")
-                    .desired_width(150.0),
-            );
             if ui.button(if on { "■ stop" } else { "▶ start" }).clicked() {
                 if on {
                     self.broadcaster = None; // drop → stop capture + sender
@@ -954,6 +970,48 @@ impl App {
                 ui.weak(self.bcast_status.as_str());
             }
         });
+    }
+
+    /// Floating tool windows toggled from the top toolbar. Each is movable and
+    /// holds the real controls — combos/sliders work in a Window (a menu dropdown
+    /// closed on selection). The `open(&mut local)` dance avoids borrowing `self`
+    /// both for the flag and inside the body.
+    fn tool_windows(&mut self, ctx: &egui::Context) {
+        let mut fx = self.show_fx;
+        egui::Window::new("🎛 Master FX")
+            .open(&mut fx)
+            .default_width(340.0)
+            .resizable(true)
+            .show(ctx, |ui| self.master_fx_panel(ui));
+        self.show_fx = fx;
+
+        let mut bc = self.show_broadcast;
+        egui::Window::new("📡 Broadcast to phone")
+            .open(&mut bc)
+            .default_width(320.0)
+            .show(ctx, |ui| self.broadcast_row(ui));
+        self.show_broadcast = bc;
+
+        let mut mx = self.show_mix;
+        egui::Window::new("Mix · mic / aux / cue")
+            .open(&mut mx)
+            .default_width(280.0)
+            .show(ctx, |ui| self.shared_gains(ui));
+        self.show_mix = mx;
+
+        let mut im = self.show_import;
+        egui::Window::new("Import from URL")
+            .open(&mut im)
+            .default_width(360.0)
+            .show(ctx, |ui| self.url_import_row(ui));
+        self.show_import = im;
+
+        let mut lk = self.show_link;
+        egui::Window::new("Ableton Link")
+            .open(&mut lk)
+            .default_width(280.0)
+            .show(ctx, |ui| self.link_panel(ui));
+        self.show_link = lk;
     }
 
     /// Engage a `k`-beat loop on `deck` (the loop buttons pass `k` as beats; the
@@ -1256,31 +1314,15 @@ impl eframe::App for App {
             }
         }
 
-        // TOP MENU BAR — always-visible dropdowns for the "settings" controls
-        // (FX, broadcast, mix levels, import, Link) so nothing is buried below the
-        // decks. Sliders/combos work inside egui menu dropdowns.
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("🎛 FX", |ui| {
-                    ui.set_min_width(300.0);
-                    self.master_fx_panel(ui);
-                });
-                ui.menu_button("📡 Broadcast", |ui| {
-                    ui.set_min_width(320.0);
-                    self.broadcast_row(ui);
-                });
-                ui.menu_button("🎚 Mix", |ui| {
-                    ui.set_min_width(240.0);
-                    self.shared_gains(ui);
-                });
-                ui.menu_button("⬇ Import", |ui| {
-                    ui.set_min_width(320.0);
-                    self.url_import_row(ui);
-                });
-                ui.menu_button("🔗 Link", |ui| {
-                    ui.set_min_width(240.0);
-                    self.link_panel(ui);
-                });
+        // TOP TOOLBAR — toggle buttons that open movable tool WINDOWS (not menu
+        // dropdowns, which ate the combo/sliders). Nothing is buried below the decks.
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.toggle_value(&mut self.show_fx, "FX");
+                ui.toggle_value(&mut self.show_broadcast, "📡 Broadcast");
+                ui.toggle_value(&mut self.show_mix, "Mix");
+                ui.toggle_value(&mut self.show_import, "Import");
+                ui.toggle_value(&mut self.show_link, "Link");
                 ui.separator();
                 ui.weak(format!(
                     "{} Hz · underruns {}",
@@ -1289,6 +1331,7 @@ impl eframe::App for App {
                 ));
             });
         });
+        self.tool_windows(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
           // Scroll via wheel/scrollbar only (NOT drag), so the add_sized sliders
