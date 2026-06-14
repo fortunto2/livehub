@@ -10,7 +10,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use livehub_engine::{input_device_names, Broadcaster, Discovery, Peer};
+use livehub_engine::{
+    input_device_names, send_control, Broadcaster, Discovery, Peer, PreviewReceiver,
+    CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+};
 
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
@@ -39,6 +42,11 @@ struct Beam {
     remembered: Option<String>,
     broadcaster: Option<Broadcaster>,
     status: String,
+    // Remote control of the phone + its camera preview (MJPEG over UDP).
+    remote_rec: bool, // local toggle intent (the phone has no ack channel)
+    preview: Option<PreviewReceiver>,
+    preview_tex: Option<egui::TextureHandle>,
+    preview_seq: u32, // last frame seq we uploaded → detect new frames
 }
 
 impl Beam {
@@ -61,11 +69,71 @@ impl Beam {
             remembered,
             broadcaster: None,
             status: String::new(),
+            remote_rec: false,
+            preview: None,
+            preview_tex: None,
+            preview_seq: 0,
         }
     }
 
     fn on(&self) -> bool {
         self.broadcaster.is_some()
+    }
+
+    /// The phone's control endpoint (ip:port parsed from the target field).
+    fn phone(&self) -> Option<SocketAddr> {
+        self.phone_addr.parse::<SocketAddr>().ok()
+    }
+
+    /// Toggle recording ON THE PHONE (no ack — we track intent locally).
+    fn toggle_remote_record(&mut self) {
+        if let Some(addr) = self.phone() {
+            if send_control(addr, CMD_REC_TOGGLE, 0).is_ok() {
+                self.remote_rec = !self.remote_rec;
+            }
+        }
+    }
+
+    /// Start/stop receiving the phone's camera preview (MJPEG → one texture).
+    fn toggle_preview(&mut self) {
+        if self.preview.is_some() {
+            if let Some(addr) = self.phone() {
+                let _ = send_control(addr, CMD_PREVIEW_STOP, 0);
+            }
+            self.preview = None;
+            self.preview_tex = None; // drop the texture → free GPU memory
+            return;
+        }
+        // Start a receiver on an ephemeral port, tell the phone to send there.
+        if let (Some(addr), Ok(rx)) = (self.phone(), PreviewReceiver::start()) {
+            let _ = send_control(addr, CMD_PREVIEW_START, rx.port());
+            self.preview = Some(rx);
+        }
+    }
+
+    /// If a newer preview frame arrived, decode it into `preview_tex`. Keeps only
+    /// the latest frame — nothing is buffered or stored.
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.preview else { return };
+        let seq = rx.frame_seq();
+        if seq == self.preview_seq {
+            return;
+        }
+        self.preview_seq = seq;
+        let Some(jpeg) = rx.latest_jpeg() else { return };
+        if let Ok(img) = image::load_from_memory(&jpeg) {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
+            // Replace in place — the old texture is freed, so memory stays bounded.
+            match &mut self.preview_tex {
+                Some(tex) => tex.set(color, egui::TextureOptions::LINEAR),
+                None => {
+                    self.preview_tex =
+                        Some(ctx.load_texture("preview", color, egui::TextureOptions::LINEAR))
+                }
+            }
+        }
     }
 
     fn start(&mut self) {
@@ -107,6 +175,9 @@ impl eframe::App for Beam {
                 self.phone_addr = self.peers[0].addr.to_string();
             }
         }
+
+        // Pull the latest camera-preview frame (if any) into the texture.
+        self.poll_preview(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
@@ -192,6 +263,36 @@ impl eframe::App for Beam {
                 );
             }
 
+            // ── Phone remote + camera preview ─────────────────────────────────
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label("📲 Phone remote:");
+            ui.horizontal(|ui| {
+                let has_phone = self.phone().is_some();
+                let rec = if self.remote_rec { "■ stop rec" } else { "⏺ record" };
+                if ui.add_enabled(has_phone, egui::Button::new(rec)).clicked() {
+                    self.toggle_remote_record();
+                }
+                let prev = if self.preview.is_some() { "👁 preview ✓" } else { "👁 preview" };
+                if ui.add_enabled(has_phone, egui::Button::new(prev)).clicked() {
+                    self.toggle_preview();
+                }
+                if self.remote_rec {
+                    ui.colored_label(egui::Color32::from_rgb(235, 90, 90), "● REC");
+                }
+            });
+            if self.preview.is_some() {
+                if let Some(tex) = &self.preview_tex {
+                    let avail = ui.available_width().min(240.0);
+                    let sz = tex.size_vec2();
+                    let aspect = if sz.x > 0.0 { sz.y / sz.x } else { 16.0 / 9.0 };
+                    let disp = egui::vec2(avail, avail * aspect);
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                } else {
+                    ui.weak("waiting for preview frames…");
+                }
+            }
+
             // ── System-audio hint ─────────────────────────────────────────────
             ui.add_space(6.0);
             ui.separator();
@@ -202,9 +303,22 @@ impl eframe::App for Beam {
             );
         });
 
-        // Idle-friendly: a 2 fps heartbeat keeps the phone list + status fresh
-        // without busy-looping; egui repaints instantly on input.
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Idle-friendly heartbeat. Faster while showing the live preview so frames
+        // flow (~6 fps); otherwise 2 fps just to refresh the phone list + meter.
+        let ms = if self.preview.is_some() { 160 } else { 500 };
+        ctx.request_repaint_after(Duration::from_millis(ms));
+    }
+}
+
+impl Drop for Beam {
+    fn drop(&mut self) {
+        // Tell the phone to stop its preview so it doesn't keep sending to a dead
+        // port after we quit. (The phone also self-stops on a control timeout.)
+        if self.preview.is_some() {
+            if let Some(addr) = self.phone() {
+                let _ = send_control(addr, CMD_PREVIEW_STOP, 0);
+            }
+        }
     }
 }
 

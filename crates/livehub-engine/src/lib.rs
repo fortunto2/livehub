@@ -16,12 +16,17 @@ mod discovery;
 mod engine;
 mod link;
 mod loops;
+mod remote;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
 pub use broadcast::{run_broadcast, Broadcaster};
 pub use device::input_device_names;
 pub use discovery::{Discovery, Peer};
+pub use remote::{
+    send_control, PreviewReceiver, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START,
+    CMD_REC_STOP, CMD_REC_TOGGLE,
+};
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;
 pub use device::list_devices;

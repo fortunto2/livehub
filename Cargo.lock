@@ -475,6 +475,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "image",
  "livehub-engine",
  "wgpu",
 ]

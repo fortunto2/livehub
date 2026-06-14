@@ -16,6 +16,7 @@ livehub-engine = { path = "../crates/livehub-engine" }
 anyhow = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # eframe's `wgpu` feature ships wgpu with default-features off → enable Metal here
 # (feature unification), same as the main app.
 wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }
