@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# A tiny macOS menu-bar broadcaster: capture an input device (BlackHole carrying
-# REAPER, system audio, a hardware input) and UDP-stream it to the phone (reelcam)
-# — no DJ console. Reuses livehub-engine's Broadcaster + Discovery.
+# A tiny standalone window: capture an input device (BlackHole carrying REAPER,
+# system audio, a hardware input) and UDP-stream it to the phone (reelcam) — no DJ
+# console. Reuses livehub-engine's Broadcaster + Discovery.
 [[bin]]
 name = "beam"
 path = "src/main.rs"
@@ -14,5 +14,8 @@ path = "src/main.rs"
 [dependencies]
 livehub-engine = { path = "../crates/livehub-engine" }
 anyhow = { workspace = true }
-tray-icon = "0.21"
-winit = "0.30"
+eframe = { workspace = true }
+egui = { workspace = true }
+# eframe's `wgpu` feature ships wgpu with default-features off → enable Metal here
+# (feature unification), same as the main app.
+wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }

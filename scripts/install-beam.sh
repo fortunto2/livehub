@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Build beam.app (the menu-bar audio broadcaster) and install it to /Applications.
-# LSUIElement → it shows ONLY in the status bar (no Dock icon). Re-run after code
-# changes. Launch from Spotlight: ‘beam’ (or add to Login Items).
+# Build beam.app (the small windowed audio broadcaster) and install it to
+# /Applications. Re-run after code changes. Launch from Spotlight: ‘beam’.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,4 +22,4 @@ cp "$ROOT/beam/Info.plist" "$APP/Contents/Info.plist"
 echo "› codesign (ad-hoc)"
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
-echo "✓ installed: $APP   (launch from Spotlight: ‘beam’ — it lives in the menu bar)"
+echo "✓ installed: $APP   (launch from Spotlight: ‘beam’ — a small always-on-top window)"
