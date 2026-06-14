@@ -16,6 +16,7 @@
 //!   n_frames u16 · then interleaved-stereo f32 (L,R,L,R…)
 
 use anyhow::{Context, Result};
+use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,10 @@ pub struct Broadcaster {
     _stream: cpal::Stream, // input capture; kept alive so capture continues
     running: Arc<AtomicBool>,
     sender: Option<std::thread::JoinHandle<()>>,
+    /// Smoothed 0..1 capture peak (fast attack / slow release) for a UI meter —
+    /// lets you SEE that the source is actually carrying signal (e.g. confirm
+    /// system audio is reaching BlackHole before you blame the network).
+    level: Arc<AtomicF32>,
 }
 
 impl Broadcaster {
@@ -52,20 +57,28 @@ impl Broadcaster {
         );
 
         let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(sr as usize * 2); // ~1 s stereo
+        let level = Arc::new(AtomicF32::new(0.0));
+        let cb_level = level.clone();
         let stream_cfg: cpal::StreamConfig = cfg.clone().into();
         let stream = dev
             .build_input_stream(
                 &stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let frames = data.len() / in_ch;
+                    let mut peak = 0.0f32;
                     for f in 0..frames {
                         let base = f * in_ch;
                         let l = data.get(base).copied().unwrap_or(0.0);
                         let r =
                             if in_ch >= 2 { data.get(base + 1).copied().unwrap_or(0.0) } else { l };
+                        peak = peak.max(l.abs()).max(r.abs());
                         let _ = prod.push(l); // drop on overflow — a live monitor can skip
                         let _ = prod.push(r);
                     }
+                    // Peak meter: fast attack, slow release.
+                    let prev = cb_level.load(Ordering::Relaxed);
+                    let v = if peak > prev { peak } else { prev * 0.85 };
+                    cb_level.store(v.min(1.0), Ordering::Relaxed);
                 },
                 |e| eprintln!("broadcast input error: {e}"),
                 None,
@@ -81,7 +94,12 @@ impl Broadcaster {
                 .spawn(move || sender_loop(cons, sr, to, running))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender })
+        Ok(Broadcaster { _stream: stream, running, sender, level })
+    }
+
+    /// Smoothed 0..1 capture level for a UI meter.
+    pub fn level(&self) -> f32 {
+        self.level.load(Ordering::Relaxed)
     }
 }
 

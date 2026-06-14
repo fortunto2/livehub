@@ -180,11 +180,56 @@ impl eframe::App for Beam {
                 ui.add_space(2.0);
                 ui.weak(&self.status);
             }
+
+            // ── Level meter (of the captured source, while broadcasting) ──────
+            ui.add_space(6.0);
+            let level = self.broadcaster.as_ref().map(|b| b.level()).unwrap_or(0.0);
+            level_bar(ui, level, self.on());
+            if self.on() && level < 0.001 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 70),
+                    "⚠ source is silent — is signal reaching this device?",
+                );
+            }
+
+            // ── System-audio hint ─────────────────────────────────────────────
+            ui.add_space(6.0);
+            ui.separator();
+            ui.weak(
+                "🔊 System/YouTube audio isn't captured directly (macOS has no system-\
+                 capture device). Route it through BlackHole: Audio MIDI Setup → a Multi-\
+                 Output (BlackHole + speakers) → set as output, then pick BlackHole above.",
+            );
         });
 
         // Idle-friendly: a 2 fps heartbeat keeps the phone list + status fresh
         // without busy-looping; egui repaints instantly on input.
         ctx.request_repaint_after(Duration::from_millis(500));
+    }
+}
+
+/// Horizontal level meter: green→yellow→red. Dim track when not broadcasting.
+fn level_bar(ui: &mut egui::Ui, level: f32, active: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().min(320.0), 14.0),
+        egui::Sense::hover(),
+    );
+    let p = ui.painter();
+    p.rect_filled(rect, 3.0, egui::Color32::from_gray(38));
+    if active {
+        let lvl = level.clamp(0.0, 1.0);
+        let color = if lvl > 0.9 {
+            egui::Color32::from_rgb(225, 80, 80)
+        } else if lvl > 0.6 {
+            egui::Color32::from_rgb(230, 200, 70)
+        } else {
+            egui::Color32::from_rgb(90, 200, 110)
+        };
+        let fill = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(rect.width() * lvl, rect.height()),
+        );
+        p.rect_filled(fill, 3.0, color);
     }
 }
 
