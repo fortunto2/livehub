@@ -225,6 +225,9 @@ struct App {
     bcast_status: String,
     /// mDNS/Bonjour discovery of reelcam phones — auto-fills the broadcast target.
     discovery: Option<livehub_engine::Discovery>,
+    /// Remembered phone (by Bonjour name) — persisted across runs so the same
+    /// reelcam auto-re-targets when rediscovered, even if its IP changed (hotspot/DHCP).
+    remembered_phone: Option<String>,
     /// Floating tool-window toggles (opened from the top toolbar). Real windows —
     /// movable, and combos/sliders inside them work (a menu dropdown ate them).
     show_fx: bool,
@@ -257,6 +260,8 @@ impl App {
         open_b: Option<PathBuf>,
         autoplay: bool,
     ) -> Self {
+        // Last broadcast target remembered across runs: (phone Bonjour name, ip:port).
+        let saved_phone = load_last_phone();
         Self {
             engine,
             link: LinkHub::new(120.0),
@@ -288,9 +293,10 @@ impl App {
             broadcaster: None,
             input_devs: livehub_engine::input_device_names(),
             bcast_device: "BlackHole".to_string(),
-            bcast_ip: String::new(),
+            bcast_ip: saved_phone.1,
             bcast_status: String::new(),
             discovery: livehub_engine::Discovery::start().ok(),
+            remembered_phone: saved_phone.0,
             show_fx: false,
             show_broadcast: false,
             show_mix: false,
@@ -926,15 +932,37 @@ impl App {
     /// Source-agnostic — pick any input. Drop the handle (■ stop) to stop.
     fn broadcast_row(&mut self, ui: &mut egui::Ui) {
         let on = self.broadcaster.is_some();
-        // Auto-discovered reelcam phones (mDNS/Bonjour) — click to fill the target.
+        // Auto-discovered reelcam phones (mDNS/Bonjour) — click to target.
         let peers = self.discovery.as_ref().map(|d| d.peers()).unwrap_or_default();
+        // Auto-re-target the remembered phone when it reappears (IP may have changed).
+        if !on {
+            if let Some(remembered) = &self.remembered_phone {
+                if let Some(p) = peers.iter().find(|p| &p.name == remembered) {
+                    let addr = p.addr.to_string();
+                    if self.bcast_ip != addr {
+                        self.bcast_ip = addr;
+                    }
+                }
+            }
+        }
         if peers.is_empty() {
-            ui.weak("📱 searching for reelcam on the network…");
+            if let Some(name) = &self.remembered_phone {
+                ui.weak(format!("📱 waiting for ‘{name}’ to come online…"));
+            } else {
+                ui.weak("📱 searching for reelcam on the network…");
+            }
         } else {
             ui.label("📱 found phones (click to target):");
             for p in &peers {
-                if ui.button(format!("{}  ·  {}", p.name, p.addr)).clicked() {
+                let remembered = self.remembered_phone.as_deref() == Some(p.name.as_str());
+                let star = if remembered { "⭐ " } else { "" };
+                if ui
+                    .button(format!("{star}{}  ·  {}", p.name, p.addr))
+                    .clicked()
+                {
                     self.bcast_ip = p.addr.to_string();
+                    self.remembered_phone = Some(p.name.clone());
+                    save_last_phone(&p.name, &self.bcast_ip);
                 }
             }
         }
@@ -973,6 +1001,16 @@ impl App {
                             Ok(b) => {
                                 self.broadcaster = Some(b);
                                 self.bcast_status = format!("streaming → {addr}");
+                                // Remember this target (name if a discovered peer matches).
+                                let name = peers
+                                    .iter()
+                                    .find(|p| p.addr == addr)
+                                    .map(|p| p.name.clone())
+                                    .or_else(|| self.remembered_phone.clone())
+                                    .unwrap_or_default();
+                                self.remembered_phone =
+                                    if name.is_empty() { None } else { Some(name.clone()) };
+                                save_last_phone(&name, &addr.to_string());
                             }
                             Err(e) => self.bcast_status = format!("error: {e}"),
                         },
@@ -1561,4 +1599,37 @@ fn draw_overview_lane(
         [Pos2::new(px, lane.top()), Pos2::new(px, lane.bottom())],
         Stroke::new(2.0, Color32::WHITE),
     );
+}
+
+// ── Remembered broadcast target ──────────────────────────────────────────────
+// Persist the last reelcam phone so it auto-re-targets on the next run. We store
+// the Bonjour *name* (stable) plus the last ip:port (a pre-fill before discovery
+// resolves). std-only, no extra deps.
+
+fn last_phone_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::Path::new(&home).join("Library/Application Support/livehub");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("last_phone.txt"))
+}
+
+/// Load `(name, ip:port)`. Missing/empty → `(None, "")`.
+fn load_last_phone() -> (Option<String>, String) {
+    let Some(p) = last_phone_path() else {
+        return (None, String::new());
+    };
+    let Ok(s) = std::fs::read_to_string(&p) else {
+        return (None, String::new());
+    };
+    // Format: "name\tip:port" (name may be empty).
+    let (name, addr) = s.trim().split_once('\t').unwrap_or(("", s.trim()));
+    let name = if name.is_empty() { None } else { Some(name.to_string()) };
+    (name, addr.to_string())
+}
+
+/// Remember `(name, ip:port)` for next launch. Best-effort; errors ignored.
+fn save_last_phone(name: &str, addr: &str) {
+    if let Some(p) = last_phone_path() {
+        let _ = std::fs::write(p, format!("{name}\t{addr}"));
+    }
 }
