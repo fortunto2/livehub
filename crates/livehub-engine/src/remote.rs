@@ -97,3 +97,92 @@ impl Drop for PreviewReceiver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Build one preview datagram: magic + seq + payload (matches the phone sender).
+    fn preview_packet(seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(8 + payload.len());
+        p.extend_from_slice(&PREVIEW_MAGIC.to_le_bytes());
+        p.extend_from_slice(&seq.to_le_bytes());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// Poll a condition up to `ms`, sleeping between tries. Returns true if it held.
+    fn wait_until(ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        cond()
+    }
+
+    #[test]
+    fn control_packet_wire_format() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let to = sock.local_addr().unwrap();
+
+        send_control(to, CMD_REC_TOGGLE, 54321).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), CTRL_MAGIC);
+        assert_eq!(buf[4], CMD_REC_TOGGLE);
+        assert_eq!(u16::from_le_bytes([buf[5], buf[6]]), 54321);
+    }
+
+    #[test]
+    fn preview_keeps_only_latest_frame() {
+        let rx = PreviewReceiver::start().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to: SocketAddr = format!("127.0.0.1:{}", rx.port()).parse().unwrap();
+
+        // Send three distinct frames; the receiver must end on the LAST one.
+        for (i, payload) in [b"AAAA".as_slice(), b"BBBB", b"CCCC"].iter().enumerate() {
+            sender.send_to(&preview_packet(i as u32, payload), to).unwrap();
+        }
+        assert!(wait_until(1000, || rx.frame_seq() >= 3), "frames not received");
+        assert_eq!(rx.latest_jpeg().as_deref(), Some(b"CCCC".as_slice()));
+    }
+
+    #[test]
+    fn preview_survives_burst() {
+        // Stability: 3000 frames back-to-back must not panic, must advance the seq,
+        // and must keep only the last (bounded memory — no accumulation).
+        let rx = PreviewReceiver::start().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to: SocketAddr = format!("127.0.0.1:{}", rx.port()).parse().unwrap();
+
+        let last = 2999u32;
+        let payload = vec![0xABu8; 4000]; // ~4 KB "JPEG"
+        for i in 0..=last {
+            // Best-effort; the OS UDP buffer may drop some — that's the point.
+            let _ = sender.send_to(&preview_packet(i, &payload), to);
+        }
+        assert!(wait_until(2000, || rx.frame_seq() > 0), "no frames received");
+        // Whatever arrived, the stored frame is exactly one payload-sized buffer.
+        assert_eq!(rx.latest_jpeg().map(|v| v.len()), Some(4000));
+    }
+
+    #[test]
+    fn non_preview_magic_is_ignored() {
+        let rx = PreviewReceiver::start().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to: SocketAddr = format!("127.0.0.1:{}", rx.port()).parse().unwrap();
+        // Audio-magic packet → must NOT be treated as a preview frame.
+        let mut junk = 0x5243_0100u32.to_le_bytes().to_vec();
+        junk.extend_from_slice(&[0u8; 64]);
+        sender.send_to(&junk, to).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rx.frame_seq(), 0);
+        assert!(rx.latest_jpeg().is_none());
+    }
+}

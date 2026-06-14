@@ -18,8 +18,8 @@ use livehub_engine::{
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 300.0])
-            .with_min_inner_size([320.0, 240.0])
+            .with_inner_size([760.0, 560.0])
+            .with_min_inner_size([520.0, 360.0])
             .with_always_on_top()
             .with_title("beam"),
         renderer: eframe::Renderer::Wgpu,
@@ -191,129 +191,155 @@ impl eframe::App for Beam {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("📡 beam");
-            ui.label("Stream an input device to your phone (reelcam).");
-            ui.separator();
+        // ── LEFT: controls ────────────────────────────────────────────────────
+        egui::SidePanel::left("controls")
+            .resizable(false)
+            .exact_width(340.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.heading("📡 beam");
+                    ui.separator();
 
-            // ── Discovered phones ──────────────────────────────────────────
-            if self.peers.is_empty() {
-                ui.weak("📱 searching for reelcam on the network…");
-            } else {
-                ui.label("📱 found phones (click to target):");
-                for p in &self.peers {
-                    let star = if self.remembered.as_deref() == Some(p.name.as_str()) {
-                        "⭐ "
+                    // Discovered phones.
+                    if self.peers.is_empty() {
+                        ui.weak("📱 searching for reelcam…");
                     } else {
-                        ""
-                    };
+                        ui.label("📱 phones (click to target):");
+                        for p in &self.peers {
+                            let star = if self.remembered.as_deref() == Some(p.name.as_str()) {
+                                "⭐ "
+                            } else {
+                                ""
+                            };
+                            if ui.button(format!("{star}{} · {}", p.name, p.addr)).clicked() {
+                                self.phone_addr = p.addr.to_string();
+                                self.remembered = Some(p.name.clone());
+                                save_last_phone(&p.name, &self.phone_addr);
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
+
+                    // Source device.
+                    ui.label("Source device:");
+                    egui::ComboBox::from_id_salt("dev")
+                        .selected_text(if self.sel_device.is_empty() {
+                            "— pick —"
+                        } else {
+                            self.sel_device.as_str()
+                        })
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            for d in &self.devices {
+                                ui.selectable_value(&mut self.sel_device, d.clone(), d.as_str());
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.label("Phone (ip:port):");
+                    ui.add_enabled(
+                        !self.on(),
+                        egui::TextEdit::singleline(&mut self.phone_addr)
+                            .hint_text("172.20.10.2:9000")
+                            .desired_width(300.0),
+                    );
+
+                    // BIG broadcast button.
+                    ui.add_space(8.0);
+                    let bl = if self.on() { "■ stop broadcast" } else { "▶ broadcast" };
                     if ui
-                        .button(format!("{star}{} · {}", p.name, p.addr))
+                        .add(egui::Button::new(egui::RichText::new(bl).size(16.0))
+                            .min_size(egui::vec2(300.0, 42.0)))
                         .clicked()
                     {
-                        self.phone_addr = p.addr.to_string();
-                        self.remembered = Some(p.name.clone());
-                        save_last_phone(&p.name, &self.phone_addr);
+                        if self.on() {
+                            self.broadcaster = None;
+                            self.status = "stopped".into();
+                        } else {
+                            self.start();
+                        }
                     }
-                }
-            }
-            ui.add_space(6.0);
+                    let level = self.broadcaster.as_ref().map(|b| b.level()).unwrap_or(0.0);
+                    ui.add_space(4.0);
+                    level_bar(ui, level, self.on());
+                    if !self.status.is_empty() {
+                        ui.weak(&self.status);
+                    }
+                    if self.on() && level < 0.001 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 170, 70),
+                            "⚠ source silent — is signal reaching it?",
+                        );
+                    }
 
-            // ── Source device ──────────────────────────────────────────────
-            ui.label("Source device:");
-            egui::ComboBox::from_id_salt("dev")
-                .selected_text(if self.sel_device.is_empty() {
-                    "— pick —"
-                } else {
-                    self.sel_device.as_str()
-                })
-                .width(320.0)
-                .show_ui(ui, |ui| {
-                    for d in &self.devices {
-                        ui.selectable_value(&mut self.sel_device, d.clone(), d.as_str());
+                    // BIG phone-remote buttons.
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("📲 Phone remote:");
+                    let has_phone = self.phone().is_some();
+                    let rec = if self.remote_rec { "■ stop rec" } else { "⏺ record" };
+                    let rec_btn = egui::Button::new(egui::RichText::new(rec).size(16.0))
+                        .min_size(egui::vec2(300.0, 42.0))
+                        .fill(if self.remote_rec {
+                            egui::Color32::from_rgb(120, 40, 40)
+                        } else {
+                            egui::Color32::from_gray(52)
+                        });
+                    if ui.add_enabled(has_phone, rec_btn).clicked() {
+                        self.toggle_remote_record();
                     }
+                    ui.add_space(4.0);
+                    let prev = if self.preview.is_some() { "👁 preview: ON" } else { "👁 preview: off" };
+                    if ui
+                        .add_enabled(
+                            has_phone,
+                            egui::Button::new(prev).min_size(egui::vec2(300.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.toggle_preview();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.weak(
+                        "🔊 System/YouTube audio needs BlackHole: Audio MIDI Setup → a \
+                         Multi-Output (BlackHole + speakers) → set as output, then pick \
+                         BlackHole above.",
+                    );
                 });
-
-            ui.add_space(4.0);
-            ui.label("Phone (ip:port):");
-            ui.add_enabled(
-                !self.on(),
-                egui::TextEdit::singleline(&mut self.phone_addr)
-                    .hint_text("172.20.10.2:9000")
-                    .desired_width(320.0),
-            );
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let label = if self.on() { "■ stop" } else { "▶ broadcast" };
-                if ui.add_sized([110.0, 28.0], egui::Button::new(label)).clicked() {
-                    if self.on() {
-                        self.broadcaster = None;
-                        self.status = "stopped".into();
-                    } else {
-                        self.start();
-                    }
-                }
-                if self.on() {
-                    ui.colored_label(egui::Color32::from_rgb(90, 210, 120), "● live");
-                }
             });
-            if !self.status.is_empty() {
-                ui.add_space(2.0);
-                ui.weak(&self.status);
-            }
 
-            // ── Level meter (of the captured source, while broadcasting) ──────
-            ui.add_space(6.0);
-            let level = self.broadcaster.as_ref().map(|b| b.level()).unwrap_or(0.0);
-            level_bar(ui, level, self.on());
-            if self.on() && level < 0.001 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 170, 70),
-                    "⚠ source is silent — is signal reaching this device?",
-                );
-            }
-
-            // ── Phone remote + camera preview ─────────────────────────────────
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label("📲 Phone remote:");
-            ui.horizontal(|ui| {
-                let has_phone = self.phone().is_some();
-                let rec = if self.remote_rec { "■ stop rec" } else { "⏺ record" };
-                if ui.add_enabled(has_phone, egui::Button::new(rec)).clicked() {
-                    self.toggle_remote_record();
-                }
-                let prev = if self.preview.is_some() { "👁 preview ✓" } else { "👁 preview" };
-                if ui.add_enabled(has_phone, egui::Button::new(prev)).clicked() {
-                    self.toggle_preview();
-                }
-                if self.remote_rec {
-                    ui.colored_label(egui::Color32::from_rgb(235, 90, 90), "● REC");
-                }
-            });
-            if self.preview.is_some() {
+        // ── RIGHT: big camera preview ─────────────────────────────────────────
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::from_gray(14)))
+            .show(ctx, |ui| {
                 if let Some(tex) = &self.preview_tex {
-                    let avail = ui.available_width().min(240.0);
+                    let avail = ui.available_size();
                     let sz = tex.size_vec2();
-                    let aspect = if sz.x > 0.0 { sz.y / sz.x } else { 16.0 / 9.0 };
-                    let disp = egui::vec2(avail, avail * aspect);
-                    ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                    let aspect = if sz.y > 0.0 { sz.x / sz.y } else { 9.0 / 16.0 };
+                    let mut w = avail.x;
+                    let mut h = w / aspect;
+                    if h > avail.y {
+                        h = avail.y;
+                        w = h * aspect;
+                    }
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(w, h),
+                        )));
+                    });
+                } else if self.preview.is_some() {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("waiting for preview frames…");
+                    });
                 } else {
-                    ui.weak("waiting for preview frames…");
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("👁 preview off — turn it on at the left");
+                    });
                 }
-            }
-
-            // ── System-audio hint ─────────────────────────────────────────────
-            ui.add_space(6.0);
-            ui.separator();
-            ui.weak(
-                "🔊 System/YouTube audio isn't captured directly (macOS has no system-\
-                 capture device). Route it through BlackHole: Audio MIDI Setup → a Multi-\
-                 Output (BlackHole + speakers) → set as output, then pick BlackHole above.",
-            );
-        });
+            });
 
         // Idle-friendly heartbeat. Faster while showing the live preview so frames
         // flow (~6 fps); otherwise 2 fps just to refresh the phone list + meter.
