@@ -62,6 +62,18 @@ enum Cmd {
         #[arg(long, default_value = "Universal Audio")]
         device: String,
     },
+    /// Capture an input device and UDP-stream it to a phone (reelcam live mode).
+    /// Point `--device` at a loopback (BlackHole carrying REAPER / livehub /
+    /// system audio) or a hardware input. `--to` is the phone's ip:port — over
+    /// the iPhone's Personal Hotspot in the field, no internet needed.
+    Broadcast {
+        /// Input device name substring (e.g. "BlackHole").
+        #[arg(long, default_value = "BlackHole")]
+        device: String,
+        /// Phone address `ip:port` (e.g. 172.20.10.2:9000).
+        #[arg(long)]
+        to: String,
+    },
     /// Load a file and play the deck mixed with the live mic. Ctrl-C to stop.
     Play {
         /// Audio file to play on the deck.
@@ -162,6 +174,12 @@ fn main() -> Result<()> {
             livehub_engine::run_passthrough(&device, mic_ch, master_l, master_r)
         }
         Some(Cmd::Sweep { device }) => livehub_engine::run_sweep(&device),
+        Some(Cmd::Broadcast { device, to }) => {
+            let addr: std::net::SocketAddr = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
+            livehub_engine::run_broadcast(&device, addr)
+        }
         Some(Cmd::Play { file, device, looped }) => play(&device, &file, looped),
         Some(Cmd::Selftest { file }) => selftest(&file),
         Some(Cmd::SelftestPace { file }) => {

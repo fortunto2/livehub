@@ -8,6 +8,7 @@
 //! work from those — never re-load mid-block.
 
 mod audio;
+mod broadcast;
 mod clap_fx;
 mod decoder;
 mod device;
@@ -17,6 +18,7 @@ mod loops;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
+pub use broadcast::run_broadcast;
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;
 pub use device::list_devices;
