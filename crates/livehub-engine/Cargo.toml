@@ -18,3 +18,4 @@ rusty_link = { workspace = true }
 clack-host = { workspace = true }
 clack-extensions = { workspace = true }
 clack-common = { workspace = true }
+mdns-sd = "0.20.0"

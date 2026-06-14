@@ -223,6 +223,8 @@ struct App {
     bcast_device: String,
     bcast_ip: String,
     bcast_status: String,
+    /// mDNS/Bonjour discovery of reelcam phones — auto-fills the broadcast target.
+    discovery: Option<livehub_engine::Discovery>,
     /// Floating tool-window toggles (opened from the top toolbar). Real windows —
     /// movable, and combos/sliders inside them work (a menu dropdown ate them).
     show_fx: bool,
@@ -288,6 +290,7 @@ impl App {
             bcast_device: "BlackHole".to_string(),
             bcast_ip: String::new(),
             bcast_status: String::new(),
+            discovery: livehub_engine::Discovery::start().ok(),
             show_fx: false,
             show_broadcast: false,
             show_mix: false,
@@ -923,6 +926,19 @@ impl App {
     /// Source-agnostic — pick any input. Drop the handle (■ stop) to stop.
     fn broadcast_row(&mut self, ui: &mut egui::Ui) {
         let on = self.broadcaster.is_some();
+        // Auto-discovered reelcam phones (mDNS/Bonjour) — click to fill the target.
+        let peers = self.discovery.as_ref().map(|d| d.peers()).unwrap_or_default();
+        if peers.is_empty() {
+            ui.weak("📱 searching for reelcam on the network…");
+        } else {
+            ui.label("📱 found phones (click to target):");
+            for p in &peers {
+                if ui.button(format!("{}  ·  {}", p.name, p.addr)).clicked() {
+                    self.bcast_ip = p.addr.to_string();
+                }
+            }
+        }
+        ui.separator();
         ui.label("Source device (captured → sent to the phone):");
         egui::ComboBox::from_id_salt("bcast_dev")
             .selected_text(if self.bcast_device.is_empty() {
