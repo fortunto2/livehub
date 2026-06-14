@@ -1500,6 +1500,24 @@ impl eframe::App for App {
           }); // ScrollArea
         });
 
+        // Are we ANIMATING? Repaint at 60 fps only when something actually moves:
+        // a deck playing (moving playhead + waveform cursor + paced video/visualizer),
+        // a track loading (progress), a LIVE camera (updates off-transport), or an
+        // active broadcast (level/status). Otherwise an idle console must NOT peg a
+        // core — drop to a slow heartbeat (egui still repaints instantly on input).
+        let live_camera = self
+            .video
+            .iter()
+            .any(|v| matches!(v, Some(VideoSource::Camera(_))));
+        let animating = self.engine.is_playing(0)
+            || self.engine.is_playing(1)
+            || self.engine.is_loading(0)
+            || self.engine.is_loading(1)
+            || self.broadcaster.is_some()
+            || self.engine.is_master_broadcasting()
+            || self.output_open
+            || live_camera;
+
         // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live
         // composite (no controls). Fullscreen it on a second display and let OBS
         // grab it via Window/Display Capture. The texture upload above already
@@ -1531,7 +1549,12 @@ impl eframe::App for App {
                     if vctx.input(|i| i.viewport().close_requested()) {
                         close_requested = true;
                     }
-                    vctx.request_repaint();
+                    // Only spin the output viewport when the picture is moving.
+                    if animating {
+                        vctx.request_repaint();
+                    } else {
+                        vctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
                 },
             );
             // Closed via the window's own button → don't reopen next frame.
@@ -1540,8 +1563,14 @@ impl eframe::App for App {
             }
         }
 
-        // Keep the playhead/meters live.
-        ctx.request_repaint();
+        // Keep the playhead/meters live WHILE playing; idle → a gentle 200 ms
+        // heartbeat so the discovered-phones list, clocks and meters still refresh
+        // without busy-looping a core. (egui repaints instantly on any input.)
+        if animating {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
     }
 }
 
