@@ -107,6 +107,9 @@ pub fn run(
     let engine = Engine::new(device, OutputRouting::default(), aux)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 900.0]),
+        // Metal (wgpu) instead of OpenGL (glow): Apple deprecated GL — wgpu→Metal
+        // is more power-efficient and smoother on Apple Silicon.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(

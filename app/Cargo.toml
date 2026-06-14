@@ -18,3 +18,7 @@ egui = { workspace = true }
 rfd = { workspace = true }
 ffmpeg-next = "8"
 image = "0.25"
+# eframe's `wgpu` feature pulls wgpu with default-features off, which omits the
+# native backend → "no wgpu backend enabled" panic at startup. Enable Metal here
+# (feature unification turns it on across the graph).
+wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }
