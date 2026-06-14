@@ -19,32 +19,12 @@ echo "› assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/livehub"
-
-cat > "$APP/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleName</key><string>livehub</string>
-	<key>CFBundleDisplayName</key><string>livehub</string>
-	<key>CFBundleIdentifier</key><string>co.superduperai.livehub</string>
-	<key>CFBundleExecutable</key><string>livehub</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.1</string>
-	<key>CFBundleVersion</key><string>1</string>
-	<key>LSMinimumSystemVersion</key><string>12.0</string>
-	<key>NSHighResolutionCapable</key><true/>
-	<key>LSApplicationCategoryType</key><string>public.app-category.music</string>
-	<key>NSMicrophoneUsageDescription</key><string>livehub mixes a live microphone into the master.</string>
-	<key>NSCameraUsageDescription</key><string>livehub can use a camera as a video-deck source.</string>
-	<key>NSLocalNetworkUsageDescription</key><string>livehub broadcasts audio to your phone (reelcam) over the local network.</string>
-</dict>
-</plist>
-PLIST
+[ -f "$ROOT/assets/livehub.icns" ] && cp "$ROOT/assets/livehub.icns" "$APP/Contents/Resources/livehub.icns"
+cp "$ROOT/assets/Info.plist" "$APP/Contents/Info.plist"
 
 # Ad-hoc sign so macOS grants a STABLE identity → mic/camera/network permissions
 # persist across launches instead of re-prompting.
 echo "› codesign (ad-hoc)"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "✓ installed: $APP   (launch from Spotlight: ‘livehub’)"

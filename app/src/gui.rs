@@ -1257,6 +1257,15 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+          // Scroll via wheel/scrollbar only (NOT drag), so the add_sized sliders
+          // still drag freely AND the ⚙ Advanced drawer below the decks is reachable.
+          egui::ScrollArea::vertical()
+              .auto_shrink([false, false])
+              .scroll_source(egui::scroll_area::ScrollSource {
+                  drag: false,
+                  ..egui::scroll_area::ScrollSource::ALL
+              })
+              .show(ui, |ui| {
             // 1. TOP BAR: title · BPM match lamp · canvas · Output · Snap.
             self.top_bar(ui);
             ui.add_space(6.0);
@@ -1335,6 +1344,7 @@ impl eframe::App for App {
                         self.engine.underruns()
                     ));
                 });
+          }); // ScrollArea
         });
 
         // Standalone OUTPUT WINDOW: a separate OS window showing ONLY the live

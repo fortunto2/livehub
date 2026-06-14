@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key><string>livehub</string>
+	<key>CFBundleDisplayName</key><string>livehub</string>
+	<key>CFBundleIdentifier</key><string>co.superduperai.livehub</string>
+	<key>CFBundleExecutable</key><string>livehub</string>
+	<key>CFBundleIconFile</key><string>livehub</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>0.1</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSMinimumSystemVersion</key><string>12.0</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>LSApplicationCategoryType</key><string>public.app-category.music</string>
+	<key>NSMicrophoneUsageDescription</key><string>livehub mixes a live microphone into the master.</string>
+	<key>NSCameraUsageDescription</key><string>livehub can use a camera as a video-deck source.</string>
+	<key>NSLocalNetworkUsageDescription</key><string>livehub broadcasts audio to your phone (reelcam) over the local network.</string>
+</dict>
+</plist>
