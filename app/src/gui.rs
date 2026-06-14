@@ -31,6 +31,12 @@ const MIXER_W: f32 = 150.0;
 /// internal tap), as opposed to capturing a hardware/loopback input device.
 pub(crate) const MASTER_SRC: &str = "🎚 livehub master (this mix)";
 
+/// Repaint cadence. While something animates we cap to ~30 fps (33 ms) — smooth
+/// enough for the waveform cursor + video, but ~half the GPU/WindowServer cost of
+/// running at the 60 Hz display rate. Idle → a lazy 200 ms heartbeat.
+const ACTIVE_REPAINT_MS: u64 = 33;
+const IDLE_REPAINT_MS: u64 = 200;
+
 /// Output-stage (canvas) aspect, switchable live. `Auto` follows the loaded
 /// clips' orientation; the fixed modes force a shape regardless of the sources.
 #[derive(Clone, Copy, PartialEq)]
@@ -1549,12 +1555,10 @@ impl eframe::App for App {
                     if vctx.input(|i| i.viewport().close_requested()) {
                         close_requested = true;
                     }
-                    // Only spin the output viewport when the picture is moving.
-                    if animating {
-                        vctx.request_repaint();
-                    } else {
-                        vctx.request_repaint_after(std::time::Duration::from_millis(200));
-                    }
+                    // Only spin the output viewport when the picture is moving,
+                    // capped to ~30 fps.
+                    let ms = if animating { ACTIVE_REPAINT_MS } else { IDLE_REPAINT_MS };
+                    vctx.request_repaint_after(std::time::Duration::from_millis(ms));
                 },
             );
             // Closed via the window's own button → don't reopen next frame.
@@ -1563,14 +1567,11 @@ impl eframe::App for App {
             }
         }
 
-        // Keep the playhead/meters live WHILE playing; idle → a gentle 200 ms
+        // Playhead/meters live at ~30 fps WHILE playing; idle → a gentle 200 ms
         // heartbeat so the discovered-phones list, clocks and meters still refresh
         // without busy-looping a core. (egui repaints instantly on any input.)
-        if animating {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
-        }
+        let ms = if animating { ACTIVE_REPAINT_MS } else { IDLE_REPAINT_MS };
+        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
     }
 }
 
