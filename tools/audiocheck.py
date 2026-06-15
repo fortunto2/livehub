@@ -29,15 +29,19 @@ def run(cmd: list[str]) -> bytes:
     return p.stdout
 
 
-def duration(path: str, stream: str) -> float:
+def probe(path: str, stream: str, field: str) -> float:
     out = run([
         "ffprobe", "-v", "0", "-select_streams", stream,
-        "-show_entries", "stream=duration", "-of", "csv=p=0", path,
+        "-show_entries", f"stream={field}", "-of", "csv=p=0", path,
     ]).decode().strip().splitlines()
     try:
         return float(out[0])
     except (IndexError, ValueError):
         return 0.0
+
+
+def duration(path: str, stream: str) -> float:
+    return probe(path, stream, "duration")
 
 
 def audio_mono(path: str) -> np.ndarray:
@@ -67,6 +71,7 @@ def main() -> None:
 
     vdur = duration(path, "v:0")
     adur = duration(path, "a:0")
+    astart = probe(path, "a:0", "start_time") # where the AUDIO track begins in the video
     audio = audio_mono(path)
     if audio.size == 0:
         sys.exit("no audio track")
@@ -84,10 +89,11 @@ def main() -> None:
     if not onsets:
         sys.exit("  no beeps detected — wrong tone, or audio didn't record")
 
-    # Start-gap: the first beep is the 250ms START marker at tone t=0, so its time
-    # IS where the recorded audio begins.
-    print(f"  ▶ audio starts at {onsets[0]*1000:6.0f} ms"
-          + ("   ⚠ LATE START (silent gap)" if onsets[0] > 0.3 else "   ✓"))
+    # The REAL start-gap: where the audio TRACK begins in the video timeline
+    # (ffprobe start_time). The first-beep time is only its position WITHIN the
+    # track, which can hide a leading silent gap.
+    print(f"  ▶ audio track starts at {astart*1000:6.0f} ms into the video"
+          + ("   ⚠ SILENT START GAP" if astart > 0.1 else "   ✓"))
 
     # Spacing: beeps should be ~1.0s apart. Gaps ≈ 2s ⇒ a dropped second.
     print("  intervals between beeps (want ~1.000s):")
@@ -104,13 +110,16 @@ def main() -> None:
 
     print("  ─────────────────────────────────────────────")
     issues = []
-    if onsets[0] > 0.3:
-        issues.append(f"audio starts {onsets[0]*1000:.0f}ms late")
+    if astart > 0.1:
+        issues.append(f"audio track starts {astart*1000:.0f}ms late (silent start)")
     if drops:
         issues.append(f"{drops} dropped beep(s)")
-    if abs(adur - vdur) > 0.2:
-        issues.append(f"audio/video length differ by {abs(adur-vdur):.2f}s")
-    print("  " + ("✓ clean: audio from the first sample, beeps 1s apart, lengths match"
+    # An END gap (audio shorter, but starting at 0) is usually a test artifact (the
+    # tone began after / ended before the recording) — flag it, but it's benign for
+    # a continuous live stream.
+    if astart < 0.1 and adur + 0.15 < vdur:
+        issues.append(f"audio ends {vdur-adur:.2f}s before video (likely test pre/post-roll)")
+    print("  " + ("✓ clean: audio aligned to the first frame, beeps 1s apart"
                   if not issues else "⚠ " + "; ".join(issues)))
 
 
