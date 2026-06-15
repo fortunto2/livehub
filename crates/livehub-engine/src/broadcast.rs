@@ -45,6 +45,10 @@ pub struct Broadcaster {
     /// full-scale CLICK. Paired with a screen flash, the offset between them in the
     /// phone's recording = the audio-vs-video latency. See `pulse()`.
     pulse: Arc<AtomicBool>,
+    /// A/V-sync test: when set, the captured device audio is muted (broadcast
+    /// SILENCE) so the only transient is the click — otherwise music/voice on the
+    /// source pollutes click detection and ruins the measurement.
+    silent: Arc<AtomicBool>,
 }
 
 impl Broadcaster {
@@ -65,6 +69,8 @@ impl Broadcaster {
         let cb_level = level.clone();
         let pulse = Arc::new(AtomicBool::new(false));
         let cb_pulse = pulse.clone();
+        let silent = Arc::new(AtomicBool::new(false));
+        let cb_silent = silent.clone();
         let stream_cfg: cpal::StreamConfig = cfg.clone().into();
         let stream = dev
             .build_input_stream(
@@ -73,6 +79,7 @@ impl Broadcaster {
                     let frames = data.len() / in_ch;
                     // A/V-sync click: replace this block with a sharp impulse.
                     let click = cb_pulse.swap(false, Ordering::Relaxed);
+                    let mute = cb_silent.load(Ordering::Relaxed);
                     let mut peak = 0.0f32;
                     for f in 0..frames {
                         let base = f * in_ch;
@@ -84,6 +91,8 @@ impl Broadcaster {
                                 0.0
                             };
                             (v, v)
+                        } else if mute {
+                            (0.0, 0.0) // sync-test silence: only the click survives
                         } else {
                             let l = data.get(base).copied().unwrap_or(0.0);
                             let r = if in_ch >= 2 {
@@ -116,7 +125,7 @@ impl Broadcaster {
                 .spawn(move || sender_loop(cons, sr, to, running))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, level, pulse })
+        Ok(Broadcaster { _stream: stream, running, sender, level, pulse, silent })
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -124,6 +133,12 @@ impl Broadcaster {
     /// recording is the audio-vs-video latency.
     pub fn pulse(&self) {
         self.pulse.store(true, Ordering::Relaxed);
+    }
+
+    /// Mute the captured device audio (broadcast silence) so a sync-test click is
+    /// the only transient — keep music/voice off the measurement.
+    pub fn set_silent(&self, on: bool) {
+        self.silent.store(on, Ordering::Relaxed);
     }
 
     /// Smoothed 0..1 capture level for a UI meter.

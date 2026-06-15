@@ -339,9 +339,14 @@ impl eframe::App for Beam {
                         .clicked()
                     {
                         self.sync_test = !self.sync_test;
+                        // Mute the device audio during the test so only the click is
+                        // heard — music/voice would pollute click detection.
+                        if let Some(b) = &self.broadcaster {
+                            b.set_silent(self.sync_test);
+                        }
                     }
                     if self.sync_test {
-                        ui.weak("film THIS window + record audio, then: avsync.py clip.mov");
+                        ui.weak("muted except the click · film THIS window · then avsync.py");
                     }
 
                     ui.add_space(8.0);
