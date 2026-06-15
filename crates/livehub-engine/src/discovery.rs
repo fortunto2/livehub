@@ -74,4 +74,15 @@ impl Discovery {
     pub fn peers(&self) -> Vec<Peer> {
         self.peers.lock().map(|g| g.clone()).unwrap_or_default()
     }
+
+    /// Re-query the network from scratch (fresh daemon + browse). Use when the phone
+    /// dropped off the list (app backgrounded / network blip) and hasn't re-appeared.
+    /// Replaces this `Discovery` in place; the old daemon is dropped (stops).
+    pub fn refresh(&mut self) {
+        if let Ok(fresh) = Discovery::start() {
+            *self = fresh;
+        } else {
+            self.peers.lock().map(|mut g| g.clear()).ok();
+        }
+    }
 }

@@ -1037,7 +1037,7 @@ impl App {
                                 self.engine.start_master_broadcast(addr);
                                 Ok(())
                             } else {
-                                livehub_engine::Broadcaster::start(&self.bcast_device, addr)
+                                livehub_engine::Broadcaster::start(&self.bcast_device, addr, 48_000)
                                     .map(|b| self.broadcaster = Some(b))
                                     .map_err(|e| e.to_string())
                             };

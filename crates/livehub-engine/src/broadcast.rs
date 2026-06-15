@@ -22,7 +22,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::device::{best_input_config, pick_input};
+use crate::device::{best_input_config, best_input_config_at, pick_input};
 
 /// 128 stereo frames per packet (~2.7 ms @ 48 kHz). Header(18) + 128*2*4 = 1042
 /// bytes — under the 1500-byte Ethernet/WiFi MTU, so no IP fragmentation.
@@ -37,6 +37,8 @@ pub struct Broadcaster {
     _stream: cpal::Stream, // input capture; kept alive so capture continues
     running: Arc<AtomicBool>,
     sender: Option<std::thread::JoinHandle<()>>,
+    sr: u32, // the ACTUAL capture rate (device-chosen) — what the phone receives
+
     /// Smoothed 0..1 capture peak (fast attack / slow release) for a UI meter —
     /// lets you SEE that the source is actually carrying signal (e.g. confirm
     /// system audio is reaching BlackHole before you blame the network).
@@ -54,9 +56,17 @@ pub struct Broadcaster {
 impl Broadcaster {
     /// Start capturing `device_hint`'s input and streaming it to `to`. Mono inputs
     /// are duplicated to stereo; multichannel inputs take channels 0–1.
-    pub fn start(device_hint: &str, to: SocketAddr) -> Result<Broadcaster> {
+    /// `sample_rate` of 0 = AUTO: use the device's own rate (preferring 48 kHz). A
+    /// nonzero value asks the device to run at that rate (CoreAudio resamples or we
+    /// fall back to the device max if it can't). The phone follows whatever actually
+    /// flows (it's in the packet header), so AUTO is the clean default.
+    pub fn start(device_hint: &str, to: SocketAddr, sample_rate: u32) -> Result<Broadcaster> {
         let dev = pick_input(device_hint)?;
-        let cfg = best_input_config(&dev)?;
+        let cfg = if sample_rate == 0 {
+            best_input_config(&dev)?
+        } else {
+            best_input_config_at(&dev, sample_rate)?
+        };
         let in_ch = (cfg.channels() as usize).max(1);
         let sr = cfg.sample_rate().0;
         eprintln!(
@@ -125,7 +135,7 @@ impl Broadcaster {
                 .spawn(move || sender_loop(cons, sr, to, running))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, level, pulse, silent })
+        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent })
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -142,6 +152,11 @@ impl Broadcaster {
     }
 
     /// Smoothed 0..1 capture level for a UI meter.
+    /// The actual capture/broadcast sample rate (device-chosen) — what the phone gets.
+    pub fn sample_rate(&self) -> u32 {
+        self.sr
+    }
+
     pub fn level(&self) -> f32 {
         self.level.load(Ordering::Relaxed)
     }
@@ -297,7 +312,7 @@ mod tests {
 
 /// CLI: capture `device_hint` → UDP to `to` until the process is killed (Ctrl-C).
 pub fn run_broadcast(device_hint: &str, to: SocketAddr) -> Result<()> {
-    let _b = Broadcaster::start(device_hint, to)?;
+    let _b = Broadcaster::start(device_hint, to, 48_000)?;
     eprintln!("broadcast: streaming (Ctrl-C to stop)");
     loop {
         std::thread::sleep(std::time::Duration::from_millis(250));

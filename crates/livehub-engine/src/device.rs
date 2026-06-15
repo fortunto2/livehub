@@ -102,25 +102,35 @@ pub(crate) fn best_output_config(dev: &cpal::Device) -> Result<cpal::SupportedSt
     best_config(
         dev.supported_output_configs()
             .context("supported_output_configs")?,
+        PREFERRED_SR,
     )
 }
 
 /// The F32 input config with the most channels, at 48 kHz when available.
 pub(crate) fn best_input_config(dev: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
+    best_input_config_at(dev, PREFERRED_SR)
+}
+
+/// Like [`best_input_config`] but targeting a specific sample rate (falls back to
+/// the device's max if it can't run at `target_sr`).
+pub(crate) fn best_input_config_at(
+    dev: &cpal::Device,
+    target_sr: u32,
+) -> Result<cpal::SupportedStreamConfig> {
     best_config(
-        dev.supported_input_configs()
-            .context("supported_input_configs")?,
+        dev.supported_input_configs().context("supported_input_configs")?,
+        target_sr,
     )
 }
 
 /// Preferred device rate — the whole rig (Arrow, video, monitoring) runs at 48k.
 const PREFERRED_SR: u32 = 48_000;
 
-fn best_config<I>(ranges: I) -> Result<cpal::SupportedStreamConfig>
+fn best_config<I>(ranges: I, target_sr: u32) -> Result<cpal::SupportedStreamConfig>
 where
     I: Iterator<Item = cpal::SupportedStreamConfigRange>,
 {
-    let target = cpal::SampleRate(PREFERRED_SR);
+    let target = cpal::SampleRate(target_sr);
     let f32: Vec<cpal::SupportedStreamConfigRange> = ranges
         .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
         .collect();

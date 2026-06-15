@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 pub const CTRL_MAGIC: u32 = 0x5243_0200;
 pub const PREVIEW_MAGIC: u32 = 0x5243_0300;
+pub const CAMPARAM_MAGIC: u32 = 0x5243_0400;
 
 // Commands (Mac → phone).
 pub const CMD_REC_START: u8 = 1;
@@ -21,6 +22,26 @@ pub const CMD_REC_STOP: u8 = 2;
 pub const CMD_REC_TOGGLE: u8 = 3;
 pub const CMD_PREVIEW_START: u8 = 4;
 pub const CMD_PREVIEW_STOP: u8 = 5;
+
+// Camera params (Mac → phone). Value is normalized 0..1 (toggles: 0.0 / 1.0); the
+// phone maps it onto its own device ranges (ISO/shutter/EV/lens), so beam needs no
+// knowledge of the camera's limits.
+pub const CAM_MANUAL_EXP: u8 = 0;
+pub const CAM_ISO: u8 = 1;
+pub const CAM_SHUTTER: u8 = 2;
+pub const CAM_EV: u8 = 3;
+pub const CAM_MANUAL_FOCUS: u8 = 4;
+pub const CAM_LENS: u8 = 5;
+pub const CAM_AE_LOCK: u8 = 6;
+
+/// Build the 9-byte camera-param packet: `magic · param u8 · value f32` (LE).
+fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
+    let mut buf = [0u8; 9];
+    buf[0..4].copy_from_slice(&CAMPARAM_MAGIC.to_le_bytes());
+    buf[4] = param;
+    buf[5..9].copy_from_slice(&value.to_le_bytes());
+    buf
+}
 
 /// Build the 7-byte control packet.
 fn control_packet(cmd: u8, preview_port: u16) -> [u8; 7] {
@@ -54,6 +75,12 @@ impl RemoteControl {
 
     pub fn send(&self, to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
         self.sock.send_to(&control_packet(cmd, preview_port), to)?;
+        Ok(())
+    }
+
+    /// Send a camera parameter (normalized 0..1) to the phone over the same socket.
+    pub fn send_cam(&self, to: SocketAddr, param: u8, value: f32) -> std::io::Result<()> {
+        self.sock.send_to(&camparam_packet(param, value), to)?;
         Ok(())
     }
 }
@@ -161,6 +188,22 @@ mod tests {
         assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), CTRL_MAGIC);
         assert_eq!(buf[4], CMD_REC_TOGGLE);
         assert_eq!(u16::from_le_bytes([buf[5], buf[6]]), 54321);
+    }
+
+    #[test]
+    fn camparam_packet_wire_format() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let to = sock.local_addr().unwrap();
+
+        let rc = RemoteControl::new().unwrap();
+        rc.send_cam(to, CAM_ISO, 0.5).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 9);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), CAMPARAM_MAGIC);
+        assert_eq!(buf[4], CAM_ISO);
+        assert_eq!(f32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]), 0.5);
     }
 
     #[test]

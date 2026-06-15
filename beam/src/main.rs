@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use livehub_engine::{
     input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, Peer,
-    PreviewReceiver, RemoteControl, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_ISO, CAM_LENS, CAM_MANUAL_EXP,
+    CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -36,6 +37,7 @@ fn main() -> anyhow::Result<()> {
 struct Beam {
     devices: Vec<String>,
     sel_device: String,
+    sample_rate: u32, // broadcast rate; the phone follows it from the packet header
     discovery: Option<Discovery>,
     peers: Vec<Peer>,
     phone_addr: String, // ip:port text (editable + filled by discovery)
@@ -53,6 +55,21 @@ struct Beam {
     sync_test: bool,
     last_pulse: Instant,
     flash: bool,
+    // Remote camera controls (beam → phone) + a luma histogram of the preview.
+    // Values are normalized 0..1; the phone maps them onto its device ranges.
+    histogram: [u32; 64],
+    // Preview frame-rate meter (diagnoses latency: high fps + visible lag = WiFi
+    // bufferbloat; low fps = uplink/encode bound).
+    preview_frames: u32,
+    preview_fps: f32,
+    preview_fps_at: Instant,
+    cam_manual_exp: bool,
+    cam_iso: f32,
+    cam_shutter: f32,
+    cam_ev: f32, // 0.5 = 0 EV
+    cam_manual_focus: bool,
+    cam_lens: f32,
+    cam_ae_lock: bool,
 }
 
 impl Beam {
@@ -69,6 +86,7 @@ impl Beam {
         Beam {
             devices,
             sel_device,
+            sample_rate: 0, // 0 = Auto (use the source device's own rate)
             discovery: Discovery::start().ok(),
             peers: Vec::new(),
             phone_addr: saved_addr,
@@ -84,6 +102,25 @@ impl Beam {
             sync_test: false,
             last_pulse: Instant::now(),
             flash: false,
+            histogram: [0; 64],
+            preview_frames: 0,
+            preview_fps: 0.0,
+            preview_fps_at: Instant::now(),
+            cam_manual_exp: false,
+            cam_iso: 0.3,
+            cam_shutter: 0.3,
+            cam_ev: 0.5,
+            cam_manual_focus: false,
+            cam_lens: 0.5,
+            cam_ae_lock: false,
+        }
+    }
+
+    /// Send a camera parameter (normalized 0..1) to the phone over the persistent
+    /// control socket (same stable port as the other commands).
+    fn cam(&self, param: u8, value: f32) {
+        if let (Some(addr), Some(c)) = (self.phone(), self.control.as_ref()) {
+            let _ = c.send_cam(addr, param, value);
         }
     }
 
@@ -138,9 +175,27 @@ impl Beam {
             return;
         }
         self.preview_seq = seq;
+        // FPS meter: count displayed frames, recompute once a second.
+        self.preview_frames += 1;
+        let dt = self.preview_fps_at.elapsed().as_secs_f32();
+        if dt >= 1.0 {
+            self.preview_fps = self.preview_frames as f32 / dt;
+            self.preview_frames = 0;
+            self.preview_fps_at = Instant::now();
+        }
         let Some(jpeg) = rx.latest_jpeg() else { return };
         if let Ok(img) = image::load_from_memory(&jpeg) {
             let rgba = img.to_rgba8();
+            // Luma histogram (BT.709) of the frame, subsampled every 4th pixel.
+            let mut hist = [0u32; 64];
+            let raw = rgba.as_raw();
+            let mut i = 0;
+            while i + 2 < raw.len() {
+                let luma = (raw[i] as u32 * 54 + raw[i + 1] as u32 * 183 + raw[i + 2] as u32 * 19) >> 8;
+                hist[(luma.min(255) as usize) >> 2] += 1;
+                i += 16; // RGBA = 4 bytes → every 4th pixel
+            }
+            self.histogram = hist;
             let (w, h) = (rgba.width() as usize, rgba.height() as usize);
             let color = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
             // Replace in place — the old texture is freed, so memory stays bounded.
@@ -154,9 +209,71 @@ impl Beam {
         }
     }
 
+    /// Camera remote + histogram, drawn under the preview. Each control change sends
+    /// a normalized cam-param to the phone; the phone maps it to its device ranges.
+    fn camera_controls_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format!("📊 {:.0} fps", self.preview_fps));
+            self.draw_histogram(ui);
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.cam_ae_lock, "🔒 AE").clicked() {
+                self.cam_ae_lock = !self.cam_ae_lock;
+                self.cam(CAM_AE_LOCK, if self.cam_ae_lock { 1.0 } else { 0.0 });
+            }
+            if ui.checkbox(&mut self.cam_manual_exp, "Manual exp").changed() {
+                self.cam(CAM_MANUAL_EXP, if self.cam_manual_exp { 1.0 } else { 0.0 });
+            }
+            if ui.checkbox(&mut self.cam_manual_focus, "Manual focus").changed() {
+                self.cam(CAM_MANUAL_FOCUS, if self.cam_manual_focus { 1.0 } else { 0.0 });
+            }
+        });
+        if self.cam_manual_exp {
+            if ui.add(egui::Slider::new(&mut self.cam_iso, 0.0..=1.0).text("ISO")).changed() {
+                self.cam(CAM_ISO, self.cam_iso);
+            }
+            if ui.add(egui::Slider::new(&mut self.cam_shutter, 0.0..=1.0).text("Shutter")).changed() {
+                self.cam(CAM_SHUTTER, self.cam_shutter);
+            }
+        } else {
+            let ev = egui::Slider::new(&mut self.cam_ev, 0.0..=1.0)
+                .text("EV")
+                .custom_formatter(|v, _| format!("{:+.1}", v * 6.0 - 3.0));
+            if ui.add(ev).changed() {
+                self.cam(CAM_EV, self.cam_ev);
+            }
+        }
+        if self.cam_manual_focus
+            && ui.add(egui::Slider::new(&mut self.cam_lens, 0.0..=1.0).text("Focus")).changed()
+        {
+            self.cam(CAM_LENS, self.cam_lens);
+        }
+    }
+
+    /// Draw the luma histogram (64 bins) as a small bar strip.
+    fn draw_histogram(&self, ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 42.0), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 2.0, egui::Color32::from_gray(28));
+        let max = self.histogram.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let bw = rect.width() / self.histogram.len() as f32;
+        for (i, &c) in self.histogram.iter().enumerate() {
+            let bh = (c as f32 / max) * rect.height();
+            let x = rect.left() + i as f32 * bw;
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x, rect.bottom() - bh),
+                    egui::pos2(x + bw.max(1.0), rect.bottom()),
+                ),
+                0.0,
+                egui::Color32::from_gray(210),
+            );
+        }
+    }
+
     fn start(&mut self) {
         match self.phone_addr.parse::<SocketAddr>() {
-            Ok(addr) => match Broadcaster::start(&self.sel_device, addr) {
+            Ok(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
                 Ok(b) => {
                     self.broadcaster = Some(b);
                     self.status = format!("streaming → {addr}");
@@ -209,15 +326,17 @@ impl eframe::App for Beam {
 
         // A/V-sync pulse: every ~1.5 s flash the window AND click the audio at the
         // same instant. Film this window + record the audio, then analyse the clip:
-        // the flash↔click offset is the audio-vs-video latency.
-        self.flash = false;
+        // the flash↔click offset is the audio-vs-video latency. The flash is HELD
+        // ~80 ms (a few frames) so a 30 fps camera reliably catches a fully-white
+        // frame — the click still fires once, on the rising edge (what we measure).
         if self.sync_test && self.on() && self.last_pulse.elapsed() >= Duration::from_millis(1500) {
             self.last_pulse = Instant::now();
-            self.flash = true;
             if let Some(b) = &self.broadcaster {
                 b.pulse();
             }
         }
+        self.flash = self.sync_test && self.on()
+            && self.last_pulse.elapsed() < Duration::from_millis(80);
 
         // ── LEFT: controls ────────────────────────────────────────────────────
         egui::SidePanel::left("controls")
@@ -264,7 +383,42 @@ impl eframe::App for Beam {
                             }
                         });
                     ui.add_space(4.0);
-                    ui.label("Phone (ip:port):");
+                    // Broadcast sample rate. The phone follows it automatically (it's
+                    // in every audio packet header), so this is the single source of
+                    // truth — no separate setting on the phone. Locked while streaming.
+                    ui.label("Sample rate (phone follows):");
+                    let rate_label =
+                        |sr: u32| if sr == 0 { "Auto (device)".to_owned() } else { format!("{sr} Hz") };
+                    ui.add_enabled_ui(!self.on(), |ui| {
+                        egui::ComboBox::from_id_salt("sr")
+                            .selected_text(rate_label(self.sample_rate))
+                            .width(300.0)
+                            .show_ui(ui, |ui| {
+                                for sr in [0u32, 44_100, 48_000, 88_200, 96_000] {
+                                    ui.selectable_value(&mut self.sample_rate, sr, rate_label(sr));
+                                }
+                            });
+                    });
+                    if let Some(b) = &self.broadcaster {
+                        ui.weak(format!("⏵ streaming at {} Hz · ⏹ stop to change", b.sample_rate()));
+                    } else {
+                        ui.weak("Auto = whatever the source device runs at");
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Phone (ip:port):");
+                        if ui
+                            .add_enabled(!self.on(), egui::Button::new("🔄 refresh"))
+                            .on_hover_text("re-scan the network for the phone (if it dropped off)")
+                            .clicked()
+                        {
+                            if let Some(d) = &mut self.discovery {
+                                d.refresh();
+                            }
+                            self.peers.clear(); // auto-refill updates phone_addr when it reappears
+                            self.status = "re-scanning…".into();
+                        }
+                    });
                     ui.add_enabled(
                         !self.on(),
                         egui::TextEdit::singleline(&mut self.phone_addr)
@@ -363,6 +517,17 @@ impl eframe::App for Beam {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_gray(14)))
             .show(ctx, |ui| {
+                // Camera remote + histogram pinned under the preview (when previewing).
+                if self.preview.is_some() {
+                    egui::TopBottomPanel::bottom("cam_ctrls")
+                        .resizable(false)
+                        .frame(
+                            egui::Frame::default()
+                                .fill(egui::Color32::from_gray(20))
+                                .inner_margin(8.0),
+                        )
+                        .show_inside(ui, |ui| self.camera_controls_ui(ui));
+                }
                 if let Some(tex) = &self.preview_tex {
                     let avail = ui.available_size();
                     let sz = tex.size_vec2();
@@ -402,7 +567,7 @@ impl eframe::App for Beam {
         let ms = if self.sync_test {
             16
         } else if self.preview.is_some() {
-            160
+            66 // ~15 fps preview refresh → show the freshest frame sooner
         } else {
             500
         };
