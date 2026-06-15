@@ -74,6 +74,17 @@ enum Cmd {
         #[arg(long)]
         to: String,
     },
+    /// Remote-record the phone for `--secs` (toggle on, wait, toggle off) WITHOUT
+    /// broadcasting — for the beam 🎬 sync-test A/V measurement (beam is the audio +
+    /// flash source; this just controls the recording).
+    Rec {
+        /// Phone address `ip:port`.
+        #[arg(long)]
+        to: String,
+        /// Recording length (seconds).
+        #[arg(long, default_value_t = 12)]
+        secs: u64,
+    },
     /// Probe whether the phone HANDLES remote commands: ask it for a camera
     /// preview frame and see if one comes back. ✓ = latest build (remote-record
     /// works); ✗ = old build or unreachable. Gives the Mac side visibility.
@@ -207,6 +218,18 @@ fn main() -> Result<()> {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
             livehub_engine::run_broadcast_test(addr, secs, record)
+        }
+        Some(Cmd::Rec { to, secs }) => {
+            let addr: std::net::SocketAddr = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
+            let ctl = livehub_engine::RemoteControl::new()?;
+            ctl.send(addr, livehub_engine::CMD_REC_TOGGLE, 0)?;
+            eprintln!("rec: recording {secs}s on {addr}…");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            ctl.send(addr, livehub_engine::CMD_REC_TOGGLE, 0)?;
+            eprintln!("rec: stopped");
+            Ok(())
         }
         Some(Cmd::ProbePhone { to }) => {
             let addr: std::net::SocketAddr = to
