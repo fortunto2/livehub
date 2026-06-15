@@ -17,7 +17,7 @@ pub const PORT: u16 = 9010;
 pub struct ClipMeta {
     pub name: String,
     pub size: u64,
-    pub date: i64,
+    pub date: String,
     pub duration: f32,
 }
 
@@ -109,6 +109,20 @@ impl Gallery {
         });
     }
 
+    /// Delete a clip from the PHONE (Photos). iOS prompts the user to confirm on the
+    /// device, so the request blocks until they tap — then the clip drops off /list.
+    pub fn delete_remote(&mut self, host: String, name: String) {
+        let tx = self.tx.clone();
+        self.busy = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Status(format!("deleting {name} — confirm on the phone…")));
+            match http_get(&host, PORT, &format!("/delete/{name}?token={TOKEN}")) {
+                Ok(_) => let_status(&tx, format!("✓ deleted {name} on phone (hit refresh)")),
+                Err(e) => let_status(&tx, format!("✗ {e}")),
+            }
+        });
+    }
+
     /// Drain background results into the UI state (call each frame).
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
@@ -182,7 +196,7 @@ fn parse_list(body: &[u8]) -> Vec<ClipMeta> {
             Some(ClipMeta {
                 name: f[0].to_string(),
                 size: f[1].parse().unwrap_or(0),
-                date: f[2].parse().unwrap_or(0),
+                date: f[2].to_string(),
                 duration: f[3].parse().unwrap_or(0.0),
             })
         })

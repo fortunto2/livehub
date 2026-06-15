@@ -186,26 +186,35 @@ impl Beam {
                             );
                             ui.painter().rect_filled(r, 4.0, egui::Color32::from_gray(30));
                         }
-                        ui.label(format!(
-                            "{:.0}s · {} MB",
-                            clip.duration,
-                            clip.size / 1_000_000
-                        ));
-                        // Dedup by filename: if it's already in the download folder,
-                        // play it locally instead of re-downloading.
+                        let mb = clip.size / 1_000_000;
+                        let size = if mb > 0 { format!(" · {mb} MB") } else { String::new() };
+                        ui.label(format!("{} · {:.0}s{}", clip.date, clip.duration, size));
+                        // Dedup by filename: if it's already downloaded, play the local
+                        // copy instead of re-downloading.
                         let local = self.gallery.dir.join(&clip.name);
-                        if local.exists() {
-                            ui.horizontal(|ui| {
+                        let have = local.exists();
+                        ui.horizontal(|ui| {
+                            if have {
                                 if ui.button("▶ play").clicked() {
                                     gallery::open_path(&local);
                                 }
-                                ui.colored_label(egui::Color32::from_rgb(90, 200, 110), "✓ saved");
-                            });
-                        } else if ui.button("↓ download").clicked() {
-                            if let Some(h) = host.clone() {
-                                self.gallery.download(h, clip.name.clone());
+                                ui.colored_label(egui::Color32::from_rgb(90, 200, 110), "✓");
+                            } else if ui.button("↓ download").clicked() {
+                                if let Some(h) = host.clone() {
+                                    self.gallery.download(h, clip.name.clone());
+                                }
                             }
-                        }
+                        });
+                        ui.horizontal(|ui| {
+                            if have && ui.small_button("🗑 mac").clicked() {
+                                let _ = std::fs::remove_file(&local);
+                            }
+                            if ui.small_button("🗑 phone").clicked() {
+                                if let Some(h) = host.clone() {
+                                    self.gallery.delete_remote(h, clip.name.clone());
+                                }
+                            }
+                        });
                     });
                     if (i + 1) % 3 == 0 {
                         ui.end_row();
