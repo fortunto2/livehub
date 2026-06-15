@@ -123,6 +123,20 @@ impl Gallery {
         });
     }
 
+    /// Delete ALL clips from the phone (Photos) in one batch → a single confirmation
+    /// on the device. Quick way to free space after pulling everything.
+    pub fn delete_all_remote(&mut self, host: String) {
+        let tx = self.tx.clone();
+        self.busy = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Status("deleting ALL on phone — confirm on the device…".into()));
+            match http_get(&host, PORT, &format!("/deleteall?token={TOKEN}")) {
+                Ok(_) => let_status(&tx, "✓ phone cleared (hit refresh)".into()),
+                Err(e) => let_status(&tx, format!("✗ {e}")),
+            }
+        });
+    }
+
     /// Drain background results into the UI state (call each frame).
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {

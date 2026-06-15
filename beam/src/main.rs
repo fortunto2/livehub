@@ -162,12 +162,18 @@ impl Beam {
             if ui.small_button("📂 open").clicked() {
                 gallery::open_path(&self.gallery.dir);
             }
-            if ui.small_button("🗑 clear folder").clicked() {
-                // Wipe the local download folder on the Mac (not Photos / not the phone).
+            if ui.small_button("🗑 Mac folder").clicked() {
+                // Wipe the local download folder on the Mac.
                 if let Ok(entries) = std::fs::read_dir(&self.gallery.dir) {
                     for e in entries.flatten() {
                         let _ = std::fs::remove_file(e.path());
                     }
+                }
+            }
+            if ui.small_button("🗑 phone (all)").clicked() {
+                // Delete ALL clips from the phone's Photos — one confirmation on the device.
+                if let Some(h) = host.clone() {
+                    self.gallery.delete_all_remote(h);
                 }
             }
         });
