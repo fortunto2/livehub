@@ -288,3 +288,64 @@ pub fn run_broadcast(device_hint: &str, to: SocketAddr) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
+
+/// One sample of the diagnostic test tone: a 250 ms 1 kHz START MARKER at t=0, then
+/// an 80 ms 1 kHz beep at every second boundary, silence between. Lets an analyzer
+/// find where the recorded audio actually begins (start gap) and whether every
+/// second's beep is present + 1 s apart (dropouts / drift).
+fn test_sample(t: f64) -> f32 {
+    use std::f64::consts::TAU;
+    let into_second = t - t.floor();
+    let beep_len = if t < 1.0 { 0.25 } else { 0.08 };
+    if into_second < beep_len {
+        ((TAU * 1000.0 * t).sin() * 0.6) as f32
+    } else {
+        0.0
+    }
+}
+
+/// CLI/diagnostic: broadcast the marker test tone to `to` for `secs`, real-time
+/// paced, same wire format as a live stream. With `record`, remote-toggles the
+/// phone's recording around it (start before, stop after) so a whole take is
+/// captured hands-free for analysis.
+pub fn run_broadcast_test(to: SocketAddr, secs: u64, record: bool) -> Result<()> {
+    let ctl = if record { crate::remote::RemoteControl::new().ok() } else { None };
+    if let Some(c) = &ctl {
+        let _ = c.send(to, crate::remote::CMD_REC_TOGGLE, 0);
+        std::thread::sleep(std::time::Duration::from_millis(500)); // let recording spin up
+    }
+    eprintln!("broadcast-test: {secs}s marker tone → {to}{}", if record { " (recording)" } else { "" });
+
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let sr = 48_000u32;
+    let mut packet = vec![0u8; HEADER + FRAMES_PER_PACKET * 2 * 4];
+    packet[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    packet[12..16].copy_from_slice(&sr.to_le_bytes());
+    packet[16..18].copy_from_slice(&(FRAMES_PER_PACKET as u16).to_le_bytes());
+
+    let total = sr as usize * secs as usize;
+    let mut frame = 0usize;
+    let mut seq = 0u64;
+    let start = std::time::Instant::now();
+    while frame < total {
+        for i in 0..FRAMES_PER_PACKET {
+            let s = test_sample((frame + i) as f64 / sr as f64).to_le_bytes();
+            let off = HEADER + i * 8;
+            packet[off..off + 4].copy_from_slice(&s);
+            packet[off + 4..off + 8].copy_from_slice(&s);
+        }
+        packet[4..12].copy_from_slice(&seq.to_le_bytes());
+        let _ = sock.send_to(&packet, to);
+        seq += 1;
+        frame += FRAMES_PER_PACKET;
+        let target = start + std::time::Duration::from_secs_f64(frame as f64 / sr as f64);
+        if let Some(d) = target.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(d);
+        }
+    }
+    if let Some(c) = &ctl {
+        let _ = c.send(to, crate::remote::CMD_REC_TOGGLE, 0);
+        eprintln!("broadcast-test: stopped recording");
+    }
+    Ok(())
+}

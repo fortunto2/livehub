@@ -74,6 +74,20 @@ enum Cmd {
         #[arg(long)]
         to: String,
     },
+    /// Broadcast a DIAGNOSTIC marker tone (250ms start beep + 1 beep/sec) to the
+    /// phone for `--secs`, optionally remote-recording it. Analyze the resulting
+    /// clip with `tools/audiocheck.py` to find audio start-gaps / dropouts / drift.
+    BroadcastTest {
+        /// Phone address `ip:port`.
+        #[arg(long)]
+        to: String,
+        /// How long to broadcast (seconds).
+        #[arg(long, default_value_t = 12)]
+        secs: u64,
+        /// Remote-toggle the phone's recording around the broadcast.
+        #[arg(long)]
+        record: bool,
+    },
     /// Load a file and play the deck mixed with the live mic. Ctrl-C to stop.
     Play {
         /// Audio file to play on the deck.
@@ -179,6 +193,12 @@ fn main() -> Result<()> {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
             livehub_engine::run_broadcast(&device, addr)
+        }
+        Some(Cmd::BroadcastTest { to, secs, record }) => {
+            let addr: std::net::SocketAddr = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
+            livehub_engine::run_broadcast_test(addr, secs, record)
         }
         Some(Cmd::Play { file, device, looped }) => play(&device, &file, looped),
         Some(Cmd::Selftest { file }) => selftest(&file),

@@ -21,7 +21,7 @@ mod remote;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
-pub use broadcast::{run_broadcast, Broadcaster};
+pub use broadcast::{run_broadcast, run_broadcast_test, Broadcaster};
 pub use device::input_device_names;
 pub use discovery::{Discovery, Peer};
 pub use last_phone::{load_last_phone, save_last_phone};
