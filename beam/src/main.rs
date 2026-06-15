@@ -7,6 +7,8 @@
 //! those): pick Source + Phone (auto-discovered), hit ▶. Closing the window quits
 //! (and stops the stream); ⌘H tucks it away while it keeps broadcasting.
 
+mod gallery;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -75,6 +77,8 @@ struct Beam {
     // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
     level_monitor: Option<LevelMonitor>,
     monitored_device: String,
+    // Remote gallery: browse + pull the phone's recorded clips over WiFi.
+    gallery: gallery::Gallery,
 }
 
 impl Beam {
@@ -121,7 +125,71 @@ impl Beam {
             cam_front: false,
             level_monitor: None,
             monitored_device: String::new(),
+            gallery: gallery::Gallery::default(),
         }
+    }
+
+    /// The phone's IP (without the audio port) — the gallery's file server is on its
+    /// own port on the same host.
+    fn phone_ip(&self) -> Option<String> {
+        self.phone_addr.parse::<SocketAddr>().ok().map(|a| a.ip().to_string())
+    }
+
+    /// The remote-gallery window: refresh, thumbnail grid, per-clip download.
+    fn gallery_ui(&mut self, ui: &mut egui::Ui) {
+        let host = self.phone_ip();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(host.is_some(), egui::Button::new("🔄 refresh")).clicked() {
+                if let Some(h) = host.clone() {
+                    self.gallery.refresh(h);
+                }
+            }
+            if self.gallery.busy {
+                ui.spinner();
+            }
+            ui.label(self.gallery.status.clone());
+        });
+        ui.weak(format!("downloads → {}", self.gallery.dir.display()));
+        ui.separator();
+        let items = self.gallery.items.clone();
+        if items.is_empty() {
+            ui.weak("No clips — hit refresh (turn the gallery ON in Reelcam settings first).");
+            return;
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("clips").spacing(egui::vec2(10.0, 10.0)).show(ui, |ui| {
+                for (i, clip) in items.iter().enumerate() {
+                    ui.vertical(|ui| {
+                        let tid = self.gallery.thumbs.get(&clip.name).map(|t| t.id());
+                        if let Some(id) = tid {
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                id,
+                                egui::vec2(130.0, 130.0),
+                            )));
+                        } else {
+                            let (r, _) = ui.allocate_exact_size(
+                                egui::vec2(130.0, 130.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(r, 4.0, egui::Color32::from_gray(30));
+                        }
+                        ui.label(format!(
+                            "{:.0}s · {} MB",
+                            clip.duration,
+                            clip.size / 1_000_000
+                        ));
+                        if ui.button("↓ download").clicked() {
+                            if let Some(h) = host.clone() {
+                                self.gallery.download(h, clip.name.clone());
+                            }
+                        }
+                    });
+                    if (i + 1) % 3 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
     }
 
     /// Keep a pre-broadcast level meter running on the selected device while NOT
@@ -363,6 +431,8 @@ impl eframe::App for Beam {
 
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
+        // Drain remote-gallery background results (list / thumbs / downloads).
+        self.gallery.poll(ctx);
 
         // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
         // it keeps streaming; if we crash, it self-stops after the timeout.
@@ -538,6 +608,21 @@ impl eframe::App for Beam {
                         self.toggle_preview();
                     }
 
+                    // Remote gallery — browse + pull recorded clips over WiFi.
+                    ui.add_space(4.0);
+                    if ui
+                        .add_enabled(
+                            has_phone,
+                            egui::Button::new("📁 gallery").min_size(egui::vec2(300.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.gallery.open = true;
+                        if let Some(h) = self.phone_ip() {
+                            self.gallery.refresh(h);
+                        }
+                    }
+
                     // A/V-sync test pulse (needs broadcast running).
                     ui.add_space(4.0);
                     let st = if self.sync_test { "🎬 sync test: ON" } else { "🎬 sync test" };
@@ -611,6 +696,16 @@ impl eframe::App for Beam {
                 }
             });
 
+        // Remote-gallery window (floating).
+        if self.gallery.open {
+            let mut open = self.gallery.open;
+            egui::Window::new("📁 Gallery")
+                .default_size([520.0, 440.0])
+                .open(&mut open)
+                .show(ctx, |ui| self.gallery_ui(ui));
+            self.gallery.open = open;
+        }
+
         // Full-screen white flash for the A/V-sync test (drawn on top of all panels).
         if self.flash {
             let painter = ctx
@@ -626,6 +721,8 @@ impl eframe::App for Beam {
             66 // ~15 fps preview refresh → show the freshest frame sooner
         } else if self.on() || self.level_monitor.is_some() {
             100 // ~10 fps so the audio level meter moves (incl. pre-broadcast)
+        } else if self.gallery.open && self.gallery.busy {
+            100 // drain gallery downloads/thumbs + animate the spinner
         } else {
             500
         };
