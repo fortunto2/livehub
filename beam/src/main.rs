@@ -159,8 +159,16 @@ impl Beam {
         });
         ui.horizontal(|ui| {
             ui.weak(format!("downloads → {}", self.gallery.dir.display()));
-            if ui.small_button("📂 open folder").clicked() {
+            if ui.small_button("📂 open").clicked() {
                 gallery::open_path(&self.gallery.dir);
+            }
+            if ui.small_button("🗑 clear folder").clicked() {
+                // Wipe the local download folder on the Mac (not Photos / not the phone).
+                if let Ok(entries) = std::fs::read_dir(&self.gallery.dir) {
+                    for e in entries.flatten() {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
             }
         });
         ui.separator();
