@@ -74,6 +74,14 @@ enum Cmd {
         #[arg(long)]
         to: String,
     },
+    /// Probe whether the phone HANDLES remote commands: ask it for a camera
+    /// preview frame and see if one comes back. ✓ = latest build (remote-record
+    /// works); ✗ = old build or unreachable. Gives the Mac side visibility.
+    ProbePhone {
+        /// Phone address `ip:port`.
+        #[arg(long)]
+        to: String,
+    },
     /// Broadcast a DIAGNOSTIC marker tone (250ms start beep + 1 beep/sec) to the
     /// phone for `--secs`, optionally remote-recording it. Analyze the resulting
     /// clip with `tools/audiocheck.py` to find audio start-gaps / dropouts / drift.
@@ -199,6 +207,31 @@ fn main() -> Result<()> {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
             livehub_engine::run_broadcast_test(addr, secs, record)
+        }
+        Some(Cmd::ProbePhone { to }) => {
+            let addr: std::net::SocketAddr = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--to must be ip:port ({to}): {e}"))?;
+            let rx = livehub_engine::PreviewReceiver::start()?;
+            eprintln!("probe: asking the phone for a preview frame on port {}…", rx.port());
+            livehub_engine::send_control(addr, livehub_engine::CMD_PREVIEW_START, rx.port())?;
+            let mut got = false;
+            for _ in 0..50 {
+                if rx.frame_seq() > 0 {
+                    got = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = livehub_engine::send_control(addr, livehub_engine::CMD_PREVIEW_STOP, 0);
+            if got {
+                println!("✓ phone RESPONDS — preview frame received. Latest build; remote-record works.");
+            } else {
+                println!("✗ NO response in 5s — phone is on an OLD build (no remote handling) or unreachable.");
+                println!("  (If the audio counter on the phone DOES move during a broadcast, the receiver");
+                println!("   works but remote-control isn't in that build → record manually.)");
+            }
+            Ok(())
         }
         Some(Cmd::Play { file, device, looped }) => play(&device, &file, looped),
         Some(Cmd::Selftest { file }) => selftest(&file),
