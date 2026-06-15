@@ -33,6 +33,8 @@ pub const CAM_EV: u8 = 3;
 pub const CAM_MANUAL_FOCUS: u8 = 4;
 pub const CAM_LENS: u8 = 5;
 pub const CAM_AE_LOCK: u8 = 6;
+pub const CAM_LENS_SELECT: u8 = 7; // value 0=ultra-wide, 1=wide, 2=tele
+pub const CAM_FLIP: u8 = 8; // value 0=back, 1=front
 
 /// Build the 9-byte camera-param packet: `magic · param u8 · value f32` (LE).
 fn camparam_packet(param: u8, value: f32) -> [u8; 9] {

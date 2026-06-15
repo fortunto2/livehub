@@ -172,6 +172,47 @@ impl Drop for Broadcaster {
     }
 }
 
+/// A lightweight input-level meter — opens the device just to measure its peak (no
+/// UDP, no broadcast). Lets beam show the source level BEFORE you hit ▶ so you can
+/// confirm signal is reaching the device. Drop it before starting a `Broadcaster` on
+/// the same device (one capture stream at a time).
+pub struct LevelMonitor {
+    _stream: cpal::Stream,
+    level: Arc<AtomicF32>,
+}
+
+impl LevelMonitor {
+    pub fn start(device_hint: &str) -> Result<LevelMonitor> {
+        let dev = pick_input(device_hint)?;
+        let cfg = best_input_config(&dev)?;
+        let stream_cfg: cpal::StreamConfig = cfg.into();
+        let level = Arc::new(AtomicF32::new(0.0));
+        let cb_level = level.clone();
+        let stream = dev
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut peak = 0.0f32;
+                    for &s in data {
+                        peak = peak.max(s.abs());
+                    }
+                    let prev = cb_level.load(Ordering::Relaxed);
+                    let v = if peak > prev { peak } else { prev * 0.85 };
+                    cb_level.store(v.min(1.0), Ordering::Relaxed);
+                },
+                |_| {},
+                None,
+            )
+            .context("build_input_stream (level monitor)")?;
+        stream.play()?;
+        Ok(LevelMonitor { _stream: stream, level })
+    }
+
+    pub fn level(&self) -> f32 {
+        self.level.load(Ordering::Relaxed)
+    }
+}
+
 /// Drain `cons`, pack `FRAMES_PER_PACKET` stereo frames per UDP packet, and send to
 /// the address from `dest()` (read once per drain pass). `dest()` returning `None`
 /// ⇒ a gated sender that's currently off: samples are drained+discarded so the ring

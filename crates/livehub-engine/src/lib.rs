@@ -21,14 +21,14 @@ mod remote;
 mod track;
 
 pub use audio::{run_passthrough, run_sweep};
-pub use broadcast::{run_broadcast, run_broadcast_test, Broadcaster};
+pub use broadcast::{run_broadcast, run_broadcast_test, Broadcaster, LevelMonitor};
 pub use device::input_device_names;
 pub use discovery::{Discovery, Peer};
 pub use last_phone::{load_last_phone, save_last_phone};
 pub use remote::{
-    send_control, PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_ISO, CAM_LENS,
-    CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
-    CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE,
+    send_control, PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
+    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START,
+    CMD_PREVIEW_STOP, CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE,
 };
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;

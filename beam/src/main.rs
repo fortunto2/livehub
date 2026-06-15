@@ -11,9 +11,10 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, Peer,
-    PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_ISO, CAM_LENS, CAM_MANUAL_EXP,
-    CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor, Peer,
+    PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
+    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START,
+    CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -70,6 +71,10 @@ struct Beam {
     cam_manual_focus: bool,
     cam_lens: f32,
     cam_ae_lock: bool,
+    cam_front: bool, // tracked flip intent (the phone has no ack channel)
+    // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
+    level_monitor: Option<LevelMonitor>,
+    monitored_device: String,
 }
 
 impl Beam {
@@ -113,6 +118,28 @@ impl Beam {
             cam_manual_focus: false,
             cam_lens: 0.5,
             cam_ae_lock: false,
+            cam_front: false,
+            level_monitor: None,
+            monitored_device: String::new(),
+        }
+    }
+
+    /// Keep a pre-broadcast level meter running on the selected device while NOT
+    /// broadcasting (so you can confirm signal before ▶). Restart it if the device
+    /// changed; drop it while broadcasting (the broadcaster owns the device then).
+    fn update_level_monitor(&mut self) {
+        if self.on() {
+            self.level_monitor = None; // broadcaster provides the level
+            self.monitored_device.clear();
+            return;
+        }
+        if self.sel_device.is_empty() {
+            self.level_monitor = None;
+            return;
+        }
+        if self.level_monitor.is_none() || self.monitored_device != self.sel_device {
+            self.level_monitor = LevelMonitor::start(&self.sel_device).ok();
+            self.monitored_device = self.sel_device.clone();
         }
     }
 
@@ -216,6 +243,25 @@ impl Beam {
             ui.label(format!("📊 {:.0} fps", self.preview_fps));
             self.draw_histogram(ui);
         });
+        // Phone camera selection — switchable live (lens 0.5×/1×/tele + front/back).
+        ui.horizontal(|ui| {
+            ui.label("Cam:");
+            if ui.button("0.5×").clicked() {
+                self.cam(CAM_LENS_SELECT, 0.0);
+            }
+            if ui.button("1×").clicked() {
+                self.cam(CAM_LENS_SELECT, 1.0);
+            }
+            if ui.button("Tele").clicked() {
+                self.cam(CAM_LENS_SELECT, 2.0);
+            }
+            ui.separator();
+            let flip = if self.cam_front { "⟳ front" } else { "⟳ rear" };
+            if ui.button(flip).clicked() {
+                self.cam_front = !self.cam_front;
+                self.cam(CAM_FLIP, if self.cam_front { 1.0 } else { 0.0 });
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             if ui.selectable_label(self.cam_ae_lock, "🔒 AE").clicked() {
                 self.cam_ae_lock = !self.cam_ae_lock;
@@ -272,6 +318,7 @@ impl Beam {
     }
 
     fn start(&mut self) {
+        self.level_monitor = None; // release the device before the broadcaster opens it
         match self.phone_addr.parse::<SocketAddr>() {
             Ok(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
                 Ok(b) => {
@@ -310,6 +357,9 @@ impl eframe::App for Beam {
                 self.phone_addr = self.peers[0].addr.to_string();
             }
         }
+
+        // Keep the pre-broadcast level meter alive on the selected device.
+        self.update_level_monitor();
 
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
@@ -441,9 +491,15 @@ impl eframe::App for Beam {
                             self.start();
                         }
                     }
-                    let level = self.broadcaster.as_ref().map(|b| b.level()).unwrap_or(0.0);
+                    // Level: from the broadcaster while streaming, else the pre-stream
+                    // monitor — so the meter moves BEFORE you hit ▶.
+                    let level = if let Some(b) = &self.broadcaster {
+                        b.level()
+                    } else {
+                        self.level_monitor.as_ref().map(|m| m.level()).unwrap_or(0.0)
+                    };
                     ui.add_space(4.0);
-                    level_bar(ui, level, self.on());
+                    level_bar(ui, level, self.on() || self.level_monitor.is_some());
                     if !self.status.is_empty() {
                         ui.weak(&self.status);
                     }
@@ -568,6 +624,8 @@ impl eframe::App for Beam {
             16
         } else if self.preview.is_some() {
             66 // ~15 fps preview refresh → show the freshest frame sooner
+        } else if self.on() || self.level_monitor.is_some() {
+            100 // ~10 fps so the audio level meter moves (incl. pre-broadcast)
         } else {
             500
         };
