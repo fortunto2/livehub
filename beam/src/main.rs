@@ -157,7 +157,12 @@ impl Beam {
             }
             ui.label(self.gallery.status.clone());
         });
-        ui.weak(format!("downloads → {}", self.gallery.dir.display()));
+        ui.horizontal(|ui| {
+            ui.weak(format!("downloads → {}", self.gallery.dir.display()));
+            if ui.small_button("📂 open folder").clicked() {
+                gallery::open_path(&self.gallery.dir);
+            }
+        });
         ui.separator();
         let items = self.gallery.items.clone();
         if items.is_empty() {
@@ -186,7 +191,17 @@ impl Beam {
                             clip.duration,
                             clip.size / 1_000_000
                         ));
-                        if ui.button("↓ download").clicked() {
+                        // Dedup by filename: if it's already in the download folder,
+                        // play it locally instead of re-downloading.
+                        let local = self.gallery.dir.join(&clip.name);
+                        if local.exists() {
+                            ui.horizontal(|ui| {
+                                if ui.button("▶ play").clicked() {
+                                    gallery::open_path(&local);
+                                }
+                                ui.colored_label(egui::Color32::from_rgb(90, 200, 110), "✓ saved");
+                            });
+                        } else if ui.button("↓ download").clicked() {
                             if let Some(h) = host.clone() {
                                 self.gallery.download(h, clip.name.clone());
                             }

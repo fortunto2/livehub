@@ -97,7 +97,10 @@ impl Gallery {
                     std::fs::create_dir_all(&dir).ok();
                     let path = dir.join(&name);
                     match std::fs::write(&path, &bytes) {
-                        Ok(_) => let_status(&tx, format!("✓ saved → {}", path.display())),
+                        Ok(_) => {
+                            let_status(&tx, format!("✓ saved → {}", path.display()));
+                            open_path(&path); // auto-play once it's down
+                        }
                         Err(e) => let_status(&tx, format!("✗ write: {e}")),
                     }
                 }
@@ -137,6 +140,12 @@ impl Gallery {
 
 fn let_status(tx: &Sender<Msg>, s: String) {
     let _ = tx.send(Msg::Status(s));
+}
+
+/// Open a downloaded clip in the system player (QuickTime) — egui can't play video
+/// inline, and `open` gives full video + audio in its own window.
+pub fn open_path(path: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
 /// Minimal blocking HTTP GET. The server replies `Connection: close`, so read-to-end
