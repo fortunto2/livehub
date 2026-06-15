@@ -79,6 +79,13 @@ struct Beam {
     monitored_device: String,
     // Remote gallery: browse + pull the phone's recorded clips over WiFi.
     gallery: gallery::Gallery,
+    tab: Tab,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Preview,
+    Gallery,
 }
 
 impl Beam {
@@ -126,6 +133,7 @@ impl Beam {
             level_monitor: None,
             monitored_device: String::new(),
             gallery: gallery::Gallery::default(),
+            tab: Tab::Preview,
         }
     }
 
@@ -617,7 +625,7 @@ impl eframe::App for Beam {
                         )
                         .clicked()
                     {
-                        self.gallery.open = true;
+                        self.tab = Tab::Gallery;
                         if let Some(h) = self.phone_ip() {
                             self.gallery.refresh(h);
                         }
@@ -658,53 +666,58 @@ impl eframe::App for Beam {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_gray(14)))
             .show(ctx, |ui| {
-                // Camera remote + histogram pinned under the preview (when previewing).
-                if self.preview.is_some() {
-                    egui::TopBottomPanel::bottom("cam_ctrls")
-                        .resizable(false)
-                        .frame(
-                            egui::Frame::default()
-                                .fill(egui::Color32::from_gray(20))
-                                .inner_margin(8.0),
-                        )
-                        .show_inside(ui, |ui| self.camera_controls_ui(ui));
-                }
-                if let Some(tex) = &self.preview_tex {
-                    let avail = ui.available_size();
-                    let sz = tex.size_vec2();
-                    let aspect = if sz.y > 0.0 { sz.x / sz.y } else { 9.0 / 16.0 };
-                    let mut w = avail.x;
-                    let mut h = w / aspect;
-                    if h > avail.y {
-                        h = avail.y;
-                        w = h * aspect;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Preview, "👁 Preview");
+                    let g = ui.selectable_value(&mut self.tab, Tab::Gallery, "📁 Gallery");
+                    if g.clicked() && self.gallery.items.is_empty() {
+                        if let Some(h) = self.phone_ip() {
+                            self.gallery.refresh(h);
+                        }
                     }
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                            tex.id(),
-                            egui::vec2(w, h),
-                        )));
-                    });
-                } else if self.preview.is_some() {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("waiting for preview frames…");
-                    });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("👁 preview off — turn it on at the left");
-                    });
+                });
+                ui.separator();
+                match self.tab {
+                    Tab::Gallery => self.gallery_ui(ui),
+                    Tab::Preview => {
+                        // Camera remote + histogram pinned under the preview.
+                        if self.preview.is_some() {
+                            egui::TopBottomPanel::bottom("cam_ctrls")
+                                .resizable(false)
+                                .frame(
+                                    egui::Frame::default()
+                                        .fill(egui::Color32::from_gray(20))
+                                        .inner_margin(8.0),
+                                )
+                                .show_inside(ui, |ui| self.camera_controls_ui(ui));
+                        }
+                        if let Some(tex) = &self.preview_tex {
+                            let avail = ui.available_size();
+                            let sz = tex.size_vec2();
+                            let aspect = if sz.y > 0.0 { sz.x / sz.y } else { 9.0 / 16.0 };
+                            let mut w = avail.x;
+                            let mut h = w / aspect;
+                            if h > avail.y {
+                                h = avail.y;
+                                w = h * aspect;
+                            }
+                            ui.centered_and_justified(|ui| {
+                                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    egui::vec2(w, h),
+                                )));
+                            });
+                        } else if self.preview.is_some() {
+                            ui.centered_and_justified(|ui| {
+                                ui.weak("waiting for preview frames…");
+                            });
+                        } else {
+                            ui.centered_and_justified(|ui| {
+                                ui.weak("👁 preview off — turn it on at the left");
+                            });
+                        }
+                    }
                 }
             });
-
-        // Remote-gallery window (floating).
-        if self.gallery.open {
-            let mut open = self.gallery.open;
-            egui::Window::new("📁 Gallery")
-                .default_size([520.0, 440.0])
-                .open(&mut open)
-                .show(ctx, |ui| self.gallery_ui(ui));
-            self.gallery.open = open;
-        }
 
         // Full-screen white flash for the A/V-sync test (drawn on top of all panels).
         if self.flash {
