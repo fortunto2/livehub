@@ -8,7 +8,7 @@ use std::sync::mpsc::Receiver;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use livehub_core::OutputRouting;
-use livehub_engine::{Engine, LinkHub, ParamInfo, TrackBuf};
+use livehub_engine::{load_last_phone, save_last_phone, Engine, LinkHub, ParamInfo, TrackBuf};
 
 use crate::video::{CameraDeck, ImageStill, VideoDeck, VideoSource, Visualizer};
 
@@ -1678,35 +1678,3 @@ fn draw_overview_lane(
     );
 }
 
-// ── Remembered broadcast target ──────────────────────────────────────────────
-// Persist the last reelcam phone so it auto-re-targets on the next run. We store
-// the Bonjour *name* (stable) plus the last ip:port (a pre-fill before discovery
-// resolves). std-only, no extra deps.
-
-fn last_phone_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let dir = std::path::Path::new(&home).join("Library/Application Support/livehub");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("last_phone.txt"))
-}
-
-/// Load `(name, ip:port)`. Missing/empty → `(None, "")`.
-fn load_last_phone() -> (Option<String>, String) {
-    let Some(p) = last_phone_path() else {
-        return (None, String::new());
-    };
-    let Ok(s) = std::fs::read_to_string(&p) else {
-        return (None, String::new());
-    };
-    // Format: "name\tip:port" (name may be empty).
-    let (name, addr) = s.trim().split_once('\t').unwrap_or(("", s.trim()));
-    let name = if name.is_empty() { None } else { Some(name.to_string()) };
-    (name, addr.to_string())
-}
-
-/// Remember `(name, ip:port)` for next launch. Best-effort; errors ignored.
-fn save_last_phone(name: &str, addr: &str) {
-    if let Some(p) = last_phone_path() {
-        let _ = std::fs::write(p, format!("{name}\t{addr}"));
-    }
-}

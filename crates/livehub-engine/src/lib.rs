@@ -14,6 +14,7 @@ mod decoder;
 mod device;
 mod discovery;
 mod engine;
+mod last_phone;
 mod link;
 mod loops;
 mod remote;
@@ -23,6 +24,7 @@ pub use audio::{run_passthrough, run_sweep};
 pub use broadcast::{run_broadcast, Broadcaster};
 pub use device::input_device_names;
 pub use discovery::{Discovery, Peer};
+pub use last_phone::{load_last_phone, save_last_phone};
 pub use remote::{
     send_control, PreviewReceiver, RemoteControl, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
     CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE,

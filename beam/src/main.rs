@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, Broadcaster, Discovery, Peer, PreviewReceiver, RemoteControl,
-    CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, Peer,
+    PreviewReceiver, RemoteControl, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -71,7 +71,7 @@ impl Beam {
             sel_device,
             discovery: Discovery::start().ok(),
             peers: Vec::new(),
-            phone_addr: saved_addr.unwrap_or_default(),
+            phone_addr: saved_addr,
             remembered,
             broadcaster: None,
             status: String::new(),
@@ -442,26 +442,3 @@ fn level_bar(ui: &mut egui::Ui, level: f32, active: bool) {
     }
 }
 
-// ── Remembered phone ─────────────────────────────────────────────────────────
-
-fn last_phone_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let dir = std::path::Path::new(&home).join("Library/Application Support/beam");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("last_phone.txt"))
-}
-
-fn load_last_phone() -> (Option<String>, Option<String>) {
-    let Some(p) = last_phone_path() else { return (None, None) };
-    let Ok(s) = std::fs::read_to_string(&p) else { return (None, None) };
-    let (name, addr) = s.trim().split_once('\t').unwrap_or(("", s.trim()));
-    let name = if name.is_empty() { None } else { Some(name.to_string()) };
-    let addr = if addr.is_empty() { None } else { Some(addr.to_string()) };
-    (name, addr)
-}
-
-fn save_last_phone(name: &str, addr: &str) {
-    if let Some(p) = last_phone_path() {
-        let _ = std::fs::write(p, format!("{name}\t{addr}"));
-    }
-}

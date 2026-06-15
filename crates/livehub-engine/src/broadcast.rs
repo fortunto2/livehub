@@ -142,8 +142,17 @@ impl Drop for Broadcaster {
     }
 }
 
-/// Drain the ring, pack `FRAMES_PER_PACKET` stereo frames per UDP packet, send.
-fn sender_loop(mut cons: rtrb::Consumer<f32>, sr: u32, to: SocketAddr, running: Arc<AtomicBool>) {
+/// Drain `cons`, pack `FRAMES_PER_PACKET` stereo frames per UDP packet, and send to
+/// the address from `dest()` (read once per drain pass). `dest()` returning `None`
+/// ⇒ a gated sender that's currently off: samples are drained+discarded so the ring
+/// can't overflow. Runs until `alive` goes false. The SINGLE place the audio wire
+/// header is written — both the fixed and gated senders below funnel through here.
+fn pump(
+    mut cons: rtrb::Consumer<f32>,
+    sr: u32,
+    alive: Arc<AtomicBool>,
+    mut dest: impl FnMut() -> Option<SocketAddr>,
+) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
@@ -158,16 +167,21 @@ fn sender_loop(mut cons: rtrb::Consumer<f32>, sr: u32, to: SocketAddr, running: 
 
     let mut seq: u64 = 0;
     let mut filled = 0usize;
-    while running.load(Ordering::Relaxed) {
+    while alive.load(Ordering::Relaxed) {
+        let to = dest();
         let mut got_any = false;
         while let Ok(s) = cons.pop() {
             got_any = true;
+            let Some(addr) = to else {
+                filled = 0; // gated off → drop so the ring can't overflow
+                continue;
+            };
             let off = HEADER + filled * 4;
             packet[off..off + 4].copy_from_slice(&s.to_le_bytes());
             filled += 1;
             if filled == FRAMES_PER_PACKET * 2 {
                 packet[4..12].copy_from_slice(&seq.to_le_bytes());
-                let _ = sock.send_to(&packet, to);
+                let _ = sock.send_to(&packet, addr);
                 seq = seq.wrapping_add(1);
                 filled = 0;
             }
@@ -178,61 +192,91 @@ fn sender_loop(mut cons: rtrb::Consumer<f32>, sr: u32, to: SocketAddr, running: 
     }
 }
 
-/// Persistent, GATED sender for the engine's INTERNAL master tap (livehub's own
-/// mix → phone, no loopback device). Unlike `sender_loop` (one fixed target,
-/// lives with a `Broadcaster`), this runs for the engine's whole lifetime and is
-/// toggled live by `on` + `target`: when off it just drains+discards the ring so
-/// it never backs up. Same wire format. Exits when `alive` goes false.
+/// Fixed-target sender (a `Broadcaster`'s capture → one phone).
+fn sender_loop(cons: rtrb::Consumer<f32>, sr: u32, to: SocketAddr, running: Arc<AtomicBool>) {
+    pump(cons, sr, running, move || Some(to));
+}
+
+/// Persistent, GATED sender for the engine's INTERNAL master tap (livehub's own mix
+/// → phone, no loopback device). Lives for the engine's whole lifetime; toggled live
+/// by `on` + `target` (off ⇒ drains+discards). Exits when `alive` goes false.
 pub(crate) fn master_sender_loop(
-    mut cons: rtrb::Consumer<f32>,
+    cons: rtrb::Consumer<f32>,
     sr: u32,
     target: Arc<Mutex<Option<SocketAddr>>>,
     on: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 ) {
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("master bcast: bind failed: {e}");
-            return;
-        }
-    };
-    let mut packet = vec![0u8; HEADER + FRAMES_PER_PACKET * 2 * 4];
-    packet[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    packet[12..16].copy_from_slice(&sr.to_le_bytes());
-    packet[16..18].copy_from_slice(&(FRAMES_PER_PACKET as u16).to_le_bytes());
-
-    let mut seq: u64 = 0;
-    let mut filled = 0usize;
-    while alive.load(Ordering::Relaxed) {
-        // Read the destination once per drain pass; `None` ⇒ off ⇒ discard.
-        let dest = if on.load(Ordering::Relaxed) {
+    pump(cons, sr, alive, move || {
+        if on.load(Ordering::Relaxed) {
             target.lock().ok().and_then(|g| *g)
         } else {
             None
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pump_emits_one_well_formed_audio_packet() {
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let to = recv.local_addr().unwrap();
+
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(FRAMES_PER_PACKET * 2 + 16);
+        for i in 0..(FRAMES_PER_PACKET * 2) {
+            let _ = prod.push(i as f32 / 1000.0); // a known ramp
+        }
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let sr = 48_000u32;
+        let handle = {
+            let alive = alive.clone();
+            std::thread::spawn(move || pump(cons, sr, alive, move || Some(to)))
         };
-        let mut got_any = false;
-        while let Ok(s) = cons.pop() {
-            got_any = true;
-            if dest.is_none() {
-                filled = 0; // off: drop samples so the ring can't overflow
-                continue;
-            }
-            let off = HEADER + filled * 4;
-            packet[off..off + 4].copy_from_slice(&s.to_le_bytes());
-            filled += 1;
-            if filled == FRAMES_PER_PACKET * 2 {
-                packet[4..12].copy_from_slice(&seq.to_le_bytes());
-                if let Some(to) = dest {
-                    let _ = sock.send_to(&packet, to);
-                }
-                seq = seq.wrapping_add(1);
-                filled = 0;
-            }
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = recv.recv_from(&mut buf).expect("packet");
+        alive.store(false, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert_eq!(n, HEADER + FRAMES_PER_PACKET * 2 * 4);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), MAGIC);
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), sr);
+        assert_eq!(u16::from_le_bytes(buf[16..18].try_into().unwrap()), FRAMES_PER_PACKET as u16);
+        // Samples land in order, little-endian f32.
+        let s0 = f32::from_le_bytes(buf[HEADER..HEADER + 4].try_into().unwrap());
+        let s1 = f32::from_le_bytes(buf[HEADER + 4..HEADER + 8].try_into().unwrap());
+        assert_eq!(s0, 0.0);
+        assert_eq!(s1, 1.0 / 1000.0);
+    }
+
+    #[test]
+    fn pump_with_no_destination_drops_and_does_not_send() {
+        // Gated off (dest() → None): it must drain the ring without sending.
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let to = probe.local_addr().unwrap();
+
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(FRAMES_PER_PACKET * 2 + 16);
+        for _ in 0..(FRAMES_PER_PACKET * 2) {
+            let _ = prod.push(1.0);
         }
-        if !got_any {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let handle = {
+            let alive = alive.clone();
+            // Destination is always None → nothing should reach `to`.
+            std::thread::spawn(move || pump(cons, 48_000, alive, move || None::<SocketAddr>))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        alive.store(false, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = to; // probe never bound to receive from this socket; assert silence:
+        let mut buf = [0u8; 64];
+        assert!(probe.recv_from(&mut buf).is_err(), "gated-off pump must not send");
     }
 }
 
