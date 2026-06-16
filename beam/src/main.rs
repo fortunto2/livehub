@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor, Peer,
+    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor,
+    MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START,
     CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
@@ -85,6 +86,13 @@ struct Beam {
     // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
     level_monitor: Option<LevelMonitor>,
     monitored_device: String,
+    // Mic check: a separate input device's level + a headphone monitor (listen), so
+    // you can confirm the mic is audible before/while streaming.
+    mic_monitor: Option<MicMonitor>,
+    mic_device: String,
+    mic_monitored: String, // which device the live MicMonitor is on
+    mic_listen: bool,
+    mic_gain: f32,
     // Remote gallery: browse + pull the phone's recorded clips over WiFi.
     gallery: gallery::Gallery,
     tab: Tab,
@@ -150,6 +158,11 @@ impl Beam {
             active_cam: 1, // phone starts on the rear wide (1×) lens
             level_monitor: None,
             monitored_device: String::new(),
+            mic_monitor: None,
+            mic_device: String::new(),
+            mic_monitored: String::new(),
+            mic_listen: false,
+            mic_gain: 1.0,
             gallery: gallery::Gallery::default(),
             tab: Tab::Preview,
             multipeer: multipeer::Multipeer::default(),
@@ -275,6 +288,25 @@ impl Beam {
         if self.level_monitor.is_none() || self.monitored_device != self.sel_device {
             self.level_monitor = LevelMonitor::start(&self.sel_device).ok();
             self.monitored_device = self.sel_device.clone();
+        }
+    }
+
+    /// Keep the mic monitor running on the chosen mic device (independent of the
+    /// broadcast source). Restart on device change; drop when no device is picked.
+    /// Push the live listen/gain settings to it each frame.
+    fn update_mic_monitor(&mut self) {
+        if self.mic_device.is_empty() {
+            self.mic_monitor = None;
+            self.mic_monitored.clear();
+            return;
+        }
+        if self.mic_monitor.is_none() || self.mic_monitored != self.mic_device {
+            self.mic_monitor = MicMonitor::start(&self.mic_device).ok();
+            self.mic_monitored = self.mic_device.clone();
+        }
+        if let Some(m) = &self.mic_monitor {
+            m.set_listen(self.mic_listen);
+            m.set_gain(self.mic_gain);
         }
     }
 
@@ -574,6 +606,8 @@ impl eframe::App for Beam {
 
         // Keep the pre-broadcast level meter alive on the selected device.
         self.update_level_monitor();
+        // Keep the mic check (level + headphone monitor) alive on its device.
+        self.update_mic_monitor();
 
         // Multicam director hotkeys: 1/2/3/4 → 0.5× / 1× / tele / front, live on the
         // phone. Skipped while a text field (e.g. the phone-IP box) has focus.
@@ -779,6 +813,44 @@ impl eframe::App for Beam {
                         );
                     }
 
+                    // ── 🎤 Mic check — level + headphone monitor (is it audible?) ──
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("🎤 Mic check:");
+                    egui::ComboBox::from_id_salt("micdev")
+                        .selected_text(if self.mic_device.is_empty() {
+                            "— off —"
+                        } else {
+                            self.mic_device.as_str()
+                        })
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.mic_device, String::new(), "— off —");
+                            for d in &self.devices {
+                                ui.selectable_value(&mut self.mic_device, d.clone(), d.as_str());
+                            }
+                        });
+                    if !self.mic_device.is_empty() {
+                        let mlevel = self.mic_monitor.as_ref().map(|m| m.level()).unwrap_or(0.0);
+                        ui.add_space(2.0);
+                        level_bar(ui, mlevel, true);
+                        ui.horizontal(|ui| {
+                            let lbl = if self.mic_listen { "🎧 monitor ON" } else { "🎧 monitor off" };
+                            if ui.selectable_label(self.mic_listen, lbl).clicked() {
+                                self.mic_listen = !self.mic_listen;
+                            }
+                            ui.add(egui::Slider::new(&mut self.mic_gain, 0.0..=2.0).text("vol"));
+                        });
+                        if self.mic_listen {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 170, 70),
+                                "⚠ use headphones — speakers + open mic = feedback",
+                            );
+                        } else if mlevel < 0.001 {
+                            ui.weak("no mic signal — check the input / preamp gain");
+                        }
+                    }
+
                     // BIG phone-remote buttons.
                     ui.add_space(8.0);
                     ui.separator();
@@ -977,8 +1049,8 @@ impl eframe::App for Beam {
             16
         } else if self.preview.is_some() {
             66 // ~15 fps preview refresh → show the freshest frame sooner
-        } else if self.on() || self.level_monitor.is_some() {
-            100 // ~10 fps so the audio level meter moves (incl. pre-broadcast)
+        } else if self.on() || self.level_monitor.is_some() || self.mic_monitor.is_some() {
+            100 // ~10 fps so the audio level meter moves (incl. pre-broadcast + mic)
         } else if self.gallery.open && self.gallery.busy {
             100 // drain gallery downloads/thumbs + animate the spinner
         } else if self.multipeer.running() {
