@@ -53,6 +53,7 @@ struct Beam {
     preview: Option<PreviewReceiver>,
     preview_tex: Option<egui::TextureHandle>,
     preview_seq: u32, // last frame seq we uploaded → detect new frames
+    preview_autostarted: bool, // auto-on once a phone appears; a manual stop sticks
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
     control: Option<RemoteControl>, // persistent control socket (stable port)
     // A/V-sync test: periodically flash the window + click the audio together.
@@ -67,6 +68,11 @@ struct Beam {
     preview_frames: u32,
     preview_fps: f32,
     preview_fps_at: Instant,
+    // Link health (#1/#3/#4): the phone's preview is our only inbound signal, so its
+    // arrival = the link is alive. Stall → watchdog re-resolves + redirects.
+    last_preview_at: Instant,
+    last_reconnect_at: Instant,
+    reconnects: u32,
     cam_manual_exp: bool,
     cam_iso: f32,
     cam_shutter: f32,
@@ -75,6 +81,7 @@ struct Beam {
     cam_lens: f32,
     cam_ae_lock: bool,
     cam_front: bool, // tracked flip intent (the phone has no ack channel)
+    active_cam: u8,  // director slot: 0=0.5× 1=1× 2=tele 3=front (keys 1–4)
     // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
     level_monitor: Option<LevelMonitor>,
     monitored_device: String,
@@ -119,6 +126,7 @@ impl Beam {
             preview: None,
             preview_tex: None,
             preview_seq: 0,
+            preview_autostarted: false,
             last_heartbeat: Instant::now(),
             control: RemoteControl::new().ok(),
             sync_test: false,
@@ -128,6 +136,9 @@ impl Beam {
             preview_frames: 0,
             preview_fps: 0.0,
             preview_fps_at: Instant::now(),
+            last_preview_at: Instant::now(),
+            last_reconnect_at: Instant::now(),
+            reconnects: 0,
             cam_manual_exp: false,
             cam_iso: 0.3,
             cam_shutter: 0.3,
@@ -136,6 +147,7 @@ impl Beam {
             cam_lens: 0.5,
             cam_ae_lock: false,
             cam_front: false,
+            active_cam: 1, // phone starts on the rear wide (1×) lens
             level_monitor: None,
             monitored_device: String::new(),
             gallery: gallery::Gallery::default(),
@@ -274,6 +286,61 @@ impl Beam {
         }
     }
 
+    /// Multicam director: punch a camera live (slot 0=0.5× 1=1× 2=tele 3=front).
+    /// A rear lens pick auto-flips the phone back to rear in one reconfiguration, so
+    /// front→lens is seamless; slot 3 flips to the front camera.
+    fn select_cam(&mut self, slot: u8) {
+        self.active_cam = slot;
+        if slot == 3 {
+            self.cam_front = true;
+            self.cam(CAM_FLIP, 1.0);
+        } else {
+            self.cam_front = false; // reelcam forces rear when selecting a lens
+            self.cam(CAM_LENS_SELECT, slot as f32);
+        }
+    }
+
+    /// Link health from the inbound preview: time since the last frame. `None` when
+    /// preview is off (no inbound signal to judge the link by).
+    fn link_age(&self) -> Option<Duration> {
+        self.preview.as_ref().map(|_| self.last_preview_at.elapsed())
+    }
+
+    /// Watchdog (#1): while previewing, if the phone's frames have stalled the link
+    /// likely bounced (sleep / range / new AWDL address). Re-resolve the phone from
+    /// discovery and redirect a live broadcast — no manual 🔄. Preview/control/heartbeat
+    /// all read `phone_addr` live, so they self-heal once it's updated.
+    fn link_watchdog(&mut self) {
+        let Some(age) = self.link_age() else { return };
+        if age < Duration::from_millis(2500) {
+            return; // link healthy
+        }
+        if self.last_reconnect_at.elapsed() < Duration::from_secs(4) {
+            return; // cooldown — give the last attempt time to take
+        }
+        // Find the phone again: the remembered one, else the only peer present.
+        let found = self
+            .remembered
+            .as_ref()
+            .and_then(|n| self.peers.iter().find(|p| &p.name == n))
+            .or_else(|| (self.peers.len() == 1).then(|| &self.peers[0]))
+            .map(|p| p.addr.to_string());
+        let Some(addr) = found else { return };
+        self.last_reconnect_at = Instant::now();
+        if addr != self.phone_addr {
+            self.phone_addr = addr.clone();
+            self.reconnects += 1;
+            if self.on() {
+                self.start(); // drop + rebuild the broadcaster pointed at the new addr
+            }
+            self.status = format!("link recovered → {addr}");
+        } else {
+            // Same address — nudge preview to re-arm on the next heartbeat tick.
+            self.last_heartbeat =
+                Instant::now().checked_sub(Duration::from_secs(3)).unwrap_or_else(Instant::now);
+        }
+    }
+
     /// Send a control command to the phone over the persistent socket (stable
     /// source port = one connection on the phone; no flow churn). Returns whether
     /// the datagram went out.
@@ -325,6 +392,7 @@ impl Beam {
             return;
         }
         self.preview_seq = seq;
+        self.last_preview_at = Instant::now(); // link is alive (inbound frame)
         // FPS meter: count displayed frames, recompute once a second.
         self.preview_frames += 1;
         let dt = self.preview_fps_at.elapsed().as_secs_f32();
@@ -362,29 +430,52 @@ impl Beam {
     /// Camera remote + histogram, drawn under the preview. Each control change sends
     /// a normalized cam-param to the phone; the phone maps it to its device ranges.
     fn camera_controls_ui(&mut self, ui: &mut egui::Ui) {
+        // #3 Link-health bar — the inbound preview rate doubles as link quality.
         ui.horizontal(|ui| {
-            ui.label(format!("📊 {:.0} fps", self.preview_fps));
+            match self.link_age() {
+                Some(age) if age < Duration::from_millis(800) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(90, 220, 130),
+                        format!("● link · {:.0} fps", self.preview_fps),
+                    );
+                }
+                Some(age) if age < Duration::from_millis(2500) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 200, 90), "◐ link weak");
+                }
+                Some(_) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 70, 70),
+                        "○ link lost — recovering…",
+                    );
+                }
+                None => {
+                    ui.weak(format!("📊 {:.0} fps (preview off)", self.preview_fps));
+                }
+            }
             self.draw_histogram(ui);
         });
-        // Phone camera selection — switchable live (lens 0.5×/1×/tele + front/back).
+        if self.reconnects > 0 {
+            ui.weak(format!("auto-reconnects this session: {}", self.reconnects));
+        }
+        // Multicam director — punch the phone's camera live. Keys 1–4 mirror these.
         ui.horizontal(|ui| {
-            ui.label("Cam:");
-            if ui.button("0.5×").clicked() {
-                self.cam(CAM_LENS_SELECT, 0.0);
-            }
-            if ui.button("1×").clicked() {
-                self.cam(CAM_LENS_SELECT, 1.0);
-            }
-            if ui.button("Tele").clicked() {
-                self.cam(CAM_LENS_SELECT, 2.0);
-            }
-            ui.separator();
-            let flip = if self.cam_front { "⟳ front" } else { "⟳ rear" };
-            if ui.button(flip).clicked() {
-                self.cam_front = !self.cam_front;
-                self.cam(CAM_FLIP, if self.cam_front { 1.0 } else { 0.0 });
+            ui.label("🎬");
+            for (slot, label) in
+                [(0u8, "1·0.5×"), (1, "2·1×"), (2, "3·Tele"), (3, "4·Front")]
+            {
+                let btn = egui::Button::new(label)
+                    .min_size(egui::vec2(64.0, 30.0))
+                    .fill(if self.active_cam == slot {
+                        egui::Color32::from_rgb(180, 40, 40) // tally red = on air
+                    } else {
+                        egui::Color32::from_gray(52)
+                    });
+                if ui.add(btn).clicked() {
+                    self.select_cam(slot);
+                }
             }
         });
+        ui.weak("keys 1–4 switch the camera live");
         ui.horizontal_wrapped(|ui| {
             if ui.selectable_label(self.cam_ae_lock, "🔒 AE").clicked() {
                 self.cam_ae_lock = !self.cam_ae_lock;
@@ -483,6 +574,34 @@ impl eframe::App for Beam {
 
         // Keep the pre-broadcast level meter alive on the selected device.
         self.update_level_monitor();
+
+        // Multicam director hotkeys: 1/2/3/4 → 0.5× / 1× / tele / front, live on the
+        // phone. Skipped while a text field (e.g. the phone-IP box) has focus.
+        if ctx.memory(|m| m.focused()).is_none() {
+            for (slot, key) in
+                [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4]
+                    .into_iter()
+                    .enumerate()
+            {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.select_cam(slot as u8);
+                }
+            }
+        }
+
+        // Auto-start the phone preview once a phone is reachable — the director monitor
+        // (and the link watchdog/health/alert, which key off inbound frames) come up
+        // with no click. Retries each frame until a phone appears; then a manual stop
+        // sticks. Skipped on a transient gap so it doesn't fight a manual stop.
+        if !self.preview_autostarted && self.preview.is_none() && self.phone().is_some() {
+            self.toggle_preview();
+            if self.preview.is_some() {
+                self.preview_autostarted = true;
+            }
+        }
+
+        // Link watchdog: auto-recover a stalled phone link (no manual 🔄 refresh).
+        self.link_watchdog();
 
         // Auto-up the AWDL link once on launch (the phone is then reachable with no
         // WiFi). A manual stop sticks — we don't re-spawn.
@@ -831,6 +950,25 @@ impl eframe::App for Beam {
             let painter = ctx
                 .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("flash")));
             painter.rect_filled(ctx.content_rect(), 0.0, egui::Color32::WHITE);
+        }
+
+        // #4 Alert: broadcasting but the phone link is lost → the reel is losing its
+        // clean audio. A bright red banner over everything so you catch it mid-set.
+        if self.on() && self.link_age().is_some_and(|a| a > Duration::from_millis(2500)) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("link_alert"),
+            ));
+            let full = ctx.content_rect();
+            let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), 26.0));
+            painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(200, 30, 30));
+            painter.text(
+                bar.center(),
+                egui::Align2::CENTER_CENTER,
+                "⚠ LINK LOST — phone not receiving audio",
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
         }
 
         // Repaint cadence: crisp 60 fps during the sync test (well-timed flash),
