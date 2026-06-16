@@ -8,6 +8,7 @@
 //! (and stops the stream); ⌘H tucks it away while it keeps broadcasting.
 
 mod gallery;
+mod multipeer;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -80,6 +81,9 @@ struct Beam {
     // Remote gallery: browse + pull the phone's recorded clips over WiFi.
     gallery: gallery::Gallery,
     tab: Tab,
+    // Multipeer (AWDL) transport — Phase 1: connect + round-trip test, no router/SIM.
+    multipeer: multipeer::Multipeer,
+    mp_last_recv: String,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -134,6 +138,8 @@ impl Beam {
             monitored_device: String::new(),
             gallery: gallery::Gallery::default(),
             tab: Tab::Preview,
+            multipeer: multipeer::Multipeer::default(),
+            mp_last_recv: String::new(),
         }
     }
 
@@ -479,6 +485,10 @@ impl eframe::App for Beam {
         self.poll_preview(ctx);
         // Drain remote-gallery background results (list / thumbs / downloads).
         self.gallery.poll(ctx);
+        // Drain Multipeer frames (Phase 1: show the last as text for the round-trip test).
+        for f in self.multipeer.drain() {
+            self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
+        }
 
         // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
         // it keeps streaming; if we crash, it self-stops after the timeout.
@@ -690,6 +700,46 @@ impl eframe::App for Beam {
                         ui.weak("muted except the click · film THIS window · then avsync.py");
                     }
 
+                    // ── Multipeer (AWDL) — no router / SIM / internet (Phase 1) ──
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("🔗 Multipeer link (no-WiFi):");
+                    let mp_on = self.multipeer.running();
+                    let lbl = if !mp_on {
+                        "▶ start link"
+                    } else if self.multipeer.connected() {
+                        "● connected"
+                    } else {
+                        "… searching"
+                    };
+                    if ui
+                        .add(egui::Button::new(lbl).min_size(egui::vec2(300.0, 30.0)).fill(
+                            if self.multipeer.connected() {
+                                egui::Color32::from_rgb(30, 90, 50)
+                            } else {
+                                egui::Color32::from_gray(52)
+                            },
+                        ))
+                        .clicked()
+                    {
+                        if mp_on {
+                            self.multipeer.stop();
+                        } else {
+                            self.multipeer.start();
+                        }
+                    }
+                    if mp_on {
+                        if ui.add_enabled(self.multipeer.connected(), egui::Button::new("ping")).clicked()
+                        {
+                            self.multipeer.send(b"ping".to_vec());
+                        }
+                        ui.weak(format!("{}", self.multipeer.status()));
+                        if !self.mp_last_recv.is_empty() {
+                            ui.weak(format!("recv: {}", self.mp_last_recv));
+                        }
+                        ui.weak("turn on 'Multipeer' in Reelcam settings to pair");
+                    }
+
                     ui.add_space(8.0);
                     ui.separator();
                     ui.weak(
@@ -774,6 +824,8 @@ impl eframe::App for Beam {
             100 // ~10 fps so the audio level meter moves (incl. pre-broadcast)
         } else if self.gallery.open && self.gallery.busy {
             100 // drain gallery downloads/thumbs + animate the spinner
+        } else if self.multipeer.running() {
+            150 // drain multipeer frames + refresh link status
         } else {
             500
         };
