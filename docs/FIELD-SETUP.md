@@ -30,12 +30,25 @@ If macOS refuses to enable the Wi-Fi option with Thunderbolt Bridge (some builds
 a "live" source), the only no-internet fallback is a second interface — a cheap
 **USB-C→Ethernet adapter** as the source (it need not be plugged into anything).
 
-## 3. No network at all — Multipeer Connectivity (a dev project, not a setting)
-AirDrop/AirPlay run over **AWDL** (Apple Wireless Direct Link) = direct device-to-
-device Wi-Fi with **no router, no internet, no SIM**, fast enough for the rig. The
-public API is **Multipeer Connectivity**. reelcam is Swift (easy); beam is Rust, so it
-needs a Swift bridge or the transport (UDP audio + HTTP gallery) re-done over Multipeer
-sessions. This is the truly infrastructure-free answer if the field has nothing.
+## 3. No network at all — Multipeer link activates AWDL, the rig rides it ✅ WORKS
+The cleanest field answer, verified working:
+1. In Reelcam settings, turn ON **"Multipeer link (no WiFi)"** — its MCSession brings
+   up **awdl0** (AWDL = the peer-to-peer Wi-Fi behind AirDrop; no router/internet/SIM).
+2. The EXISTING rig rides it automatically: the phone advertises `_reelcam._udp` over
+   awdl0 too, beam's mDNS discovery re-finds it there, and the UDP audio + preview flow
+   over awdl0. (Hit 🔄 refresh in beam if the address changed.)
+3. Turn Wi-Fi fully OFF (Settings → Wi-Fi, NOT Control Center — the latter keeps the
+   radio on and reconnects). Audio + preview keep working → confirmed on the link.
+
+Proof it's the link, not Wi-Fi: ping the phone's old Wi-Fi IP — it's dead (100% loss)
+while the rig keeps working.
+
+Keep the Multipeer toggle ON in the field — it's what keeps awdl0 alive; without it
+AWDL goes dormant and the link drops.
+
+The `mp-bridge` + MCSession data channel (the Rust↔Swift bridge) is the explicit
+fallback if the Bonjour-over-AWDL routing ever proves flaky — then audio/gallery get
+tunnelled through Multipeer frames directly.
 
 ## Not viable
 - **Bluetooth**: the uncompressed audio stream is ~3 Mbit/s; Bluetooth tops out near
