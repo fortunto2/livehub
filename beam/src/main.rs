@@ -81,9 +81,11 @@ struct Beam {
     // Remote gallery: browse + pull the phone's recorded clips over WiFi.
     gallery: gallery::Gallery,
     tab: Tab,
-    // Multipeer (AWDL) transport — Phase 1: connect + round-trip test, no router/SIM.
+    // Multipeer (AWDL) transport — auto-up on launch so the phone is reachable with
+    // no WiFi. `mp_started` makes the auto-start happen once (a manual stop sticks).
     multipeer: multipeer::Multipeer,
     mp_last_recv: String,
+    mp_started: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -140,6 +142,7 @@ impl Beam {
             tab: Tab::Preview,
             multipeer: multipeer::Multipeer::default(),
             mp_last_recv: String::new(),
+            mp_started: false,
         }
     }
 
@@ -481,6 +484,13 @@ impl eframe::App for Beam {
         // Keep the pre-broadcast level meter alive on the selected device.
         self.update_level_monitor();
 
+        // Auto-up the AWDL link once on launch (the phone is then reachable with no
+        // WiFi). A manual stop sticks — we don't re-spawn.
+        if !self.mp_started {
+            self.multipeer.start();
+            self.mp_started = true;
+        }
+
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
         // Drain remote-gallery background results (list / thumbs / downloads).
@@ -524,9 +534,23 @@ impl eframe::App for Beam {
                     ui.heading("📡 beam");
                     ui.separator();
 
-                    // Discovered phones.
+                    // Unified phone-link status — one place, both transports. WiFi =
+                    // discovered over mDNS; AWDL = the Multipeer link (no router/SIM).
+                    let wifi = !self.peers.is_empty();
+                    let awdl = self.multipeer.connected();
+                    let (status, col) = match (wifi, awdl) {
+                        (true, true) => ("📱 Phone: connected (WiFi + AWDL link)", egui::Color32::from_rgb(90, 220, 130)),
+                        (false, true) => ("📱 Phone: connected (AWDL link · no WiFi)", egui::Color32::from_rgb(90, 220, 130)),
+                        (true, false) => ("📱 Phone: on WiFi", egui::Color32::from_rgb(220, 200, 90)),
+                        (false, false) => ("📱 Phone: searching… (open Reelcam)", egui::Color32::from_gray(150)),
+                    };
+                    ui.colored_label(col, status);
+
+                    // Discovered phones (for targeting when several are on WiFi).
                     if self.peers.is_empty() {
-                        ui.weak("📱 searching for reelcam…");
+                        if awdl {
+                            ui.weak("linked directly — no WiFi address to pick");
+                        }
                     } else {
                         ui.label("📱 phones (click to target):");
                         for p in &self.peers {
@@ -700,44 +724,39 @@ impl eframe::App for Beam {
                         ui.weak("muted except the click · film THIS window · then avsync.py");
                     }
 
-                    // ── Multipeer (AWDL) — no router / SIM / internet (Phase 1) ──
+                    // ── Direct AWDL link (auto) — no router / SIM / internet ──
+                    // Auto-up on launch; collapsed to a small control since it's hands-off.
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label("🔗 Multipeer link (no-WiFi):");
                     let mp_on = self.multipeer.running();
-                    let lbl = if !mp_on {
-                        "▶ start link"
-                    } else if self.multipeer.connected() {
-                        "● connected"
-                    } else {
-                        "… searching"
-                    };
-                    if ui
-                        .add(egui::Button::new(lbl).min_size(egui::vec2(300.0, 30.0)).fill(
-                            if self.multipeer.connected() {
-                                egui::Color32::from_rgb(30, 90, 50)
-                            } else {
-                                egui::Color32::from_gray(52)
-                            },
-                        ))
-                        .clicked()
-                    {
-                        if mp_on {
-                            self.multipeer.stop();
+                    ui.horizontal(|ui| {
+                        let dot = if self.multipeer.connected() {
+                            "🟢"
+                        } else if mp_on {
+                            "🟡"
                         } else {
-                            self.multipeer.start();
+                            "⚪"
+                        };
+                        ui.weak(format!("{dot} direct link (AWDL)"));
+                        let toggle = if mp_on { "stop" } else { "start" };
+                        if ui.small_button(toggle).clicked() {
+                            if mp_on {
+                                self.multipeer.stop();
+                            } else {
+                                self.multipeer.start();
+                            }
+                            self.mp_started = true; // a manual choice sticks
                         }
-                    }
-                    if mp_on {
-                        if ui.add_enabled(self.multipeer.connected(), egui::Button::new("ping")).clicked()
+                        if mp_on
+                            && ui
+                                .add_enabled(self.multipeer.connected(), egui::Button::new("ping").small())
+                                .clicked()
                         {
                             self.multipeer.send(b"ping".to_vec());
                         }
-                        ui.weak(format!("{}", self.multipeer.status()));
-                        if !self.mp_last_recv.is_empty() {
-                            ui.weak(format!("recv: {}", self.mp_last_recv));
-                        }
-                        ui.weak("turn on 'Multipeer' in Reelcam settings to pair");
+                    });
+                    if mp_on && !self.mp_last_recv.is_empty() {
+                        ui.weak(format!("recv: {}", self.mp_last_recv));
                     }
 
                     ui.add_space(8.0);

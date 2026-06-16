@@ -13,6 +13,7 @@ import Foundation
 import MultipeerConnectivity
 
 let serviceType = "reelcam-mp" // must match reelcam's advertiser
+let mpToken = "rcm-mp-7f3a"    // must match reelcam — only our beam may connect
 let myPeer = MCPeerID(displayName: (Host.current().localizedName ?? "beam").prefix(60).description)
 let mcSession = MCSession(peer: myPeer, securityIdentity: nil, encryptionPreference: .none)
 
@@ -36,7 +37,7 @@ final class Bridge: NSObject, MCSessionDelegate, MCNearbyServiceBrowserDelegate 
     func browser(_ b: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID,
                  withDiscoveryInfo info: [String: String]?) {
         note("found \(peerID.displayName)")
-        b.invitePeer(peerID, to: mcSession, withContext: nil, timeout: 20)
+        b.invitePeer(peerID, to: mcSession, withContext: mpToken.data(using: .utf8), timeout: 20)
     }
     func browser(_ b: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         note("lost \(peerID.displayName)")

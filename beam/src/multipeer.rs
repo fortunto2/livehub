@@ -36,6 +36,7 @@ impl Multipeer {
     pub fn connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
+    #[allow(dead_code)] // kept for debugging the link state
     pub fn status(&self) -> String {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
