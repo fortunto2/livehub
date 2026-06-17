@@ -448,9 +448,18 @@ impl Beam {
         self.phone_addr.parse::<SocketAddr>().ok()
     }
 
-    /// Toggle recording ON THE PHONE (no ack — we track intent locally).
+    /// Is the phone reachable for control — a WiFi IP, OR the Direct (Multipeer) link?
+    fn phone_reachable(&self) -> bool {
+        self.phone().is_some() || (self.transport_direct && self.multipeer.connected())
+    }
+
+    /// Toggle recording ON THE PHONE (no ack — we track intent locally). Works over the
+    /// Multipeer link in Direct mode (no WiFi IP needed).
     fn toggle_remote_record(&mut self) {
-        if let Some(addr) = self.phone() {
+        if self.transport_direct && self.multipeer.connected() {
+            self.multipeer.send(control_packet(CMD_REC_TOGGLE, 0).to_vec(), true);
+            self.remote_rec = !self.remote_rec;
+        } else if let Some(addr) = self.phone() {
             if self.ctl(addr, CMD_REC_TOGGLE, 0) {
                 self.remote_rec = !self.remote_rec;
             }
@@ -965,7 +974,8 @@ impl eframe::App for Beam {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.label("📲 Phone remote:");
-                    let has_phone = self.phone().is_some();
+                    let has_phone = self.phone().is_some(); // WiFi IP — for the HTTP gallery
+                    let can_control = self.phone_reachable(); // IP OR the Direct link
                     let rec = if self.remote_rec { "■ stop rec" } else { "⏺ record" };
                     let rec_btn = egui::Button::new(egui::RichText::new(rec).size(16.0))
                         .min_size(egui::vec2(300.0, 42.0))
@@ -974,14 +984,14 @@ impl eframe::App for Beam {
                         } else {
                             egui::Color32::from_gray(52)
                         });
-                    if ui.add_enabled(has_phone, rec_btn).clicked() {
+                    if ui.add_enabled(can_control, rec_btn).clicked() {
                         self.toggle_remote_record();
                     }
                     ui.add_space(4.0);
                     let prev = if self.preview.is_some() { "👁 preview: ON" } else { "👁 preview: off" };
                     if ui
                         .add_enabled(
-                            has_phone,
+                            can_control,
                             egui::Button::new(prev).min_size(egui::vec2(300.0, 34.0)),
                         )
                         .clicked()
@@ -998,8 +1008,11 @@ impl eframe::App for Beam {
                                     .clicked()
                                 {
                                     self.preview_q_mode = i as u8;
-                                    if let Some(addr) = self.phone() {
-                                        let q = self.effective_preview_q();
+                                    let q = self.effective_preview_q();
+                                    if self.transport_direct && self.multipeer.connected() {
+                                        self.multipeer
+                                            .send(control_packet(CMD_PREVIEW_QUALITY, q as u16).to_vec(), true);
+                                    } else if let Some(addr) = self.phone() {
                                         self.ctl(addr, CMD_PREVIEW_QUALITY, q as u16);
                                     }
                                 }
