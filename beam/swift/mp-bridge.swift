@@ -77,11 +77,14 @@ DispatchQueue.global(qos: .userInteractive).async {
         buf.append(contentsOf: chunk)
         while buf.count >= 4 {
             let len = Int(buf[0]) | Int(buf[1]) << 8 | Int(buf[2]) << 16 | Int(buf[3]) << 24
-            if buf.count < 4 + len { break }
-            let payload = Data(buf[4 ..< (4 + len)])
+            if buf.count < 4 + len || len < 1 { break }
+            // Frame = [u32 len][u8 reliable][data…]. Strip the reliability byte.
+            let reliable = buf[4] != 0
+            let payload = Data(buf[5 ..< (4 + len)])
             buf.removeFirst(4 + len)
             if !mcSession.connectedPeers.isEmpty {
-                try? mcSession.send(payload, toPeers: mcSession.connectedPeers, with: .reliable)
+                try? mcSession.send(payload, toPeers: mcSession.connectedPeers,
+                                    with: reliable ? .reliable : .unreliable)
             }
         }
     }

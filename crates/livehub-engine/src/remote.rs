@@ -38,7 +38,7 @@ pub const CAM_LENS_SELECT: u8 = 7; // value 0=ultra-wide, 1=wide, 2=tele
 pub const CAM_FLIP: u8 = 8; // value 0=back, 1=front
 
 /// Build the 9-byte camera-param packet: `magic · param u8 · value f32` (LE).
-fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
+pub fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
     let mut buf = [0u8; 9];
     buf[0..4].copy_from_slice(&CAMPARAM_MAGIC.to_le_bytes());
     buf[4] = param;
@@ -47,7 +47,7 @@ fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
 }
 
 /// Build the 7-byte control packet.
-fn control_packet(cmd: u8, preview_port: u16) -> [u8; 7] {
+pub fn control_packet(cmd: u8, preview_port: u16) -> [u8; 7] {
     let mut buf = [0u8; 7];
     buf[0..4].copy_from_slice(&CTRL_MAGIC.to_le_bytes());
     buf[4] = cmd;

@@ -123,9 +123,15 @@ impl Multipeer {
         *self.status.lock().unwrap() = String::new();
     }
 
-    pub fn send(&self, data: Vec<u8>) {
+    /// Send a payload to the phone over the MCSession. `reliable` = ordered/guaranteed
+    /// (control) vs best-effort like UDP (audio/preview — never block on a slow link).
+    /// The reliability is the first byte of the pipe frame; the bridge strips it.
+    pub fn send(&self, data: Vec<u8>, reliable: bool) {
         if let Some(tx) = &self.stdin_tx {
-            let _ = tx.send(data);
+            let mut frame = Vec::with_capacity(1 + data.len());
+            frame.push(reliable as u8);
+            frame.extend_from_slice(&data);
+            let _ = tx.send(frame);
         }
     }
 

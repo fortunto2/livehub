@@ -17,8 +17,9 @@ use livehub_engine::{
     input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor,
     MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
-    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_QUALITY,
-    CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
+    CAM_SHUTTER, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    PREVIEW_MAGIC,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -104,6 +105,9 @@ struct Beam {
     multipeer: multipeer::Multipeer,
     mp_last_recv: String,
     mp_started: bool,
+    // Transport: WiFi (UDP/Bonjour, the default) or Direct (route audio/preview/control
+    // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
+    transport_direct: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -174,6 +178,7 @@ impl Beam {
             multipeer: multipeer::Multipeer::default(),
             mp_last_recv: String::new(),
             mp_started: false,
+            transport_direct: false,
         }
     }
 
@@ -322,6 +327,9 @@ impl Beam {
         if let (Some(addr), Some(c)) = (self.phone(), self.control.as_ref()) {
             let _ = c.send_cam(addr, param, value);
         }
+        if self.transport_direct && self.multipeer.connected() {
+            self.multipeer.send(camparam_packet(param, value).to_vec(), true);
+        }
     }
 
     /// Multicam director: punch a camera live (slot 0=0.5× 1=1× 2=tele 3=front).
@@ -372,7 +380,11 @@ impl Beam {
     /// Link health from the inbound preview: time since the last frame. `None` when
     /// preview is off (no inbound signal to judge the link by).
     fn link_age(&self) -> Option<Duration> {
-        self.preview.as_ref().map(|_| self.last_preview_at.elapsed())
+        if self.preview.is_some() || self.transport_direct {
+            Some(self.last_preview_at.elapsed())
+        } else {
+            None
+        }
     }
 
     /// Watchdog (#1): while previewing, if the phone's frames have stalled the link
@@ -414,6 +426,9 @@ impl Beam {
     /// source port = one connection on the phone; no flow churn). Returns whether
     /// the datagram went out.
     fn ctl(&self, to: SocketAddr, cmd: u8, port: u16) -> bool {
+        if self.transport_direct && self.multipeer.connected() {
+            self.multipeer.send(control_packet(cmd, port).to_vec(), true);
+        }
         self.control.as_ref().is_some_and(|c| c.send(to, cmd, port).is_ok())
     }
 
@@ -445,9 +460,16 @@ impl Beam {
             self.preview_tex = None; // drop the texture → free GPU memory
             return;
         }
-        // Start a receiver on an ephemeral port, tell the phone to send there.
-        if let (Some(addr), Ok(rx)) = (self.phone(), PreviewReceiver::start()) {
-            self.ctl(addr, CMD_PREVIEW_START, rx.port());
+        // Start a UDP receiver (used in WiFi mode; harmless in Direct, where frames
+        // arrive over Multipeer). Tell the phone where to send — over whichever
+        // transport is active (the heartbeat keeps re-asserting it).
+        if let Ok(rx) = PreviewReceiver::start() {
+            let port = rx.port();
+            if self.transport_direct && self.multipeer.connected() {
+                self.multipeer.send(control_packet(CMD_PREVIEW_START, port).to_vec(), true);
+            } else if let Some(addr) = self.phone() {
+                self.ctl(addr, CMD_PREVIEW_START, port);
+            }
             self.preview = Some(rx);
         }
     }
@@ -461,6 +483,13 @@ impl Beam {
             return;
         }
         self.preview_seq = seq;
+        let Some(jpeg) = rx.latest_jpeg() else { return };
+        self.show_jpeg(ctx, &jpeg);
+    }
+
+    /// Decode a preview JPEG → texture + histogram and tick the fps/link meters.
+    /// Shared by the UDP receiver and the Multipeer (Direct) preview path.
+    fn show_jpeg(&mut self, ctx: &egui::Context, jpeg: &[u8]) {
         self.last_preview_at = Instant::now(); // link is alive (inbound frame)
         // FPS meter: count displayed frames, recompute once a second.
         self.preview_frames += 1;
@@ -470,8 +499,7 @@ impl Beam {
             self.preview_frames = 0;
             self.preview_fps_at = Instant::now();
         }
-        let Some(jpeg) = rx.latest_jpeg() else { return };
-        if let Ok(img) = image::load_from_memory(&jpeg) {
+        if let Ok(img) = image::load_from_memory(jpeg) {
             let rgba = img.to_rgba8();
             // Luma histogram (BT.709) of the frame, subsampled every 4th pixel.
             let mut hist = [0u32; 64];
@@ -602,8 +630,15 @@ impl Beam {
 
     fn start(&mut self) {
         self.level_monitor = None; // release the device before the broadcaster opens it
-        match self.phone_addr.parse::<SocketAddr>() {
-            Ok(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
+        // Direct transport has no UDP target (no WiFi/discovery in the field) — the
+        // audio rides Multipeer. Use a dummy addr so the broadcaster still runs + taps.
+        let addr = self
+            .phone_addr
+            .parse::<SocketAddr>()
+            .ok()
+            .or_else(|| self.transport_direct.then(|| "127.0.0.1:9000".parse().unwrap()));
+        match addr {
+            Some(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
                 Ok(b) => {
                     self.broadcaster = Some(b);
                     self.status = format!("streaming → {addr}");
@@ -612,13 +647,13 @@ impl Beam {
                     {
                         self.remembered = Some(name.clone());
                         save_last_phone(&name, &addr.to_string());
-                    } else {
+                    } else if !self.transport_direct {
                         save_last_phone("", &addr.to_string());
                     }
                 }
                 Err(e) => self.status = format!("error: {e}"),
             },
-            Err(_) => self.status = "bad ip:port (e.g. 172.20.10.2:9000)".into(),
+            None => self.status = "bad ip:port (e.g. 172.20.10.2:9000)".into(),
         }
     }
 }
@@ -664,7 +699,9 @@ impl eframe::App for Beam {
         // (and the link watchdog/health/alert, which key off inbound frames) come up
         // with no click. Retries each frame until a phone appears; then a manual stop
         // sticks. Skipped on a transient gap so it doesn't fight a manual stop.
-        if !self.preview_autostarted && self.preview.is_none() && self.phone().is_some() {
+        let phone_reachable =
+            self.phone().is_some() || (self.transport_direct && self.multipeer.connected());
+        if !self.preview_autostarted && self.preview.is_none() && phone_reachable {
             self.toggle_preview();
             if self.preview.is_some() {
                 self.preview_autostarted = true;
@@ -686,20 +723,38 @@ impl eframe::App for Beam {
         // Drain remote-gallery background results (list / thumbs / downloads).
         self.gallery.poll(ctx);
         // Drain Multipeer frames (Phase 1: show the last as text for the round-trip test).
+        // Inbound over the Multipeer link: preview frames (Direct transport) → display;
+        // anything else → debug line.
         for f in self.multipeer.drain() {
-            self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
+            if f.len() > 8 && u32::from_le_bytes([f[0], f[1], f[2], f[3]]) == PREVIEW_MAGIC {
+                self.show_jpeg(ctx, &f[8..]);
+            } else {
+                self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
+            }
+        }
+        // Direct transport: forward captured audio packets over the Multipeer link
+        // (the field path when UDP/Bonjour can't reach the phone). WiFi mode skips this.
+        if self.transport_direct && self.multipeer.connected() {
+            let pkts = self.broadcaster.as_ref().map(|b| b.drain_packets()).unwrap_or_default();
+            for p in pkts {
+                self.multipeer.send(p, false); // unreliable — audio may skip, never block
+            }
         }
 
         // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
         // it keeps streaming; if we crash, it self-stops after the timeout.
         if self.preview.is_some() && self.last_heartbeat.elapsed() >= Duration::from_secs(2) {
             self.last_heartbeat = Instant::now();
-            let port = self.preview.as_ref().map(|r| r.port());
-            if let (Some(addr), Some(port)) = (self.phone(), port) {
+            let port = self.preview.as_ref().map(|r| r.port()).unwrap_or(0);
+            let q = self.effective_preview_q() as u16;
+            if self.transport_direct && self.multipeer.connected() {
+                // Field path: no UDP addr — drive preview over the Multipeer link.
+                self.multipeer.send(control_packet(CMD_PREVIEW_START, port).to_vec(), true);
+                self.multipeer.send(control_packet(CMD_PREVIEW_QUALITY, q).to_vec(), true);
+            } else if let Some(addr) = self.phone() {
                 self.ctl(addr, CMD_PREVIEW_START, port);
-                // Re-assert the preview quality (survives a phone-side preview restart,
-                // which resets it to the default).
-                self.ctl(addr, CMD_PREVIEW_QUALITY, self.effective_preview_q() as u16);
+                // Re-assert quality (survives a phone-side preview restart that resets it).
+                self.ctl(addr, CMD_PREVIEW_QUALITY, q);
             }
         }
 
@@ -1009,11 +1064,26 @@ impl eframe::App for Beam {
                                 .add_enabled(self.multipeer.connected(), egui::Button::new("ping").small())
                                 .clicked()
                         {
-                            self.multipeer.send(b"ping".to_vec());
+                            self.multipeer.send(b"ping".to_vec(), true);
                         }
                     });
                     if mp_on && !self.mp_last_recv.is_empty() {
                         ui.weak(format!("recv: {}", self.mp_last_recv));
+                    }
+                    // Transport selector — route audio/preview/control over WiFi (UDP) or
+                    // straight through the Multipeer link (the no-WiFi field path).
+                    ui.horizontal(|ui| {
+                        ui.label("Transport:");
+                        ui.selectable_value(&mut self.transport_direct, false, "WiFi");
+                        ui.selectable_value(&mut self.transport_direct, true, "Direct");
+                    });
+                    if self.transport_direct {
+                        let col = if self.multipeer.connected() {
+                            egui::Color32::from_rgb(90, 220, 130)
+                        } else {
+                            egui::Color32::from_rgb(220, 200, 90)
+                        };
+                        ui.colored_label(col, "audio + preview ride the AWDL link (no WiFi needed)");
                     }
 
                     ui.add_space(8.0);

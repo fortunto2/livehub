@@ -20,6 +20,7 @@ use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use crate::device::{best_input_config, best_input_config_at, pick_input};
@@ -51,6 +52,9 @@ pub struct Broadcaster {
     /// SILENCE) so the only transient is the click — otherwise music/voice on the
     /// source pollutes click detection and ruins the measurement.
     silent: Arc<AtomicBool>,
+    /// Each outgoing audio packet, mirrored here so beam can also forward it over the
+    /// Multipeer (AWDL) link when WiFi/UDP can't reach the phone (the field case).
+    tap_rx: Receiver<Vec<u8>>,
 }
 
 impl Broadcaster {
@@ -128,14 +132,21 @@ impl Broadcaster {
         stream.play().context("input stream play")?;
 
         let running = Arc::new(AtomicBool::new(true));
+        let (tap_tx, tap_rx) = sync_channel::<Vec<u8>>(64); // bounded — drop on backpressure
         let sender = {
             let running = running.clone();
             std::thread::Builder::new()
                 .name("broadcast-sender".into())
-                .spawn(move || sender_loop(cons, sr, to, running))
+                .spawn(move || sender_loop(cons, sr, to, running, Some(tap_tx)))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent })
+        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent, tap_rx })
+    }
+
+    /// Drain the audio packets captured since the last call — for forwarding over the
+    /// Multipeer link (Direct transport). Beam ignores it in WiFi mode.
+    pub fn drain_packets(&self) -> Vec<Vec<u8>> {
+        self.tap_rx.try_iter().collect()
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -223,6 +234,7 @@ fn pump(
     sr: u32,
     alive: Arc<AtomicBool>,
     mut dest: impl FnMut() -> Option<SocketAddr>,
+    tap: Option<SyncSender<Vec<u8>>>, // also forward each packet here (for the Multipeer link)
 ) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -253,6 +265,9 @@ fn pump(
             if filled == FRAMES_PER_PACKET * 2 {
                 packet[4..12].copy_from_slice(&seq.to_le_bytes());
                 let _ = sock.send_to(&packet, addr);
+                if let Some(t) = &tap {
+                    let _ = t.try_send(packet.clone()); // drop on full — audio may skip
+                }
                 seq = seq.wrapping_add(1);
                 filled = 0;
             }
@@ -263,9 +278,16 @@ fn pump(
     }
 }
 
-/// Fixed-target sender (a `Broadcaster`'s capture → one phone).
-fn sender_loop(cons: rtrb::Consumer<f32>, sr: u32, to: SocketAddr, running: Arc<AtomicBool>) {
-    pump(cons, sr, running, move || Some(to));
+/// Fixed-target sender (a `Broadcaster`'s capture → one phone). `tap` also forwards
+/// every packet to the Multipeer link (when Direct transport is wanted).
+fn sender_loop(
+    cons: rtrb::Consumer<f32>,
+    sr: u32,
+    to: SocketAddr,
+    running: Arc<AtomicBool>,
+    tap: Option<SyncSender<Vec<u8>>>,
+) {
+    pump(cons, sr, running, move || Some(to), tap);
 }
 
 /// Persistent, GATED sender for the engine's INTERNAL master tap (livehub's own mix
@@ -278,13 +300,19 @@ pub(crate) fn master_sender_loop(
     on: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 ) {
-    pump(cons, sr, alive, move || {
-        if on.load(Ordering::Relaxed) {
-            target.lock().ok().and_then(|g| *g)
-        } else {
-            None
-        }
-    });
+    pump(
+        cons,
+        sr,
+        alive,
+        move || {
+            if on.load(Ordering::Relaxed) {
+                target.lock().ok().and_then(|g| *g)
+            } else {
+                None
+            }
+        },
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -306,7 +334,7 @@ mod tests {
         let sr = 48_000u32;
         let handle = {
             let alive = alive.clone();
-            std::thread::spawn(move || pump(cons, sr, alive, move || Some(to)))
+            std::thread::spawn(move || pump(cons, sr, alive, move || Some(to), None))
         };
 
         let mut buf = [0u8; 2048];
@@ -340,7 +368,7 @@ mod tests {
         let handle = {
             let alive = alive.clone();
             // Destination is always None → nothing should reach `to`.
-            std::thread::spawn(move || pump(cons, 48_000, alive, move || None::<SocketAddr>))
+            std::thread::spawn(move || pump(cons, 48_000, alive, move || None::<SocketAddr>, None))
         };
         std::thread::sleep(std::time::Duration::from_millis(50));
         alive.store(false, Ordering::Relaxed);

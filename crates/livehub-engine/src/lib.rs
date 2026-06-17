@@ -28,7 +28,8 @@ pub use mic_monitor::MicMonitor;
 pub use discovery::{Discovery, Peer};
 pub use last_phone::{load_last_phone, save_last_phone};
 pub use remote::{
-    send_control, PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
+    camparam_packet, control_packet, send_control, PreviewReceiver, RemoteControl, PREVIEW_MAGIC,
+    CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_QUALITY,
     CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE,
 };
