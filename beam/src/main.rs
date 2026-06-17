@@ -109,6 +109,7 @@ struct Beam {
     // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
     transport_direct: bool,
     mp_tx_audio: u64, // audio packets forwarded over the link (Direct diagnostics)
+    source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -181,6 +182,7 @@ impl Beam {
             mp_started: false,
             transport_direct: false,
             mp_tx_audio: 0,
+            source_listen: false,
         }
     }
 
@@ -752,6 +754,7 @@ impl eframe::App for Beam {
         // (the field path when UDP/Bonjour can't reach the phone). WiFi mode skips this.
         if let Some(b) = &self.broadcaster {
             b.set_tap(self.transport_direct); // clone+forward packets only in Direct
+            b.set_monitor(self.source_listen); // local speaker monitor of the source
         }
         if self.transport_direct && self.multipeer.connected() {
             let pkts = self.broadcaster.as_ref().map(|b| b.drain_packets()).unwrap_or_default();
@@ -930,6 +933,19 @@ impl eframe::App for Beam {
                             egui::Color32::from_rgb(230, 170, 70),
                             "⚠ source silent — is signal reaching it?",
                         );
+                    }
+                    // Listen to the source on THIS Mac — for when it's going only to the
+                    // phone (e.g. REAPER → BlackHole) and you can't hear it locally.
+                    let listen_lbl = if self.source_listen {
+                        "🔊 listening on this Mac"
+                    } else {
+                        "🔇 listen on this Mac"
+                    };
+                    if ui.selectable_label(self.source_listen, listen_lbl).clicked() {
+                        self.source_listen = !self.source_listen;
+                    }
+                    if self.source_listen && !self.on() {
+                        ui.weak("starts when you ▶ broadcast");
                     }
 
                     // ── 🎤 Mic check — level + headphone monitor (is it audible?) ──

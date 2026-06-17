@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use crate::device::{best_input_config, best_input_config_at, pick_input};
+use crate::device::{
+    best_input_config, best_input_config_at, best_output_config_at, pick_input, pick_output,
+};
 
 /// 128 stereo frames per packet (~2.7 ms @ 48 kHz). Header(18) + 128*2*4 = 1042
 /// bytes — under the 1500-byte Ethernet/WiFi MTU, so no IP fragmentation.
@@ -57,6 +59,9 @@ pub struct Broadcaster {
     tap_rx: Receiver<Vec<u8>>,
     /// Gate for the tap — only clone+forward packets when Direct transport is on.
     tap_on: Arc<AtomicBool>,
+    /// Local-monitor output (hear the source on the Mac); silent until `monitor_on`.
+    _out_stream: Option<cpal::Stream>,
+    monitor_on: Arc<AtomicBool>,
 }
 
 impl Broadcaster {
@@ -81,6 +86,12 @@ impl Broadcaster {
         );
 
         let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(sr as usize * 2); // ~1 s stereo
+        // Local monitor: a second ring fed only while listening, drained by an output
+        // stream on the Mac's speakers/headphones — so you HEAR the source (e.g. REAPER
+        // via BlackHole) that's otherwise going only to the phone.
+        let (mut mon_prod, mut mon_cons) = rtrb::RingBuffer::<f32>::new(sr as usize); // ~0.5 s stereo
+        let monitor_on = Arc::new(AtomicBool::new(false));
+        let cb_monitor = monitor_on.clone();
         let level = Arc::new(AtomicF32::new(0.0));
         let cb_level = level.clone();
         let pulse = Arc::new(AtomicBool::new(false));
@@ -121,6 +132,10 @@ impl Broadcaster {
                         peak = peak.max(l.abs()).max(r.abs());
                         let _ = prod.push(l); // drop on overflow — a live monitor can skip
                         let _ = prod.push(r);
+                        if cb_monitor.load(Ordering::Relaxed) {
+                            let _ = mon_prod.push(l); // → local speakers (only while listening)
+                            let _ = mon_prod.push(r);
+                        }
                     }
                     // Peak meter: fast attack, slow release.
                     let prev = cb_level.load(Ordering::Relaxed);
@@ -133,6 +148,35 @@ impl Broadcaster {
             .context("build_input_stream")?;
         stream.play().context("input stream play")?;
 
+        // Monitor output on the Mac's default output, at the source rate (no drift). It
+        // always drains the monitor ring (empty = silence when not listening). Best-effort
+        // — if the default output can't be opened, listening is simply unavailable.
+        let out_stream = pick_output("").ok().and_then(|od| {
+            let oc = best_output_config_at(&od, sr).ok()?;
+            let out_ch = oc.channels().max(1) as usize;
+            let ocfg: cpal::StreamConfig = oc.into();
+            let s = od
+                .build_output_stream(
+                    &ocfg,
+                    move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let mut i = 0;
+                        while i + out_ch <= out.len() {
+                            let l = mon_cons.pop().unwrap_or(0.0);
+                            let r = mon_cons.pop().unwrap_or(0.0);
+                            for c in 0..out_ch {
+                                out[i + c] = if c % 2 == 0 { l } else { r };
+                            }
+                            i += out_ch;
+                        }
+                    },
+                    |e| eprintln!("monitor output error: {e}"),
+                    None,
+                )
+                .ok()?;
+            s.play().ok()?;
+            Some(s)
+        });
+
         let running = Arc::new(AtomicBool::new(true));
         let (tap_tx, tap_rx) = sync_channel::<Vec<u8>>(64); // bounded — drop on backpressure
         let tap_on = Arc::new(AtomicBool::new(false));
@@ -144,7 +188,19 @@ impl Broadcaster {
                 .spawn(move || sender_loop(cons, sr, to, running, Some((tap_tx, tap_on))))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent, tap_rx, tap_on })
+        Ok(Broadcaster {
+            _stream: stream,
+            _out_stream: out_stream,
+            running,
+            sender,
+            sr,
+            level,
+            pulse,
+            silent,
+            tap_rx,
+            tap_on,
+            monitor_on,
+        })
     }
 
     /// Drain the audio packets captured since the last call — for forwarding over the
@@ -156,6 +212,15 @@ impl Broadcaster {
     /// Enable/disable the Multipeer tap (set true while Direct transport is selected).
     pub fn set_tap(&self, on: bool) {
         self.tap_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Listen to the broadcast source on the Mac's own output (speakers/headphones) —
+    /// for when the source (e.g. REAPER → BlackHole) is otherwise inaudible locally.
+    pub fn set_monitor(&self, on: bool) {
+        self.monitor_on.store(on, Ordering::Relaxed);
+    }
+    pub fn monitoring(&self) -> bool {
+        self.monitor_on.load(Ordering::Relaxed)
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
