@@ -110,6 +110,8 @@ struct Beam {
     transport_direct: bool,
     mp_tx_audio: u64, // audio packets forwarded over the link (Direct diagnostics)
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
+    broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
+    broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -183,6 +185,8 @@ impl Beam {
             transport_direct: false,
             mp_tx_audio: 0,
             source_listen: false,
+            broadcast_autostart: false,
+            broadcast_device: String::new(),
         }
     }
 
@@ -659,6 +663,7 @@ impl Beam {
             Some(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
                 Ok(b) => {
                     self.broadcaster = Some(b);
+                    self.broadcast_device = self.sel_device.clone();
                     self.status = format!("streaming → {addr}");
                     if let Some(name) =
                         self.peers.iter().find(|p| p.addr == addr).map(|p| p.name.clone())
@@ -698,6 +703,25 @@ impl eframe::App for Beam {
         self.update_level_monitor();
         // Keep the mic check (level + headphone monitor) alive on its device.
         self.update_mic_monitor();
+
+        // Auto-start the broadcast once on launch (so you don't forget to hit ▶), as
+        // soon as a source device + a target (phone IP or the Direct link) are ready.
+        // A manual stop then sticks — we don't re-arm.
+        if !self.broadcast_autostart
+            && !self.on()
+            && !self.sel_device.is_empty()
+            && (self.phone().is_some() || self.transport_direct)
+        {
+            self.start();
+            if self.on() {
+                self.broadcast_autostart = true;
+            }
+        }
+        // Source device switched mid-broadcast → rebuild the broadcaster on the new one
+        // (otherwise it keeps capturing the old device — the "nothing happens" gotcha).
+        if self.on() && self.broadcast_device != self.sel_device {
+            self.start();
+        }
 
         // Multicam director hotkeys: 1/2/3/4 → 0.5× / 1× / tele / front, live on the
         // phone. Skipped while a text field (e.g. the phone-IP box) has focus.
