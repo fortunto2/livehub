@@ -36,7 +36,6 @@ impl Multipeer {
     pub fn connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    #[allow(dead_code)] // kept for debugging the link state
     pub fn status(&self) -> String {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -53,7 +52,9 @@ impl Multipeer {
         {
             Ok(c) => c,
             Err(e) => {
-                *self.status.lock().unwrap() = format!("bridge failed: {e}");
+                if let Ok(mut s) = self.status.lock() {
+                    *s = format!("bridge failed: {e}");
+                }
                 return;
             }
         };

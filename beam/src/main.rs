@@ -394,6 +394,11 @@ impl Beam {
     /// discovery and redirect a live broadcast — no manual 🔄. Preview/control/heartbeat
     /// all read `phone_addr` live, so they self-heal once it's updated.
     fn link_watchdog(&mut self) {
+        // In Direct mode there's no WiFi peer to re-resolve; the bridge re-invites on
+        // its own. Don't let a stale WiFi peer churn the broadcaster onto the wrong path.
+        if self.transport_direct {
+            return;
+        }
         let Some(age) = self.link_age() else { return };
         if age < Duration::from_millis(2500) {
             return; // link healthy
@@ -736,6 +741,9 @@ impl eframe::App for Beam {
         }
         // Direct transport: forward captured audio packets over the Multipeer link
         // (the field path when UDP/Bonjour can't reach the phone). WiFi mode skips this.
+        if let Some(b) = &self.broadcaster {
+            b.set_tap(self.transport_direct); // clone+forward packets only in Direct
+        }
         if self.transport_direct && self.multipeer.connected() {
             let pkts = self.broadcaster.as_ref().map(|b| b.drain_packets()).unwrap_or_default();
             for p in pkts {

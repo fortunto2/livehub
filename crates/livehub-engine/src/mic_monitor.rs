@@ -14,7 +14,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::device::{best_input_config, best_output_config, pick_input, pick_output};
+use crate::device::{best_input_config, best_output_config_at, pick_input, pick_output};
 
 pub struct MicMonitor {
     _in: cpal::Stream,
@@ -30,6 +30,7 @@ impl MicMonitor {
         let in_dev = pick_input(mic_hint)?;
         let in_cfg = best_input_config(&in_dev)?;
         let in_channels = in_cfg.channels().max(1) as usize;
+        let in_sr = in_cfg.sample_rate().0; // open the output at THIS rate → no clock drift
         let in_stream_cfg: cpal::StreamConfig = in_cfg.into();
 
         // Wait-free mic→speaker ring (mono); ~0.2 s at 48k absorbs callback jitter.
@@ -65,7 +66,7 @@ impl MicMonitor {
             .context("build_input_stream (mic monitor)")?;
 
         let out_dev = pick_output("")?; // system default output (your headphones)
-        let out_cfg = best_output_config(&out_dev)?;
+        let out_cfg = best_output_config_at(&out_dev, in_sr)?; // match the mic rate → no drift
         let out_channels = out_cfg.channels().max(1) as usize;
         let out_stream_cfg: cpal::StreamConfig = out_cfg.into();
         let cb_listen = listen.clone();

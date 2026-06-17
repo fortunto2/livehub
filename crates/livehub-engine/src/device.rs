@@ -99,10 +99,20 @@ fn name_matches(d: &cpal::Device, hint_lc: &str) -> bool {
 
 /// The F32 output config with the most channels, at 48 kHz when available.
 pub(crate) fn best_output_config(dev: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
+    best_output_config_at(dev, PREFERRED_SR)
+}
+
+/// Like [`best_output_config`] but targeting a specific sample rate (falls back to the
+/// device's max if it can't run at `target_sr`) — used to match a monitor output to its
+/// input rate so the two clocks don't drift.
+pub(crate) fn best_output_config_at(
+    dev: &cpal::Device,
+    target_sr: u32,
+) -> Result<cpal::SupportedStreamConfig> {
     best_config(
         dev.supported_output_configs()
             .context("supported_output_configs")?,
-        PREFERRED_SR,
+        target_sr,
     )
 }
 

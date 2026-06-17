@@ -55,6 +55,8 @@ pub struct Broadcaster {
     /// Each outgoing audio packet, mirrored here so beam can also forward it over the
     /// Multipeer (AWDL) link when WiFi/UDP can't reach the phone (the field case).
     tap_rx: Receiver<Vec<u8>>,
+    /// Gate for the tap — only clone+forward packets when Direct transport is on.
+    tap_on: Arc<AtomicBool>,
 }
 
 impl Broadcaster {
@@ -133,20 +135,27 @@ impl Broadcaster {
 
         let running = Arc::new(AtomicBool::new(true));
         let (tap_tx, tap_rx) = sync_channel::<Vec<u8>>(64); // bounded — drop on backpressure
+        let tap_on = Arc::new(AtomicBool::new(false));
         let sender = {
             let running = running.clone();
+            let tap_on = tap_on.clone();
             std::thread::Builder::new()
                 .name("broadcast-sender".into())
-                .spawn(move || sender_loop(cons, sr, to, running, Some(tap_tx)))
+                .spawn(move || sender_loop(cons, sr, to, running, Some((tap_tx, tap_on))))
                 .ok()
         };
-        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent, tap_rx })
+        Ok(Broadcaster { _stream: stream, running, sender, sr, level, pulse, silent, tap_rx, tap_on })
     }
 
     /// Drain the audio packets captured since the last call — for forwarding over the
     /// Multipeer link (Direct transport). Beam ignores it in WiFi mode.
     pub fn drain_packets(&self) -> Vec<Vec<u8>> {
         self.tap_rx.try_iter().collect()
+    }
+
+    /// Enable/disable the Multipeer tap (set true while Direct transport is selected).
+    pub fn set_tap(&self, on: bool) {
+        self.tap_on.store(on, Ordering::Relaxed);
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -234,7 +243,8 @@ fn pump(
     sr: u32,
     alive: Arc<AtomicBool>,
     mut dest: impl FnMut() -> Option<SocketAddr>,
-    tap: Option<SyncSender<Vec<u8>>>, // also forward each packet here (for the Multipeer link)
+    // forward each packet here when the gate is on (for the Multipeer link)
+    tap: Option<(SyncSender<Vec<u8>>, Arc<AtomicBool>)>,
 ) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -265,8 +275,12 @@ fn pump(
             if filled == FRAMES_PER_PACKET * 2 {
                 packet[4..12].copy_from_slice(&seq.to_le_bytes());
                 let _ = sock.send_to(&packet, addr);
-                if let Some(t) = &tap {
-                    let _ = t.try_send(packet.clone()); // drop on full — audio may skip
+                // Only clone+forward to the Multipeer tap when Direct transport wants it
+                // (else WiFi mode would clone every packet for a channel nobody drains).
+                if let Some((t, on)) = &tap {
+                    if on.load(Ordering::Relaxed) {
+                        let _ = t.try_send(packet.clone()); // drop on full — audio may skip
+                    }
                 }
                 seq = seq.wrapping_add(1);
                 filled = 0;
@@ -285,7 +299,7 @@ fn sender_loop(
     sr: u32,
     to: SocketAddr,
     running: Arc<AtomicBool>,
-    tap: Option<SyncSender<Vec<u8>>>,
+    tap: Option<(SyncSender<Vec<u8>>, Arc<AtomicBool>)>,
 ) {
     pump(cons, sr, running, move || Some(to), tap);
 }

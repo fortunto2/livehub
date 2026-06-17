@@ -32,6 +32,16 @@ final class Bridge: NSObject, MCSessionDelegate, MCNearbyServiceBrowserDelegate 
         browser.delegate = self
         browser.startBrowsingForPeers()
         note("browsing for reelcam…")
+        // Auto-recovery: while NOT connected, restart browsing every few seconds so a
+        // dropped link re-discovers + re-invites the (still-advertising) phone on its
+        // own — no manual Direct off/on. (Runs on the main RunLoop, kept alive below.)
+        Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+            guard let self, mcSession.connectedPeers.isEmpty else { return }
+            note("re-browsing…")
+            browser.stopBrowsingForPeers()
+            browser.startBrowsingForPeers()
+            if let p = lastPeer { invite(p) }
+        }
     }
 
     private func invite(_ peerID: MCPeerID) {
