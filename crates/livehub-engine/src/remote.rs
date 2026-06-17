@@ -22,6 +22,7 @@ pub const CMD_REC_STOP: u8 = 2;
 pub const CMD_REC_TOGGLE: u8 = 3;
 pub const CMD_PREVIEW_START: u8 = 4;
 pub const CMD_PREVIEW_STOP: u8 = 5;
+pub const CMD_PREVIEW_QUALITY: u8 = 6; // value = level 0=Low 1=Med 2=High (res + JPEG q)
 
 // Camera params (Mac → phone). Value is normalized 0..1 (toggles: 0.0 / 1.0); the
 // phone maps it onto its own device ranges (ISO/shutter/EV/lens), so beam needs no

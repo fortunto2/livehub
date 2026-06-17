@@ -17,8 +17,8 @@ use livehub_engine::{
     input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor,
     MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
-    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_START,
-    CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
+    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_QUALITY,
+    CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -55,6 +55,9 @@ struct Beam {
     preview_tex: Option<egui::TextureHandle>,
     preview_seq: u32, // last frame seq we uploaded → detect new frames
     preview_autostarted: bool, // auto-on once a phone appears; a manual stop sticks
+    preview_q_mode: u8, // 0=Low 1=Med 2=High 3=Auto (UI selection)
+    preview_q_auto: u8, // the Auto-adjusted effective level (0..2)
+    preview_q_adjust_at: Instant, // cooldown between Auto steps
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
     control: Option<RemoteControl>, // persistent control socket (stable port)
     // A/V-sync test: periodically flash the window + click the audio together.
@@ -135,6 +138,9 @@ impl Beam {
             preview_tex: None,
             preview_seq: 0,
             preview_autostarted: false,
+            preview_q_mode: 3, // Auto by default
+            preview_q_auto: 1, // start at Med
+            preview_q_adjust_at: Instant::now(),
             last_heartbeat: Instant::now(),
             control: RemoteControl::new().ok(),
             sync_test: false,
@@ -329,6 +335,37 @@ impl Beam {
         } else {
             self.cam_front = false; // reelcam forces rear when selecting a lens
             self.cam(CAM_LENS_SELECT, slot as f32);
+        }
+    }
+
+    /// Effective preview quality level (0..2): the Auto-adjusted value in Auto mode,
+    /// else the manual selection.
+    fn effective_preview_q(&self) -> u8 {
+        if self.preview_q_mode == 3 {
+            self.preview_q_auto
+        } else {
+            self.preview_q_mode.min(2)
+        }
+    }
+
+    /// Auto quality: nudge the level by the arriving preview fps (a network-health
+    /// proxy). Drops on congestion, raises slowly when healthy — hysteresis + cooldown
+    /// keep it from oscillating.
+    fn adapt_preview_quality(&mut self) {
+        if self.preview_q_mode != 3 || self.preview.is_none() {
+            return;
+        }
+        if self.last_preview_at.elapsed() > Duration::from_millis(1500)
+            || self.preview_q_adjust_at.elapsed() < Duration::from_secs(3)
+        {
+            return; // stale frames or still in cooldown
+        }
+        if self.preview_fps < 7.0 && self.preview_q_auto > 0 {
+            self.preview_q_auto -= 1;
+            self.preview_q_adjust_at = Instant::now();
+        } else if self.preview_fps > 14.0 && self.preview_q_auto < 2 {
+            self.preview_q_auto += 1;
+            self.preview_q_adjust_at = Instant::now();
         }
     }
 
@@ -660,8 +697,15 @@ impl eframe::App for Beam {
             let port = self.preview.as_ref().map(|r| r.port());
             if let (Some(addr), Some(port)) = (self.phone(), port) {
                 self.ctl(addr, CMD_PREVIEW_START, port);
+                // Re-assert the preview quality (survives a phone-side preview restart,
+                // which resets it to the default).
+                self.ctl(addr, CMD_PREVIEW_QUALITY, self.effective_preview_q() as u16);
             }
         }
+
+        // Auto quality: in Auto mode, nudge the level by the arriving preview fps —
+        // network health proxy. Drop fast on congestion, raise slowly when healthy.
+        self.adapt_preview_quality();
 
         // A/V-sync pulse: every ~1.5 s flash the window AND click the audio at the
         // same instant. Film this window + record the audio, then analyse the clip:
@@ -877,6 +921,28 @@ impl eframe::App for Beam {
                         .clicked()
                     {
                         self.toggle_preview();
+                    }
+                    // Preview quality — Low/Med/High, or Auto (drops under network load).
+                    if self.preview.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("Quality:");
+                            for (i, name) in ["Low", "Med", "High", "Auto"].iter().enumerate() {
+                                if ui
+                                    .selectable_label(self.preview_q_mode == i as u8, *name)
+                                    .clicked()
+                                {
+                                    self.preview_q_mode = i as u8;
+                                    if let Some(addr) = self.phone() {
+                                        let q = self.effective_preview_q();
+                                        self.ctl(addr, CMD_PREVIEW_QUALITY, q as u16);
+                                    }
+                                }
+                            }
+                        });
+                        if self.preview_q_mode == 3 {
+                            let lvl = ["Low", "Med", "High"][self.preview_q_auto.min(2) as usize];
+                            ui.weak(format!("auto → {lvl} · {:.0} fps", self.preview_fps));
+                        }
                     }
 
                     // Remote gallery — browse + pull recorded clips over WiFi.
