@@ -24,6 +24,7 @@ func note(_ s: String) {
 final class Bridge: NSObject, MCSessionDelegate, MCNearbyServiceBrowserDelegate {
     let browser = MCNearbyServiceBrowser(peer: myPeer, serviceType: serviceType)
     let outLock = NSLock()
+    var lastPeer: MCPeerID? // for re-inviting if a connect attempt stalls/drops
 
     override init() {
         super.init()
@@ -33,11 +34,18 @@ final class Bridge: NSObject, MCSessionDelegate, MCNearbyServiceBrowserDelegate 
         note("browsing for reelcam…")
     }
 
+    private func invite(_ peerID: MCPeerID) {
+        // Short timeout so a stalled connect retries fast (e.g. while Local Network
+        // permission is still being granted), instead of hanging ~20 s.
+        browser.invitePeer(peerID, to: mcSession, withContext: mpToken.data(using: .utf8), timeout: 10)
+    }
+
     // Browser: invite any reelcam peer we find.
     func browser(_ b: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID,
                  withDiscoveryInfo info: [String: String]?) {
+        lastPeer = peerID
         note("found \(peerID.displayName)")
-        b.invitePeer(peerID, to: mcSession, withContext: mpToken.data(using: .utf8), timeout: 20)
+        invite(peerID)
     }
     func browser(_ b: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         note("lost \(peerID.displayName)")
@@ -50,6 +58,15 @@ final class Bridge: NSObject, MCSessionDelegate, MCNearbyServiceBrowserDelegate 
     func session(_ s: MCSession, peer: MCPeerID, didChange state: MCSessionState) {
         let st = state == .connected ? "connected" : (state == .connecting ? "connecting" : "notconnected")
         note("state \(peer.displayName) \(st)")
+        // A stalled/dropped connect (often while the Local Network grant settles) →
+        // retry shortly so it recovers without a manual restart.
+        if state == .notConnected, let p = lastPeer {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, mcSession.connectedPeers.isEmpty else { return }
+                note("retry invite \(p.displayName)")
+                self.invite(p)
+            }
+        }
     }
 
     // Data from the phone → stdout (framed).
