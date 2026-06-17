@@ -1100,6 +1100,12 @@ impl eframe::App for Beam {
                             self.preview_fps,
                             if self.on() { "" } else { " · (hit ▶ broadcast for audio)" },
                         ));
+                        // The bridge's last line — tells us WHERE the link is stuck
+                        // (browsing / found / connecting / a browse/permission error).
+                        let st = self.multipeer.status();
+                        if !st.is_empty() {
+                            ui.weak(format!("bridge: {st}"));
+                        }
                     }
 
                     ui.add_space(8.0);

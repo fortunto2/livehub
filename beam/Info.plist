@@ -14,5 +14,11 @@
 	<key>LSApplicationCategoryType</key><string>public.app-category.music</string>
 	<key>NSMicrophoneUsageDescription</key><string>beam captures an input device (e.g. BlackHole carrying REAPER) to stream to your phone.</string>
 	<key>NSLocalNetworkUsageDescription</key><string>beam finds your phone (reelcam) and streams audio to it over the local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_reelcam-mp._tcp</string>
+		<string>_reelcam-mp._udp</string>
+		<string>_reelcam._udp</string>
+	</array>
 </dict>
 </plist>
