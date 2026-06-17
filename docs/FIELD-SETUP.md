@@ -49,6 +49,17 @@ The link is **on by default** on both ends and keeps awdl0 alive. Only turn it o
 "Direct link" toggle in Reelcam, or "stop" in beam) to save battery when on real WiFi.
 The accept is **token-gated** (`rcm-mp-7f3a`) so only your beam can pair.
 
+### Direct transport — audio + preview ride the link itself ✅
+The Bonjour-over-AWDL ride (audio/preview as UDP that finds awdl0) proved flaky in the
+real field — the link connects but UDP never establishes. So beam has a **Transport
+selector: WiFi / Direct**. In **Direct**, audio + preview + camera control are routed
+**through the Multipeer data channel directly** (no UDP, no discovery, no IP needed):
+1. Both apps on, the direct link green.
+2. In beam set **Transport → Direct**.
+3. Hit **▶ broadcast** (audio rides the link), preview comes up over the link too.
+WiFi mode is unchanged — use it when there's a real network. Audio goes unreliable
+(like UDP, never blocks); control is reliable.
+
 The `mp-bridge` + MCSession data channel (the Rust↔Swift bridge) is the explicit
 fallback if the Bonjour-over-AWDL routing ever proves flaky — then audio/gallery get
 tunnelled through Multipeer frames directly.
