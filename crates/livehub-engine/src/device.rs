@@ -72,8 +72,12 @@ fn itertools_max<I: Iterator<Item = cpal::SupportedStreamConfigRange>>(it: I) ->
 pub(crate) fn pick_output(hint: &str) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let hint_lc = hint.to_lowercase();
-    if let Some(d) = host.output_devices()?.find(|d| name_matches(d, &hint_lc)) {
-        return Ok(d);
+    // An EMPTY hint means "system default" — don't `find`, since `contains("")` matches
+    // EVERY device (it would grab the first one, often BlackHole, not the speakers).
+    if !hint_lc.is_empty() {
+        if let Some(d) = host.output_devices()?.find(|d| name_matches(d, &hint_lc)) {
+            return Ok(d);
+        }
     }
     host.default_output_device()
         .context("no matching output device and no system default")
@@ -84,8 +88,10 @@ pub(crate) fn pick_output(hint: &str) -> Result<cpal::Device> {
 pub(crate) fn pick_input(hint: &str) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let hint_lc = hint.to_lowercase();
-    if let Some(d) = host.input_devices()?.find(|d| name_matches(d, &hint_lc)) {
-        return Ok(d);
+    if !hint_lc.is_empty() {
+        if let Some(d) = host.input_devices()?.find(|d| name_matches(d, &hint_lc)) {
+            return Ok(d);
+        }
     }
     host.default_input_device()
         .context("no matching input device and no system default")
