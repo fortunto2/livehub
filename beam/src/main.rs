@@ -108,6 +108,7 @@ struct Beam {
     // Transport: WiFi (UDP/Bonjour, the default) or Direct (route audio/preview/control
     // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
     transport_direct: bool,
+    mp_tx_audio: u64, // audio packets forwarded over the link (Direct diagnostics)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -179,6 +180,7 @@ impl Beam {
             mp_last_recv: String::new(),
             mp_started: false,
             transport_direct: false,
+            mp_tx_audio: 0,
         }
     }
 
@@ -738,6 +740,7 @@ impl eframe::App for Beam {
             let pkts = self.broadcaster.as_ref().map(|b| b.drain_packets()).unwrap_or_default();
             for p in pkts {
                 self.multipeer.send(p, false); // unreliable — audio may skip, never block
+                self.mp_tx_audio += 1;
             }
         }
 
@@ -1078,12 +1081,25 @@ impl eframe::App for Beam {
                         ui.selectable_value(&mut self.transport_direct, true, "Direct");
                     });
                     if self.transport_direct {
-                        let col = if self.multipeer.connected() {
+                        let conn = self.multipeer.connected();
+                        let col = if conn {
                             egui::Color32::from_rgb(90, 220, 130)
                         } else {
-                            egui::Color32::from_rgb(220, 200, 90)
+                            egui::Color32::from_rgb(230, 70, 70)
                         };
-                        ui.colored_label(col, "audio + preview ride the AWDL link (no WiFi needed)");
+                        // Live diagnostics — so a field "no signal" tells us WHERE it breaks:
+                        // link must be connected, tx must climb (audio forwarded), preview
+                        // fps must move (frames coming back).
+                        ui.colored_label(
+                            col,
+                            if conn { "link: connected" } else { "link: NOT connected — can't route" },
+                        );
+                        ui.weak(format!(
+                            "tx {} audio pkts · preview {:.0} fps{}",
+                            self.mp_tx_audio,
+                            self.preview_fps,
+                            if self.on() { "" } else { " · (hit ▶ broadcast for audio)" },
+                        ));
                     }
 
                     ui.add_space(8.0);
