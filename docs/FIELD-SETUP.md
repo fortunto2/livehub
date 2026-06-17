@@ -49,6 +49,18 @@ The link is **on by default** on both ends and keeps awdl0 alive. Only turn it o
 "Direct link" toggle in Reelcam, or "stop" in beam) to save battery when on real WiFi.
 The accept is **token-gated** (`rcm-mp-7f3a`) so only your beam can pair.
 
+### ⚠️ The WiFi RADIO must stay ON (both Mac + phone) — but NO network needed
+AWDL lives on the WiFi radio. **Turn the WiFi radio OFF and the link dies** (`found →
+connecting → lost`). "No WiFi in the field" means **no router/network/internet**, NOT
+"radio off": keep the WiFi radio **on** (you can even be joined to a network — AWDL runs
+alongside) and AWDL brings up the direct Mac↔phone link with no router. Leaving/having
+no network is fine; powering the radio off is not.
+
+On macOS the link also needs **Local Network permission** for beam (System Settings →
+Privacy & Security → Local Network → beam ON) and `NSBonjourServices` declared in
+beam.app's Info.plist (already shipped) — without the service declaration the MC browser
+silently finds nothing.
+
 ### Direct transport — audio + preview ride the link itself ✅
 The Bonjour-over-AWDL ride (audio/preview as UDP that finds awdl0) proved flaky in the
 real field — the link connects but UDP never establishes. So beam has a **Transport
