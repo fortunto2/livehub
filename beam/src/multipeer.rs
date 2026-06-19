@@ -40,6 +40,13 @@ impl Multipeer {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
+    /// A clone of the channel to the bridge — for a dedicated audio-forward thread that
+    /// streams packets smoothly (off the UI loop, which batched them into ~10 Hz bursts
+    /// → crackle). Frames must be `[reliable u8][data]`, same as `send()`.
+    pub fn sender(&self) -> Option<Sender<Vec<u8>>> {
+        self.stdin_tx.clone()
+    }
+
     pub fn start(&mut self) {
         if self.child.is_some() {
             return;

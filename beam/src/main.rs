@@ -11,6 +11,8 @@ mod gallery;
 mod multipeer;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
@@ -108,7 +110,7 @@ struct Beam {
     // Transport: WiFi (UDP/Bonjour, the default) or Direct (route audio/preview/control
     // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
     transport_direct: bool,
-    mp_tx_audio: u64, // audio packets forwarded over the link (Direct diagnostics)
+    mp_tx_audio: Arc<AtomicU64>, // audio packets forwarded over the link (incremented on the forward thread)
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
     broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
@@ -183,7 +185,7 @@ impl Beam {
             mp_last_recv: String::new(),
             mp_started: false,
             transport_direct: false,
-            mp_tx_audio: 0,
+            mp_tx_audio: Arc::new(AtomicU64::new(0)),
             source_listen: false,
             broadcast_autostart: false,
             broadcast_device: String::new(),
@@ -661,7 +663,27 @@ impl Beam {
             .or_else(|| self.transport_direct.then(|| "127.0.0.1:9000".parse().unwrap()));
         match addr {
             Some(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
-                Ok(b) => {
+                Ok(mut b) => {
+                    // Stream the broadcaster's audio packets over the Multipeer link on a
+                    // DEDICATED thread (smooth, like the UDP path) — not the UI loop. The
+                    // thread ends when the broadcaster drops (tap sender closes).
+                    if let (Some(rx), Some(tx)) = (b.take_tap(), self.multipeer.sender()) {
+                        let counter = self.mp_tx_audio.clone();
+                        std::thread::Builder::new()
+                            .name("mp-audio-forward".into())
+                            .spawn(move || {
+                                while let Ok(pkt) = rx.recv() {
+                                    let mut frame = Vec::with_capacity(1 + pkt.len());
+                                    frame.push(0u8); // unreliable, like UDP
+                                    frame.extend_from_slice(&pkt);
+                                    if tx.send(frame).is_err() {
+                                        break; // bridge gone
+                                    }
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                            })
+                            .ok();
+                    }
                     self.broadcaster = Some(b);
                     self.broadcast_device = self.sel_device.clone();
                     self.status = format!("streaming → {addr}");
@@ -774,18 +796,14 @@ impl eframe::App for Beam {
                 self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
             }
         }
-        // Direct transport: forward captured audio packets over the Multipeer link
-        // (the field path when UDP/Bonjour can't reach the phone). WiFi mode skips this.
+        // Direct transport: the broadcaster only FILLS its tap in Direct mode; a
+        // dedicated thread (spawned in start()) streams those packets over the link
+        // smoothly. (No UI-loop draining — that batched audio into ~10 Hz bursts.)
         if let Some(b) = &self.broadcaster {
-            b.set_tap(self.transport_direct); // clone+forward packets only in Direct
+            // Fill the tap only with a live link to forward to (else packets pile up
+            // for a bridge that drops them anyway).
+            b.set_tap(self.transport_direct && self.multipeer.connected());
             b.set_monitor(self.source_listen); // local speaker monitor of the source
-        }
-        if self.transport_direct && self.multipeer.connected() {
-            let pkts = self.broadcaster.as_ref().map(|b| b.drain_packets()).unwrap_or_default();
-            for p in pkts {
-                self.multipeer.send(p, false); // unreliable — audio may skip, never block
-                self.mp_tx_audio += 1;
-            }
         }
 
         // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
@@ -1157,7 +1175,7 @@ impl eframe::App for Beam {
                         );
                         ui.weak(format!(
                             "tx {} audio pkts · preview {:.0} fps{}",
-                            self.mp_tx_audio,
+                            self.mp_tx_audio.load(Ordering::Relaxed),
                             self.preview_fps,
                             if self.on() { "" } else { " · (hit ▶ broadcast for audio)" },
                         ));

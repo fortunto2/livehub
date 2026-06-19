@@ -54,9 +54,10 @@ pub struct Broadcaster {
     /// SILENCE) so the only transient is the click — otherwise music/voice on the
     /// source pollutes click detection and ruins the measurement.
     silent: Arc<AtomicBool>,
-    /// Each outgoing audio packet, mirrored here so beam can also forward it over the
-    /// Multipeer (AWDL) link when WiFi/UDP can't reach the phone (the field case).
-    tap_rx: Receiver<Vec<u8>>,
+    /// Each outgoing audio packet, mirrored here so beam can forward it over the
+    /// Multipeer (AWDL) link (Direct). Taken out once by a dedicated forward thread so
+    /// packets stream smoothly (the UI loop batched them into bursts → crackle).
+    tap_rx: Option<Receiver<Vec<u8>>>,
     /// Gate for the tap — only clone+forward packets when Direct transport is on.
     tap_on: Arc<AtomicBool>,
     /// Local-monitor output (hear the source on the Mac); silent until `monitor_on`.
@@ -197,16 +198,17 @@ impl Broadcaster {
             level,
             pulse,
             silent,
-            tap_rx,
+            tap_rx: Some(tap_rx),
             tap_on,
             monitor_on,
         })
     }
 
-    /// Drain the audio packets captured since the last call — for forwarding over the
-    /// Multipeer link (Direct transport). Beam ignores it in WiFi mode.
-    pub fn drain_packets(&self) -> Vec<Vec<u8>> {
-        self.tap_rx.try_iter().collect()
+    /// Take the audio-packet receiver (once) — beam drains it on a dedicated thread and
+    /// streams each packet over the Multipeer link as it's produced (smooth, like the
+    /// UDP path). Gated by `set_tap` (the broadcaster only fills it in Direct mode).
+    pub fn take_tap(&mut self) -> Option<Receiver<Vec<u8>>> {
+        self.tap_rx.take()
     }
 
     /// Enable/disable the Multipeer tap (set true while Direct transport is selected).
