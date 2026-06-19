@@ -193,7 +193,7 @@ fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<Vec<u8>> {
     let head = std::str::from_utf8(&buf[..sep]).unwrap_or("");
     if !head.starts_with("HTTP/1.1 200") {
         let code = head.lines().next().unwrap_or("HTTP error");
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, code.to_string()));
+        return Err(std::io::Error::other(code.to_string()));
     }
     Ok(buf[sep + 4..].to_vec())
 }

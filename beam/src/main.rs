@@ -666,23 +666,26 @@ impl Beam {
                 Ok(mut b) => {
                     // Stream the broadcaster's audio packets over the Multipeer link on a
                     // DEDICATED thread (smooth, like the UDP path) — not the UI loop. The
-                    // thread ends when the broadcaster drops (tap sender closes).
-                    if let (Some(rx), Some(tx)) = (b.take_tap(), self.multipeer.sender()) {
-                        let counter = self.mp_tx_audio.clone();
-                        std::thread::Builder::new()
-                            .name("mp-audio-forward".into())
-                            .spawn(move || {
-                                while let Ok(pkt) = rx.recv() {
-                                    let mut frame = Vec::with_capacity(1 + pkt.len());
-                                    frame.push(0u8); // unreliable, like UDP
-                                    frame.extend_from_slice(&pkt);
-                                    if tx.send(frame).is_err() {
-                                        break; // bridge gone
+                    // thread ends when the broadcaster drops (tap sender closes). Only take
+                    // the tap if the bridge is up (else the receiver would be lost for good).
+                    if let Some(tx) = self.multipeer.sender() {
+                        if let Some(rx) = b.take_tap() {
+                            let counter = self.mp_tx_audio.clone();
+                            std::thread::Builder::new()
+                                .name("mp-audio-forward".into())
+                                .spawn(move || {
+                                    while let Ok(pkt) = rx.recv() {
+                                        let mut frame = Vec::with_capacity(1 + pkt.len());
+                                        frame.push(0u8); // unreliable, like UDP
+                                        frame.extend_from_slice(&pkt);
+                                        if tx.send(frame).is_err() {
+                                            break; // bridge gone
+                                        }
+                                        counter.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
-                            })
-                            .ok();
+                                })
+                                .ok();
+                        }
                     }
                     self.broadcaster = Some(b);
                     self.broadcast_device = self.sel_device.clone();
@@ -1286,10 +1289,12 @@ impl eframe::App for Beam {
             16
         } else if self.preview.is_some() {
             66 // ~15 fps preview refresh → show the freshest frame sooner
-        } else if self.on() || self.level_monitor.is_some() || self.mic_monitor.is_some() {
-            100 // ~10 fps so the audio level meter moves (incl. pre-broadcast + mic)
-        } else if self.gallery.open && self.gallery.busy {
-            100 // drain gallery downloads/thumbs + animate the spinner
+        } else if self.on()
+            || self.level_monitor.is_some()
+            || self.mic_monitor.is_some()
+            || (self.gallery.open && self.gallery.busy)
+        {
+            100 // ~10 fps: audio level meter (incl. pre-broadcast + mic) / gallery spinner
         } else if self.multipeer.running() {
             150 // drain multipeer frames + refresh link status
         } else {
