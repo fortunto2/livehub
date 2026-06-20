@@ -137,8 +137,20 @@ impl Multipeer {
     pub fn send(&self, data: Vec<u8>, reliable: bool) {
         if let Some(tx) = &self.stdin_tx {
             let mut frame = Vec::with_capacity(1 + data.len());
-            frame.push(reliable as u8);
+            frame.push(reliable as u8); // 0 = unreliable, 1 = reliable
             frame.extend_from_slice(&data);
+            let _ = tx.send(frame);
+        }
+    }
+
+    /// Send a local FILE to the phone (MCSession `sendResource`) — for delivering the
+    /// clean-audio .m4a for on-device merge. Frame byte 2 = resource; payload `path\tname`.
+    pub fn send_resource(&self, path: &str, name: &str) {
+        if let Some(tx) = &self.stdin_tx {
+            let payload = format!("{path}\t{name}");
+            let mut frame = Vec::with_capacity(1 + payload.len());
+            frame.push(2u8);
+            frame.extend_from_slice(payload.as_bytes());
             let _ = tx.send(frame);
         }
     }

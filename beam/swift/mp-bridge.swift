@@ -105,13 +105,29 @@ DispatchQueue.global(qos: .userInteractive).async {
         while buf.count >= 4 {
             let len = Int(buf[0]) | Int(buf[1]) << 8 | Int(buf[2]) << 16 | Int(buf[3]) << 24
             if buf.count < 4 + len || len < 1 { break }
-            // Frame = [u32 len][u8 reliable][data…]. Strip the reliability byte.
-            let reliable = buf[4] != 0
+            // Frame = [u32 len][u8 mode][payload]. mode: 0 unreliable, 1 reliable, 2 file.
+            let mode = buf[4]
             let payload = Data(buf[5 ..< (4 + len)])
             buf.removeFirst(4 + len)
-            if !mcSession.connectedPeers.isEmpty {
+            guard !mcSession.connectedPeers.isEmpty else { continue }
+            if mode == 2 {
+                // Resource: payload = "path\tname" → send the file to every peer.
+                if let s = String(data: payload, encoding: .utf8) {
+                    let parts = s.components(separatedBy: "\t")
+                    if parts.count == 2 {
+                        let url = URL(fileURLWithPath: parts[0])
+                        for peer in mcSession.connectedPeers {
+                            mcSession.sendResource(at: url, withName: parts[1], toPeer: peer,
+                                                   withCompletionHandler: { e in
+                                if let e = e { note("resource error: \(e.localizedDescription)") }
+                                else { note("resource sent \(parts[1])") }
+                            })
+                        }
+                    }
+                }
+            } else {
                 try? mcSession.send(payload, toPeers: mcSession.connectedPeers,
-                                    with: reliable ? .reliable : .unreliable)
+                                    with: mode != 0 ? .reliable : .unreliable)
             }
         }
     }

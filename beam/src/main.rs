@@ -116,7 +116,8 @@ struct Beam {
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
     broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
-    local_rec_file: Option<String>, // backup: clean WAV being recorded (synced to the take)
+    local_rec_file: Option<String>, // backup: clean audio file being/just recorded (synced to the take)
+    last_rec_path: Option<PathBuf>, // full path of the last backup take (to send to the phone)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -203,6 +204,7 @@ impl Beam {
             broadcast_autostart: false,
             broadcast_device: String::new(),
             local_rec_file: None,
+            last_rec_path: None,
         }
     }
 
@@ -508,8 +510,9 @@ impl Beam {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             if let Some(b) = &self.broadcaster {
                 b.pulse(); // sync CLICK at the start — landmark for post-merge alignment
-                b.record_start(path);
+                b.record_start(path.clone());
                 self.local_rec_file = Some(name);
+                self.last_rec_path = Some(path);
             }
         } else if let Some(b) = &self.broadcaster {
             b.record_stop();
@@ -1112,6 +1115,23 @@ impl eframe::App for Beam {
                         };
                     } else if let Some(f) = &self.local_rec_file {
                         ui.weak(format!("💾 saved clean audio: {f}"));
+                        // Send the clean audio to the phone → it merges onto the last clip
+                        // + exports to Photos (ready for Reels). Needs the link connected.
+                        let can_send = self.last_rec_path.is_some() && self.multipeer.connected();
+                        if ui
+                            .add_enabled(
+                                can_send,
+                                egui::Button::new("📤 send to phone + merge")
+                                    .min_size(egui::vec2(300.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            if let Some(p) = self.last_rec_path.clone() {
+                                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("audio.m4a");
+                                self.multipeer.send_resource(&p.to_string_lossy(), name);
+                                self.status = "sent audio → phone is merging…".into();
+                            }
+                        }
                     }
                     ui.add_space(4.0);
                     let prev = if self.preview.is_some() { "👁 preview: ON" } else { "👁 preview: off" };
