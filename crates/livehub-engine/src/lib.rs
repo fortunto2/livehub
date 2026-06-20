@@ -32,8 +32,9 @@ pub use remote::{
     camparam_packet, control_packet, send_control, PreviewReceiver, RemoteControl, CTRL_MAGIC,
     PREVIEW_MAGIC,
     CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
-    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_PREVIEW_QUALITY,
-    CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE,
+    CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS, CAM_SHUTTER, CMD_HEARTBEAT,
+    CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START, CMD_REC_STOP,
+    CMD_REC_TOGGLE,
 };
 pub use clap_fx::{list_superduper_clap, MasterFx, ParamInfo, ParamSet};
 pub use decoder::decode_track;

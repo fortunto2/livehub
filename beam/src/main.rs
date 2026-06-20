@@ -22,8 +22,8 @@ use livehub_engine::{
     MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
-    CAM_SHUTTER, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START,
-    CMD_REC_STOP, CMD_REC_TOGGLE, CTRL_MAGIC, PREVIEW_MAGIC,
+    CAM_SHUTTER, CMD_HEARTBEAT, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
+    CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE, CTRL_MAGIC, PREVIEW_MAGIC,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -66,6 +66,9 @@ struct Beam {
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
     control: Option<RemoteControl>, // persistent control socket (stable port)
     rec_sync: Option<std::net::UdpSocket>, // inbound: phone's record button → sync our backup
+    last_phone_alive: Option<Instant>, // last phone heartbeat (honest link health, both transports)
+    phone_rx: bool,       // the phone reports it's actually receiving our audio
+    last_hb_sent: Instant, // throttle our outbound heartbeat to the phone
     // A/V-sync test: periodically flash the window + click the audio together.
     sync_test: bool,
     last_pulse: Instant,
@@ -199,6 +202,9 @@ impl Beam {
                 }
                 s
             },
+            last_phone_alive: None,
+            phone_rx: false,
+            last_hb_sent: Instant::now(),
             sync_test: false,
             last_pulse: Instant::now(),
             flash: false,
@@ -595,6 +601,8 @@ impl Beam {
     /// loop-safe with the REC button's outbound toggle).
     fn poll_rec_sync(&mut self) {
         let mut want: Option<bool> = None;
+        let mut beat = false;
+        let mut rx = self.phone_rx;
         if let Some(sock) = &self.rec_sync {
             let mut buf = [0u8; 64];
             while let Ok((n, _)) = sock.recv_from(&mut buf) {
@@ -602,10 +610,19 @@ impl Beam {
                     match buf[4] {
                         CMD_REC_START => want = Some(true),
                         CMD_REC_STOP => want = Some(false),
+                        CMD_HEARTBEAT => {
+                            beat = true;
+                            // port field = 1 when the phone is actually receiving our audio.
+                            rx = n >= 7 && u16::from_le_bytes([buf[5], buf[6]]) == 1;
+                        }
                         _ => {}
                     }
                 }
             }
+        }
+        if beat {
+            self.last_phone_alive = Some(Instant::now());
+            self.phone_rx = rx;
         }
         if let Some(recording) = want {
             self.apply_local_rec(recording);
@@ -707,31 +724,43 @@ impl Beam {
         }
     }
 
+    /// Honest link status from the phone's heartbeat. Distinguishes the two failure modes
+    /// that looked identical before: phone UNREACHABLE (red) vs phone reachable but NOT
+    /// receiving our audio (amber — beam not broadcasting / wrong device-channel).
+    fn link_status_label(&self, ui: &mut egui::Ui) {
+        let green = egui::Color32::from_rgb(90, 220, 130);
+        let amber = egui::Color32::from_rgb(220, 200, 90);
+        let red = egui::Color32::from_rgb(230, 70, 70);
+        let fps = if self.preview.is_some() {
+            format!(" · {:.0} fps", self.preview_fps)
+        } else {
+            String::new()
+        };
+        match self.last_phone_alive.map(|t| t.elapsed()) {
+            Some(age) if age < Duration::from_millis(2500) => {
+                if self.phone_rx {
+                    ui.colored_label(green, format!("● phone · rx ✓{fps}"));
+                } else {
+                    ui.colored_label(amber, "◐ phone alive · NO audio (check Source/Channels)");
+                }
+            }
+            Some(_) => {
+                ui.colored_label(red, "○ phone link lost — recovering…");
+            }
+            None => {
+                ui.weak("○ waiting for phone…");
+            }
+        }
+    }
+
     /// Camera remote + histogram, drawn under the preview. Each control change sends
     /// a normalized cam-param to the phone; the phone maps it to its device ranges.
     fn camera_controls_ui(&mut self, ui: &mut egui::Ui) {
-        // #3 Link-health bar — the inbound preview rate doubles as link quality.
+        // #3 Link-health bar — driven by the phone's 1 Hz heartbeat (honest: it's about
+        // the phone being alive + actually RECEIVING our audio, NOT the preview back-channel
+        // — audio is one-way, so preview-off must not read as "no link").
         ui.horizontal(|ui| {
-            match self.link_age() {
-                Some(age) if age < Duration::from_millis(800) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(90, 220, 130),
-                        format!("● link · {:.0} fps", self.preview_fps),
-                    );
-                }
-                Some(age) if age < Duration::from_millis(2500) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 200, 90), "◐ link weak");
-                }
-                Some(_) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(230, 70, 70),
-                        "○ link lost — recovering…",
-                    );
-                }
-                None => {
-                    ui.weak(format!("📊 {:.0} fps (preview off)", self.preview_fps));
-                }
-            }
+            self.link_status_label(ui);
             self.draw_histogram(ui);
         });
         if self.reconnects > 0 {
@@ -1009,6 +1038,17 @@ impl eframe::App for Beam {
 
         // Phone's record button → keep our clean backup in sync.
         self.poll_rec_sync();
+        // Heartbeat to the phone every ~1 s: it learns beam's IP (for rec-sync + its own
+        // heartbeat back) even before audio flows, and the steady packet helps hold the
+        // phone's WiFi awake. The phone heartbeats back → honest link status (below).
+        if self.last_hb_sent.elapsed() >= Duration::from_millis(1000) {
+            self.last_hb_sent = Instant::now();
+            if let Some(addr) = self.phone() {
+                self.ctl(addr, CMD_HEARTBEAT, 0);
+            } else if self.effective_direct() && self.multipeer.connected() {
+                self.multipeer.send(control_packet(CMD_HEARTBEAT, 0).to_vec(), false);
+            }
+        }
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
         // Drain remote-gallery background results (list / thumbs / downloads).

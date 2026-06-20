@@ -23,6 +23,7 @@ pub const CMD_REC_TOGGLE: u8 = 3;
 pub const CMD_PREVIEW_START: u8 = 4;
 pub const CMD_PREVIEW_STOP: u8 = 5;
 pub const CMD_PREVIEW_QUALITY: u8 = 6; // value = level 0=Low 1=Med 2=High (res + JPEG q)
+pub const CMD_HEARTBEAT: u8 = 7; // both ways: liveness; phone→beam carries rx state in the port field
 
 // Camera params (Mac → phone). Value is normalized 0..1 (toggles: 0.0 / 1.0); the
 // phone maps it onto its own device ranges (ISO/shutter/EV/lens), so beam needs no
