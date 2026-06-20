@@ -18,13 +18,15 @@
 use anyhow::{Context, Result};
 use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, StreamTrait};
+use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use crate::wav::WavWriter;
-use std::sync::{Arc, Mutex};
 
 use crate::device::{
     best_input_config, best_input_config_at, best_output_config_at, pick_input, pick_output,
@@ -446,40 +448,96 @@ enum RecCmd {
     Quit,
 }
 
-/// Drains the broadcaster's record ring (interleaved-stereo f32) and writes 16-bit WAV
-/// files on Start/Stop. Lives for the broadcaster's lifetime; finalizes on Quit.
+/// Where recorded audio lands: AAC via an ffmpeg pipe (`.m4a` — directly mergeable onto
+/// the phone's H.264/HEVC video with `-c copy`, no conversion), or a plain WAV fallback
+/// when ffmpeg is absent.
+enum RecSink {
+    Aac { child: Child, stdin: ChildStdin },
+    Wav(WavWriter),
+}
+
+fn ffmpeg_path() -> Option<PathBuf> {
+    ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+fn open_sink(path: &PathBuf, sr: u32) -> Option<RecSink> {
+    let want_aac = path.extension().map(|e| e == "m4a").unwrap_or(false);
+    if want_aac {
+        if let Some(ff) = ffmpeg_path() {
+            if let Ok(mut child) = Command::new(ff)
+                .args(["-y", "-f", "s16le", "-ar"])
+                .arg(sr.to_string())
+                .args(["-ac", "2", "-i", "pipe:0", "-c:a", "aac", "-b:a", "256k"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.take() {
+                    return Some(RecSink::Aac { child, stdin });
+                }
+            }
+        }
+    }
+    // No ffmpeg (or a non-m4a path) → WAV fallback.
+    WavWriter::create(&path.with_extension("wav"), sr, 2)
+        .ok()
+        .map(RecSink::Wav)
+}
+
+fn close_sink(sink: Option<RecSink>) {
+    match sink {
+        Some(RecSink::Aac { mut child, stdin }) => {
+            drop(stdin); // EOF → ffmpeg finalizes the .m4a
+            let _ = child.wait();
+        }
+        Some(RecSink::Wav(w)) => {
+            let _ = w.finalize();
+        }
+        None => {}
+    }
+}
+
+/// Drains the broadcaster's record ring (interleaved-stereo f32) and writes it to the
+/// current sink (AAC/.m4a via ffmpeg, or WAV). Lives for the broadcaster's lifetime.
 fn record_writer(mut cons: rtrb::Consumer<f32>, cmd_rx: Receiver<RecCmd>, sr: u32) {
-    let mut writer: Option<WavWriter> = None;
-    let mut buf: Vec<i16> = Vec::with_capacity(8192);
+    let mut sink: Option<RecSink> = None;
+    let mut samples: Vec<i16> = Vec::with_capacity(8192);
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 RecCmd::Start(path) => {
-                    if let Some(w) = writer.take() {
-                        let _ = w.finalize();
-                    }
-                    writer = WavWriter::create(&path, sr, 2).ok();
+                    close_sink(sink.take());
+                    sink = open_sink(&path, sr);
                 }
-                RecCmd::Stop => {
-                    if let Some(w) = writer.take() {
-                        let _ = w.finalize();
-                    }
-                }
+                RecCmd::Stop => close_sink(sink.take()),
                 RecCmd::Quit => {
-                    if let Some(w) = writer.take() {
-                        let _ = w.finalize();
-                    }
+                    close_sink(sink.take());
                     return;
                 }
             }
         }
-        buf.clear();
+        samples.clear();
         while let Ok(s) = cons.pop() {
-            buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+            samples.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
         }
-        if let Some(w) = &mut writer {
-            if !buf.is_empty() {
-                let _ = w.write(&buf);
+        if !samples.is_empty() {
+            match &mut sink {
+                Some(RecSink::Aac { stdin, .. }) => {
+                    let mut bytes = Vec::with_capacity(samples.len() * 2);
+                    for &v in &samples {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let _ = stdin.write_all(&bytes);
+                }
+                Some(RecSink::Wav(w)) => {
+                    let _ = w.write(&samples);
+                }
+                None => {}
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(5));

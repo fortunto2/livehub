@@ -504,7 +504,7 @@ impl Beam {
         self.remote_rec = !self.remote_rec;
         // Local clean-audio backup, in sync with the phone's take.
         if self.remote_rec {
-            let path = backup_wav_path();
+            let path = backup_audio_path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             if let Some(b) = &self.broadcaster {
                 b.pulse(); // sync CLICK at the start — landmark for post-merge alignment
@@ -1390,15 +1390,16 @@ impl Drop for Beam {
     }
 }
 
-/// Path for a backup clean-audio WAV: ~/Movies/Reelcam/beam-audio-<unix_secs>.wav.
-fn backup_wav_path() -> PathBuf {
+/// Path for a backup clean-audio file: ~/Movies/Reelcam/beam-audio-<unix_secs>.m4a
+/// (AAC — directly mergeable onto the phone video; falls back to .wav if no ffmpeg).
+fn backup_audio_path() -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Movies/Reelcam");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("beam-audio-{ts}.wav"))
+    dir.join(format!("beam-audio-{ts}.m4a"))
 }
 
 /// Horizontal level meter: green→yellow→red. Dim track when not broadcasting.
