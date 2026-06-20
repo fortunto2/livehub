@@ -116,6 +116,7 @@ struct Beam {
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
     broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
+    broadcast_addr: String,    // the target the live broadcaster was baked with (detect a redirect)
     local_rec_file: Option<String>, // backup: clean audio file being/just recorded (synced to the take)
     last_rec_path: Option<PathBuf>, // full path of the last backup take (to send to the phone)
     broadcast_ch: usize, // which stereo PAIR to capture (0=1-2, 1=3-4, …) for aggregates
@@ -205,6 +206,7 @@ impl Beam {
             source_listen: false,
             broadcast_autostart: false,
             broadcast_device: String::new(),
+            broadcast_addr: String::new(),
             local_rec_file: None,
             last_rec_path: None,
             broadcast_ch: 0,
@@ -738,13 +740,16 @@ impl Beam {
                     }
                     self.broadcaster = Some(b);
                     self.broadcast_device = self.sel_device.clone();
+                    self.broadcast_addr = self.phone_addr.clone();
                     self.status = format!("streaming → {addr}");
                     if let Some(name) =
                         self.peers.iter().find(|p| p.addr == addr).map(|p| p.name.clone())
                     {
                         self.remembered = Some(name.clone());
                         save_last_phone(&name, &addr.to_string());
-                    } else if !self.effective_direct() {
+                    } else if !self.effective_direct() && !addr.ip().is_loopback() {
+                        // Persist a real LAN target only — never a loopback (e.g. the rx
+                        // diagnostic's 127.0.0.1), which would poison the next launch.
                         save_last_phone("", &addr.to_string());
                     }
                 }
@@ -773,6 +778,25 @@ impl eframe::App for Beam {
             }
         }
 
+        // While broadcasting, rescue a STALE target (loopback/garbage — e.g. an rx-test
+        // 127.0.0.1 left in last-phone) by redirecting to the discovered phone. The
+        // broadcaster-rebuild check below re-points the live stream at the new address.
+        if self.on() && !self.effective_direct() {
+            let target_stale = self.phone().map(|a| a.ip().is_loopback()).unwrap_or(true);
+            if target_stale {
+                let want = self
+                    .remembered
+                    .as_ref()
+                    .filter(|n| !n.is_empty())
+                    .and_then(|n| self.peers.iter().find(|p| &p.name == n))
+                    .or_else(|| (self.peers.len() == 1).then(|| &self.peers[0]))
+                    .map(|p| p.addr.to_string());
+                if let Some(want) = want {
+                    self.phone_addr = want;
+                }
+            }
+        }
+
         // Keep the pre-broadcast level meter alive on the selected device.
         self.update_level_monitor();
         // Keep the mic check (level + headphone monitor) alive on its device.
@@ -793,7 +817,9 @@ impl eframe::App for Beam {
         }
         // Source device switched mid-broadcast → rebuild the broadcaster on the new one
         // (otherwise it keeps capturing the old device — the "nothing happens" gotcha).
-        if self.on() && self.broadcast_device != self.sel_device {
+        if self.on()
+            && (self.broadcast_device != self.sel_device || self.broadcast_addr != self.phone_addr)
+        {
             self.start();
         }
 
