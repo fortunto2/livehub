@@ -112,7 +112,8 @@ struct Beam {
     // Transport: WiFi (UDP/Bonjour, the default) or Direct (route audio/preview/control
     // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
     transport_mode: Transport,
-    last_keepalive: Instant, // keep the AWDL link warm so it drops less
+    last_keepalive: Instant,
+    last_peer_seen: Instant, // last time a WiFi phone was discovered (AWDL hysteresis) // keep the AWDL link warm so it drops less
     mp_tx_audio: Arc<AtomicU64>, // audio packets forwarded over the link (incremented on the forward thread)
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
@@ -219,6 +220,7 @@ impl Beam {
             mp_started: false,
             transport_mode,
             last_keepalive: Instant::now(),
+            last_peer_seen: Instant::now(),
             mp_tx_audio: Arc::new(AtomicU64::new(0)),
             source_listen: p.source_listen,
             broadcast_autostart: false,
@@ -801,6 +803,9 @@ impl eframe::App for Beam {
         if let Some(d) = &self.discovery {
             self.peers = d.peers();
         }
+        if !self.peers.is_empty() {
+            self.last_peer_seen = Instant::now();
+        }
         if !self.on() {
             if let Some(name) = &self.remembered {
                 if let Some(p) = self.peers.iter().find(|p| &p.name == name) {
@@ -894,11 +899,24 @@ impl eframe::App for Beam {
         // Link watchdog: auto-recover a stalled phone link (no manual 🔄 refresh).
         self.link_watchdog();
 
-        // Auto-up the AWDL link once on launch (the phone is then reachable with no
-        // WiFi). A manual stop sticks — we don't re-spawn.
-        if !self.mp_started {
+        // AWDL/Multipeer is a WiFi-RADIO hog: an active link time-slices the WiFi radio
+        // → laggy + dropped WiFi audio, and even stalls unrelated WiFi (Xcode device
+        // link, ping). So keep it up ONLY when we actually need Direct — in Direct mode,
+        // or in Auto when no WiFi phone is discovered. On WiFi, tear it down so awdl0 goes
+        // dormant and WiFi gets the full radio.
+        let want_mp = match self.transport_mode {
+            Transport::Direct => true,
+            Transport::WiFi => false,
+            // Only fall back to AWDL after WiFi has been gone a few seconds — no launch
+            // flap, no flicker when discovery briefly drops the phone.
+            Transport::Auto => self.last_peer_seen.elapsed() > Duration::from_secs(3),
+        };
+        if want_mp && !self.mp_started {
             self.multipeer.start();
             self.mp_started = true;
+        } else if !want_mp && self.mp_started {
+            self.multipeer.stop();
+            self.mp_started = false;
         }
 
         // Pull the latest camera-preview frame (if any) into the texture.
