@@ -1024,7 +1024,8 @@ impl eframe::App for Beam {
                             if let Some(d) = &mut self.discovery {
                                 d.refresh();
                             }
-                            self.peers.clear(); // auto-refill updates phone_addr when it reappears
+                            self.peers.clear();
+                            self.phone_addr.clear(); // drop a manual/stale addr → auto-refill from discovery
                             self.status = "re-scanning…".into();
                         }
                     });

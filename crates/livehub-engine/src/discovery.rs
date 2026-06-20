@@ -5,10 +5,27 @@
 
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 const SERVICE: &str = "_reelcam._udp.local.";
+
+/// Pick the best address: a real WiFi-LAN IPv4 (192.168/10/172) over a 169.254
+/// link-local or an awdl0 IPv6 — so audio rides WiFi, not the JITTERY AWDL link (the
+/// phone advertises on BOTH when the Multipeer link is up).
+fn pick_addr(addrs: &[IpAddr]) -> Option<IpAddr> {
+    addrs
+        .iter()
+        .find(|ip| matches!(ip, IpAddr::V4(v4) if v4.is_private()))
+        .or_else(|| {
+            addrs
+                .iter()
+                .find(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_loopback()))
+        })
+        .or_else(|| addrs.iter().find(|ip| ip.is_ipv4()))
+        .or_else(|| addrs.first())
+        .copied()
+}
 
 /// A discovered reelcam phone.
 #[derive(Clone)]
@@ -37,15 +54,11 @@ impl Discovery {
                     match event {
                         ServiceEvent::ServiceResolved(info) => {
                             let port = info.get_port();
-                            // Prefer an IPv4 address; fall back to any. mdns-sd 0.20
-                            // yields `ScopedIp`; convert to plain `IpAddr`.
-                            let ip = info
-                                .get_addresses()
-                                .iter()
-                                .find(|a| a.is_ipv4())
-                                .or_else(|| info.get_addresses().iter().next())
-                                .map(|a| a.to_ip_addr());
-                            if let Some(ip) = ip {
+                            // mdns-sd 0.20 yields `ScopedIp`; convert to plain `IpAddr`,
+                            // then prefer the WiFi-LAN address over awdl0 (see pick_addr).
+                            let addrs: Vec<IpAddr> =
+                                info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
+                            if let Some(ip) = pick_addr(&addrs) {
                                 let addr = SocketAddr::new(ip, port);
                                 let name = info
                                     .get_fullname()
