@@ -9,6 +9,7 @@
 
 mod gallery;
 mod multipeer;
+mod prefs;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -121,6 +122,7 @@ struct Beam {
     last_rec_path: Option<PathBuf>, // full path of the last backup take (to send to the phone)
     broadcast_ch: usize, // which stereo PAIR to capture (0=1-2, 1=3-4, …) for aggregates
     master_gain: f32,    // master volume applied to the broadcast
+    saved_prefs: prefs::Prefs, // last-persisted snapshot (save only on change)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -140,15 +142,30 @@ enum Transport {
 
 impl Beam {
     fn new() -> Self {
+        let p = prefs::load();
         let (remembered, saved_addr) = load_last_phone();
         let devices = input_device_names();
-        // Default to a BlackHole-ish device if present (the usual REAPER loopback).
+        // Remembered source device if it's still present; else a BlackHole-ish default
+        // (the usual REAPER loopback); else the first input.
         let sel_device = devices
             .iter()
-            .find(|d| d.to_lowercase().contains("blackhole"))
+            .find(|d| **d == p.device)
+            .or_else(|| devices.iter().find(|d| d.to_lowercase().contains("blackhole")))
+            .or_else(|| devices.first())
             .cloned()
-            .or_else(|| devices.first().cloned())
             .unwrap_or_default();
+        let transport_mode = match p.transport {
+            1 => Transport::WiFi,
+            2 => Transport::Direct,
+            _ => Transport::Auto,
+        };
+        let saved_prefs = prefs::Prefs {
+            device: sel_device.clone(),
+            channel: p.channel,
+            gain: p.gain,
+            source_listen: p.source_listen,
+            transport: p.transport,
+        };
         Beam {
             devices,
             sel_device,
@@ -200,17 +217,34 @@ impl Beam {
             multipeer: multipeer::Multipeer::default(),
             mp_last_recv: String::new(),
             mp_started: false,
-            transport_mode: Transport::Auto,
+            transport_mode,
             last_keepalive: Instant::now(),
             mp_tx_audio: Arc::new(AtomicU64::new(0)),
-            source_listen: false,
+            source_listen: p.source_listen,
             broadcast_autostart: false,
             broadcast_device: String::new(),
             broadcast_addr: String::new(),
             local_rec_file: None,
             last_rec_path: None,
-            broadcast_ch: 0,
-            master_gain: 1.0,
+            broadcast_ch: p.channel,
+            master_gain: p.gain,
+            saved_prefs,
+        }
+    }
+
+    /// Snapshot the persist-worthy UI state (source device, channel, gain, monitor,
+    /// transport) for change detection.
+    fn current_prefs(&self) -> prefs::Prefs {
+        prefs::Prefs {
+            device: self.sel_device.clone(),
+            channel: self.broadcast_ch,
+            gain: self.master_gain,
+            source_listen: self.source_listen,
+            transport: match self.transport_mode {
+                Transport::Auto => 0,
+                Transport::WiFi => 1,
+                Transport::Direct => 2,
+            },
         }
     }
 
@@ -795,6 +829,13 @@ impl eframe::App for Beam {
                     self.phone_addr = want;
                 }
             }
+        }
+
+        // Persist the rig (device / channel / gain / monitor / transport) on any change.
+        let cur = self.current_prefs();
+        if cur != self.saved_prefs {
+            prefs::save(&cur);
+            self.saved_prefs = cur;
         }
 
         // Keep the pre-broadcast level meter alive on the selected device.
