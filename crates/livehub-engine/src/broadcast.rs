@@ -147,10 +147,12 @@ impl Broadcaster {
                         } else if mute {
                             (0.0, 0.0) // sync-test silence: only the click survives
                         } else {
-                            // Capture the SELECTED stereo pair (off) × master gain.
-                            let l = data.get(base + off).copied().unwrap_or(0.0) * g;
+                            // Capture the SELECTED stereo pair (off) × master gain. Clamp
+                            // so a gain boost can't push past ±1.0 → garbage/crackle on the
+                            // phone (the right fix for a low level is the channel pair, not gain).
+                            let l = (data.get(base + off).copied().unwrap_or(0.0) * g).clamp(-1.0, 1.0);
                             let r = if in_ch >= 2 {
-                                data.get(base + off + 1).copied().unwrap_or(0.0) * g
+                                (data.get(base + off + 1).copied().unwrap_or(0.0) * g).clamp(-1.0, 1.0)
                             } else {
                                 l
                             };
