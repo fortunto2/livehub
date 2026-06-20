@@ -11,6 +11,7 @@ pub struct Prefs {
     pub gain: f32,
     pub source_listen: bool,
     pub transport: u8, // 0=Auto, 1=WiFi, 2=Direct
+    pub auto_merge: bool, // auto-send the backup → phone merges, on record stop
 }
 
 fn path() -> Option<PathBuf> {
@@ -24,7 +25,7 @@ fn path() -> Option<PathBuf> {
 /// transport defaults to WiFi (1): AWDL/Direct time-slices the WiFi radio, so plain
 /// WiFi is the right default; Direct is opt-in for the field.
 pub fn load() -> Prefs {
-    let mut p = Prefs { gain: 1.0, transport: 1, ..Prefs::default() };
+    let mut p = Prefs { gain: 1.0, transport: 1, auto_merge: true, ..Prefs::default() };
     let Some(path) = path() else { return p };
     let Ok(s) = std::fs::read_to_string(&path) else { return p };
     for line in s.lines() {
@@ -36,6 +37,7 @@ pub fn load() -> Prefs {
             "gain" => p.gain = v.parse().unwrap_or(1.0),
             "source_listen" => p.source_listen = v == "1",
             "transport" => p.transport = v.parse().unwrap_or(0),
+            "auto_merge" => p.auto_merge = v == "1",
             _ => {}
         }
     }
@@ -46,12 +48,13 @@ pub fn load() -> Prefs {
 pub fn save(p: &Prefs) {
     let Some(path) = path() else { return };
     let body = format!(
-        "device={}\nchannel={}\ngain={}\nsource_listen={}\ntransport={}\n",
+        "device={}\nchannel={}\ngain={}\nsource_listen={}\ntransport={}\nauto_merge={}\n",
         p.device,
         p.channel,
         p.gain,
         u8::from(p.source_listen),
         p.transport,
+        u8::from(p.auto_merge),
     );
     let _ = std::fs::write(path, body);
 }

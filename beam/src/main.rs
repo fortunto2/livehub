@@ -22,8 +22,8 @@ use livehub_engine::{
     MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
-    CAM_SHUTTER, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_TOGGLE,
-    PREVIEW_MAGIC,
+    CAM_SHUTTER, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP, CMD_REC_START,
+    CMD_REC_STOP, CMD_REC_TOGGLE, CTRL_MAGIC, PREVIEW_MAGIC,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +65,7 @@ struct Beam {
     preview_q_adjust_at: Instant, // cooldown between Auto steps
     last_heartbeat: Instant, // re-arm the phone's preview watchdog
     control: Option<RemoteControl>, // persistent control socket (stable port)
+    rec_sync: Option<std::net::UdpSocket>, // inbound: phone's record button → sync our backup
     // A/V-sync test: periodically flash the window + click the audio together.
     sync_test: bool,
     last_pulse: Instant,
@@ -123,6 +124,8 @@ struct Beam {
     last_rec_path: Option<PathBuf>, // full path of the last backup take (to send to the phone)
     broadcast_ch: usize, // which stereo PAIR to capture (0=1-2, 1=3-4, …) for aggregates
     master_gain: f32,    // master volume applied to the broadcast
+    auto_merge: bool,    // on record stop: auto-send the backup → phone merges (M2)
+    pending_merge_at: Option<Instant>, // when recording stopped; send once the file finalizes
     saved_prefs: prefs::Prefs, // last-persisted snapshot (save only on change)
 }
 
@@ -166,6 +169,7 @@ impl Beam {
             gain: p.gain,
             source_listen: p.source_listen,
             transport: p.transport,
+            auto_merge: p.auto_merge,
         };
         Beam {
             devices,
@@ -187,6 +191,14 @@ impl Beam {
             preview_q_adjust_at: Instant::now(),
             last_heartbeat: Instant::now(),
             control: RemoteControl::new().ok(),
+            rec_sync: {
+                // Bind the phone→beam rec-sync port (the phone's record button sends here).
+                let s = std::net::UdpSocket::bind(("0.0.0.0", 9020)).ok();
+                if let Some(ref s) = s {
+                    let _ = s.set_nonblocking(true);
+                }
+                s
+            },
             sync_test: false,
             last_pulse: Instant::now(),
             flash: false,
@@ -230,6 +242,8 @@ impl Beam {
             last_rec_path: None,
             broadcast_ch: p.channel,
             master_gain: p.gain,
+            auto_merge: p.auto_merge,
+            pending_merge_at: None,
             saved_prefs,
         }
     }
@@ -247,6 +261,7 @@ impl Beam {
                 Transport::WiFi => 1,
                 Transport::Direct => 2,
             },
+            auto_merge: self.auto_merge,
         }
     }
 
@@ -545,9 +560,18 @@ impl Beam {
         if !sent {
             return;
         }
-        self.remote_rec = !self.remote_rec;
-        // Local clean-audio backup, in sync with the phone's take.
-        if self.remote_rec {
+        self.apply_local_rec(!self.remote_rec);
+    }
+
+    /// Start/stop the local clean-audio backup to MATCH `recording` — WITHOUT telling the
+    /// phone. Used both by our REC button (after it sent the toggle) and by the phone's
+    /// own record button (via the rec-sync packet). Idempotent → loop-safe across sides.
+    fn apply_local_rec(&mut self, recording: bool) {
+        if recording == self.remote_rec {
+            return;
+        }
+        self.remote_rec = recording;
+        if recording {
             let path = backup_audio_path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             if let Some(b) = &self.broadcaster {
@@ -558,6 +582,54 @@ impl Beam {
             }
         } else if let Some(b) = &self.broadcaster {
             b.record_stop();
+            // Auto-merge: send the clean backup once it finalizes (ffmpeg flush) → the
+            // phone merges it onto the take automatically. Armed here; fired from update().
+            if self.auto_merge {
+                self.pending_merge_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Drain inbound rec-sync packets — the phone's own record button sends a rec-STATE
+    /// (CMD_REC_START/STOP) here, and we match our clean backup to it (no echo back →
+    /// loop-safe with the REC button's outbound toggle).
+    fn poll_rec_sync(&mut self) {
+        let mut want: Option<bool> = None;
+        if let Some(sock) = &self.rec_sync {
+            let mut buf = [0u8; 64];
+            while let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if n >= 5 && u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) == CTRL_MAGIC {
+                    match buf[4] {
+                        CMD_REC_START => want = Some(true),
+                        CMD_REC_STOP => want = Some(false),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(recording) = want {
+            self.apply_local_rec(recording);
+        }
+    }
+
+    /// Send the last clean-audio backup to the phone → it merges onto the last clip and
+    /// exports to Photos. Over WiFi (TCP to the phone's BoardReceiver) or the Direct link.
+    fn send_backup_to_phone(&mut self) {
+        let Some(p) = self.last_rec_path.clone() else { return };
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio.m4a")
+            .to_string();
+        if let Some(phone) = self.phone() {
+            let addr = SocketAddr::new(phone.ip(), 9011);
+            std::thread::spawn(move || {
+                let _ = send_file_tcp(addr, &p, &name);
+            });
+            self.status = "sent audio (WiFi) → phone is merging…".into();
+        } else if self.multipeer.connected() {
+            self.multipeer.send_resource(&p.to_string_lossy(), &name);
+            self.status = "sent audio → phone is merging…".into();
         }
     }
 
@@ -843,6 +915,22 @@ impl eframe::App for Beam {
             self.saved_prefs = cur;
         }
 
+        // Auto-merge: once a stopped take's backup has finalized (give ffmpeg ~2 s to
+        // flush + close the .m4a), send it to the phone to merge. Fire-and-clear.
+        if let Some(t) = self.pending_merge_at {
+            if t.elapsed() > Duration::from_millis(2000) {
+                self.pending_merge_at = None;
+                let ready = self
+                    .last_rec_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .is_some_and(|m| m.len() > 1024);
+                if ready {
+                    self.send_backup_to_phone();
+                }
+            }
+        }
+
         // Keep the pre-broadcast level meter alive on the selected device.
         self.update_level_monitor();
         // Keep the mic check (level + headphone monitor) alive on its device.
@@ -919,6 +1007,8 @@ impl eframe::App for Beam {
             self.mp_started = false;
         }
 
+        // Phone's record button → keep our clean backup in sync.
+        self.poll_rec_sync();
         // Pull the latest camera-preview frame (if any) into the texture.
         self.poll_preview(ctx);
         // Drain remote-gallery background results (list / thumbs / downloads).
@@ -1249,32 +1339,21 @@ impl eframe::App for Beam {
                         // IP is set; else over the Direct/AWDL link.
                         let can_send = self.last_rec_path.is_some()
                             && (self.phone().is_some() || self.multipeer.connected());
+                        let label = if self.pending_merge_at.is_some() {
+                            "📤 auto-merging…"
+                        } else {
+                            "📤 send to phone + merge"
+                        };
                         if ui
                             .add_enabled(
                                 can_send,
-                                egui::Button::new("📤 send to phone + merge")
-                                    .min_size(egui::vec2(300.0, 30.0)),
+                                egui::Button::new(label).min_size(egui::vec2(300.0, 30.0)),
                             )
                             .clicked()
                         {
-                            if let Some(p) = self.last_rec_path.clone() {
-                                let name = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("audio.m4a")
-                                    .to_string();
-                                if let Some(phone) = self.phone() {
-                                    let addr = SocketAddr::new(phone.ip(), 9011);
-                                    std::thread::spawn(move || {
-                                        let _ = send_file_tcp(addr, &p, &name);
-                                    });
-                                    self.status = "sent audio (WiFi) → phone is merging…".into();
-                                } else {
-                                    self.multipeer.send_resource(&p.to_string_lossy(), &name);
-                                    self.status = "sent audio → phone is merging…".into();
-                                }
-                            }
+                            self.send_backup_to_phone();
                         }
+                        ui.checkbox(&mut self.auto_merge, "auto-merge after stop");
                     }
                     ui.add_space(4.0);
                     let prev = if self.preview.is_some() { "👁 preview: ON" } else { "👁 preview: off" };
