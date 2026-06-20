@@ -20,6 +20,7 @@ mod loops;
 mod mic_monitor;
 mod remote;
 mod track;
+mod wav;
 
 pub use audio::{run_passthrough, run_sweep};
 pub use broadcast::{run_broadcast, run_broadcast_test, Broadcaster, LevelMonitor};

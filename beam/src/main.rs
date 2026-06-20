@@ -11,6 +11,7 @@ mod gallery;
 mod multipeer;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -115,6 +116,7 @@ struct Beam {
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
     broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
+    local_rec_file: Option<String>, // backup: clean WAV being recorded (synced to the take)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -200,6 +202,7 @@ impl Beam {
             source_listen: false,
             broadcast_autostart: false,
             broadcast_device: String::new(),
+            local_rec_file: None,
         }
     }
 
@@ -484,15 +487,32 @@ impl Beam {
     }
 
     /// Toggle recording ON THE PHONE (no ack — we track intent locally). Works over the
-    /// Multipeer link in Direct mode (no WiFi IP needed).
+    /// Multipeer link in Direct mode (no WiFi IP needed). Also records a synced LOCAL
+    /// clean-audio WAV backup (+ a start click as the post-merge sync anchor).
     fn toggle_remote_record(&mut self) {
-        if self.effective_direct() && self.multipeer.connected() {
+        let sent = if self.effective_direct() && self.multipeer.connected() {
             self.multipeer.send(control_packet(CMD_REC_TOGGLE, 0).to_vec(), true);
-            self.remote_rec = !self.remote_rec;
+            true
         } else if let Some(addr) = self.phone() {
-            if self.ctl(addr, CMD_REC_TOGGLE, 0) {
-                self.remote_rec = !self.remote_rec;
+            self.ctl(addr, CMD_REC_TOGGLE, 0)
+        } else {
+            false
+        };
+        if !sent {
+            return;
+        }
+        self.remote_rec = !self.remote_rec;
+        // Local clean-audio backup, in sync with the phone's take.
+        if self.remote_rec {
+            let path = backup_wav_path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if let Some(b) = &self.broadcaster {
+                b.pulse(); // sync CLICK at the start — landmark for post-merge alignment
+                b.record_start(path);
+                self.local_rec_file = Some(name);
             }
+        } else if let Some(b) = &self.broadcaster {
+            b.record_stop();
         }
     }
 
@@ -1078,6 +1098,21 @@ impl eframe::App for Beam {
                     if ui.add_enabled(can_control, rec_btn).clicked() {
                         self.toggle_remote_record();
                     }
+                    // Local clean-audio backup status (the post-merge safety net).
+                    if self.remote_rec {
+                        match &self.local_rec_file {
+                            Some(f) => ui.colored_label(
+                                egui::Color32::from_rgb(210, 90, 90),
+                                format!("● REC + 💾 clean audio → {f}"),
+                            ),
+                            None => ui.colored_label(
+                                egui::Color32::from_rgb(230, 170, 70),
+                                "● REC (no local backup — start ▶ broadcast)",
+                            ),
+                        };
+                    } else if let Some(f) = &self.local_rec_file {
+                        ui.weak(format!("💾 saved clean audio: {f}"));
+                    }
                     ui.add_space(4.0);
                     let prev = if self.preview.is_some() { "👁 preview: ON" } else { "👁 preview: off" };
                     if ui
@@ -1353,6 +1388,17 @@ impl Drop for Beam {
             }
         }
     }
+}
+
+/// Path for a backup clean-audio WAV: ~/Movies/Reelcam/beam-audio-<unix_secs>.wav.
+fn backup_wav_path() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Movies/Reelcam");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("beam-audio-{ts}.wav"))
 }
 
 /// Horizontal level meter: green→yellow→red. Dim track when not broadcasting.

@@ -20,7 +20,10 @@ use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+
+use crate::wav::WavWriter;
 use std::sync::{Arc, Mutex};
 
 use crate::device::{
@@ -63,6 +66,10 @@ pub struct Broadcaster {
     /// Local-monitor output (hear the source on the Mac); silent until `monitor_on`.
     _out_stream: Option<cpal::Stream>,
     monitor_on: Arc<AtomicBool>,
+    /// Local backup recording → clean WAV (for post-merge); gated by `rec_on`.
+    rec_on: Arc<AtomicBool>,
+    rec_cmd_tx: Sender<RecCmd>,
+    rec_writer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Broadcaster {
@@ -93,6 +100,11 @@ impl Broadcaster {
         let (mut mon_prod, mut mon_cons) = rtrb::RingBuffer::<f32>::new(sr as usize); // ~0.5 s stereo
         let monitor_on = Arc::new(AtomicBool::new(false));
         let cb_monitor = monitor_on.clone();
+        // Local backup recording: a third ring filled only while recording, drained by
+        // a writer thread → a clean 16-bit WAV (no network artifacts) for post-merge.
+        let (mut rec_prod, rec_cons) = rtrb::RingBuffer::<f32>::new(sr as usize * 2);
+        let rec_on = Arc::new(AtomicBool::new(false));
+        let cb_rec = rec_on.clone();
         let level = Arc::new(AtomicF32::new(0.0));
         let cb_level = level.clone();
         let pulse = Arc::new(AtomicBool::new(false));
@@ -137,6 +149,10 @@ impl Broadcaster {
                             let _ = mon_prod.push(l); // → local speakers (only while listening)
                             let _ = mon_prod.push(r);
                         }
+                        if cb_rec.load(Ordering::Relaxed) {
+                            let _ = rec_prod.push(l); // → local WAV (only while recording)
+                            let _ = rec_prod.push(r);
+                        }
                     }
                     // Peak meter: fast attack, slow release.
                     let prev = cb_level.load(Ordering::Relaxed);
@@ -178,6 +194,13 @@ impl Broadcaster {
             Some(s)
         });
 
+        // Local-recording writer thread (drains rec ring → WAV files on command).
+        let (rec_cmd_tx, rec_cmd_rx) = channel::<RecCmd>();
+        let rec_writer = std::thread::Builder::new()
+            .name("broadcast-rec".into())
+            .spawn(move || record_writer(rec_cons, rec_cmd_rx, sr))
+            .ok();
+
         let running = Arc::new(AtomicBool::new(true));
         let (tap_tx, tap_rx) = sync_channel::<Vec<u8>>(64); // bounded — drop on backpressure
         let tap_on = Arc::new(AtomicBool::new(false));
@@ -201,6 +224,9 @@ impl Broadcaster {
             tap_rx: Some(tap_rx),
             tap_on,
             monitor_on,
+            rec_on,
+            rec_cmd_tx,
+            rec_writer,
         })
     }
 
@@ -223,6 +249,17 @@ impl Broadcaster {
     }
     pub fn monitoring(&self) -> bool {
         self.monitor_on.load(Ordering::Relaxed)
+    }
+
+    /// Start recording the clean source to `path` (a fresh 16-bit WAV). Synced to the
+    /// phone's record so the audio can be merged onto the video in post.
+    pub fn record_start(&self, path: PathBuf) {
+        let _ = self.rec_cmd_tx.send(RecCmd::Start(path));
+        self.rec_on.store(true, Ordering::Relaxed);
+    }
+    pub fn record_stop(&self) {
+        self.rec_on.store(false, Ordering::Relaxed);
+        let _ = self.rec_cmd_tx.send(RecCmd::Stop);
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -252,6 +289,12 @@ impl Broadcaster {
 impl Drop for Broadcaster {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Finalize any open WAV + stop the recorder thread cleanly.
+        self.rec_on.store(false, Ordering::Relaxed);
+        let _ = self.rec_cmd_tx.send(RecCmd::Quit);
+        if let Some(h) = self.rec_writer.take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.sender.take() {
             let _ = h.join();
         }
@@ -394,6 +437,53 @@ pub(crate) fn master_sender_loop(
         },
         None,
     );
+}
+
+/// Commands to the local-recording writer thread.
+enum RecCmd {
+    Start(PathBuf),
+    Stop,
+    Quit,
+}
+
+/// Drains the broadcaster's record ring (interleaved-stereo f32) and writes 16-bit WAV
+/// files on Start/Stop. Lives for the broadcaster's lifetime; finalizes on Quit.
+fn record_writer(mut cons: rtrb::Consumer<f32>, cmd_rx: Receiver<RecCmd>, sr: u32) {
+    let mut writer: Option<WavWriter> = None;
+    let mut buf: Vec<i16> = Vec::with_capacity(8192);
+    loop {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                RecCmd::Start(path) => {
+                    if let Some(w) = writer.take() {
+                        let _ = w.finalize();
+                    }
+                    writer = WavWriter::create(&path, sr, 2).ok();
+                }
+                RecCmd::Stop => {
+                    if let Some(w) = writer.take() {
+                        let _ = w.finalize();
+                    }
+                }
+                RecCmd::Quit => {
+                    if let Some(w) = writer.take() {
+                        let _ = w.finalize();
+                    }
+                    return;
+                }
+            }
+        }
+        buf.clear();
+        while let Ok(s) = cons.pop() {
+            buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+        }
+        if let Some(w) = &mut writer {
+            if !buf.is_empty() {
+                let _ = w.write(&buf);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 #[cfg(test)]

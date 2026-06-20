@@ -159,6 +159,39 @@ record-to-Insta or montage-on-Mac foundations above.
 4. **Keep single-phone clips Instagram-ready** (vertical 1080, compatible codec,
    AAC); 4K/HEVC stays an opt-in "best source for Mac montage."
 
+## Idea 3 — Backup mode: beam records clean audio, merge in post
+
+The field link (AWDL) can crackle/drop. This decouples audio QUALITY from the
+live link: **beam records the clean source locally** (lossless, no network
+artifacts); the live link only carries **start/stop sync + preview**, not the
+audio that ends up in the reel. Crackle stops mattering.
+
+### Flow
+1. beam records the broadcast source to a **WAV** when recording (synced to the
+   record button), stamped with `session_id` + start time. (M1)
+2. The phone records video (+ its copy of the live stream as a sync reference).
+3. Pull the video to beam (gallery / Direct tunnel). (M2)
+4. **ffmpeg** muxes beam's clean WAV onto the phone video, offset-aligned. (M2)
+
+### Sync by transients (handles network delays)
+A constant start-offset fails if the link added variable delay. Align by
+**spikes**, with multiple anchors:
+- **Injected click** (precise): fire beam's A/V-sync `pulse()` at record start —
+  it lands in both beam's WAV (known, t=0) and the phone's reference. Detect the
+  click in the reference → exact offset. Survives crackle (a click is a huge
+  transient). Periodic clicks → piecewise warp for long takes.
+- **Natural transients** (no click): onset-detect (spectral flux) the loud hits
+  in both signals, match the strongest, align by them. Uses the music's own
+  spikes.
+The crackly reference is used ONLY to locate the click/onsets — the final audio
+is beam's clean WAV. Reuses `video_audio::detect_beats` (onsets) + `pulse()`.
+
+### Milestones
+- **M1** (foundation, building now): beam writes a clean WAV synced to the record
+  button + a start click as the sync anchor + session metadata.
+- **M2:** pull video + ffmpeg merge with a coarse offset.
+- **M3:** auto transient/click alignment (+ multi-anchor for long takes).
+
 ## Open decisions
 - Streaming first cut: phone-direct (fast) vs beam-as-OBS (strategic)?
 - Orientation priority: vertical (reels/IG/TikTok) vs horizontal (classic
