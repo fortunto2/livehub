@@ -109,7 +109,8 @@ struct Beam {
     mp_started: bool,
     // Transport: WiFi (UDP/Bonjour, the default) or Direct (route audio/preview/control
     // through the Multipeer link — for the field where UDP-over-AWDL won't establish).
-    transport_direct: bool,
+    transport_mode: Transport,
+    last_keepalive: Instant, // keep the AWDL link warm so it drops less
     mp_tx_audio: Arc<AtomicU64>, // audio packets forwarded over the link (incremented on the forward thread)
     source_listen: bool, // hear the broadcast source on the Mac's own speakers/headphones
     broadcast_autostart: bool, // auto-up the broadcast once on launch; a manual stop sticks
@@ -120,6 +121,15 @@ struct Beam {
 enum Tab {
     Preview,
     Gallery,
+}
+
+/// Where audio/preview/control are routed. `Auto` prefers WiFi when the phone is on
+/// the LAN and falls to the Direct (Multipeer/AWDL) link when WiFi is gone.
+#[derive(PartialEq, Clone, Copy)]
+enum Transport {
+    Auto,
+    WiFi,
+    Direct,
 }
 
 impl Beam {
@@ -184,7 +194,8 @@ impl Beam {
             multipeer: multipeer::Multipeer::default(),
             mp_last_recv: String::new(),
             mp_started: false,
-            transport_direct: false,
+            transport_mode: Transport::Auto,
+            last_keepalive: Instant::now(),
             mp_tx_audio: Arc::new(AtomicU64::new(0)),
             source_listen: false,
             broadcast_autostart: false,
@@ -337,7 +348,7 @@ impl Beam {
         if let (Some(addr), Some(c)) = (self.phone(), self.control.as_ref()) {
             let _ = c.send_cam(addr, param, value);
         }
-        if self.transport_direct && self.multipeer.connected() {
+        if self.effective_direct() && self.multipeer.connected() {
             self.multipeer.send(camparam_packet(param, value).to_vec(), true);
         }
     }
@@ -390,7 +401,7 @@ impl Beam {
     /// Link health from the inbound preview: time since the last frame. `None` when
     /// preview is off (no inbound signal to judge the link by).
     fn link_age(&self) -> Option<Duration> {
-        if self.preview.is_some() || self.transport_direct {
+        if self.preview.is_some() || self.effective_direct() {
             Some(self.last_preview_at.elapsed())
         } else {
             None
@@ -404,7 +415,7 @@ impl Beam {
     fn link_watchdog(&mut self) {
         // In Direct mode there's no WiFi peer to re-resolve; the bridge re-invites on
         // its own. Don't let a stale WiFi peer churn the broadcaster onto the wrong path.
-        if self.transport_direct {
+        if self.effective_direct() {
             return;
         }
         let Some(age) = self.link_age() else { return };
@@ -441,7 +452,7 @@ impl Beam {
     /// source port = one connection on the phone; no flow churn). Returns whether
     /// the datagram went out.
     fn ctl(&self, to: SocketAddr, cmd: u8, port: u16) -> bool {
-        if self.transport_direct && self.multipeer.connected() {
+        if self.effective_direct() && self.multipeer.connected() {
             self.multipeer.send(control_packet(cmd, port).to_vec(), true);
         }
         self.control.as_ref().is_some_and(|c| c.send(to, cmd, port).is_ok())
@@ -456,15 +467,26 @@ impl Beam {
         self.phone_addr.parse::<SocketAddr>().ok()
     }
 
+    /// Should we route over the Direct (Multipeer/AWDL) link right now? In Auto, yes
+    /// only when WiFi is gone (no phone discovered on the LAN) but the link is up — so
+    /// it prefers WiFi and falls back to Direct automatically.
+    fn effective_direct(&self) -> bool {
+        match self.transport_mode {
+            Transport::WiFi => false,
+            Transport::Direct => true,
+            Transport::Auto => self.peers.is_empty() && self.multipeer.connected(),
+        }
+    }
+
     /// Is the phone reachable for control — a WiFi IP, OR the Direct (Multipeer) link?
     fn phone_reachable(&self) -> bool {
-        self.phone().is_some() || (self.transport_direct && self.multipeer.connected())
+        self.phone().is_some() || (self.effective_direct() && self.multipeer.connected())
     }
 
     /// Toggle recording ON THE PHONE (no ack — we track intent locally). Works over the
     /// Multipeer link in Direct mode (no WiFi IP needed).
     fn toggle_remote_record(&mut self) {
-        if self.transport_direct && self.multipeer.connected() {
+        if self.effective_direct() && self.multipeer.connected() {
             self.multipeer.send(control_packet(CMD_REC_TOGGLE, 0).to_vec(), true);
             self.remote_rec = !self.remote_rec;
         } else if let Some(addr) = self.phone() {
@@ -489,7 +511,7 @@ impl Beam {
         // transport is active (the heartbeat keeps re-asserting it).
         if let Ok(rx) = PreviewReceiver::start() {
             let port = rx.port();
-            if self.transport_direct && self.multipeer.connected() {
+            if self.effective_direct() && self.multipeer.connected() {
                 self.multipeer.send(control_packet(CMD_PREVIEW_START, port).to_vec(), true);
             } else if let Some(addr) = self.phone() {
                 self.ctl(addr, CMD_PREVIEW_START, port);
@@ -660,7 +682,7 @@ impl Beam {
             .phone_addr
             .parse::<SocketAddr>()
             .ok()
-            .or_else(|| self.transport_direct.then(|| "127.0.0.1:9000".parse().unwrap()));
+            .or_else(|| self.effective_direct().then(|| "127.0.0.1:9000".parse().unwrap()));
         match addr {
             Some(addr) => match Broadcaster::start(&self.sel_device, addr, self.sample_rate) {
                 Ok(mut b) => {
@@ -695,7 +717,7 @@ impl Beam {
                     {
                         self.remembered = Some(name.clone());
                         save_last_phone(&name, &addr.to_string());
-                    } else if !self.transport_direct {
+                    } else if !self.effective_direct() {
                         save_last_phone("", &addr.to_string());
                     }
                 }
@@ -735,7 +757,7 @@ impl eframe::App for Beam {
         if !self.broadcast_autostart
             && !self.on()
             && !self.sel_device.is_empty()
-            && (self.phone().is_some() || self.transport_direct)
+            && (self.phone().is_some() || self.effective_direct())
         {
             self.start();
             if self.on() {
@@ -767,7 +789,7 @@ impl eframe::App for Beam {
         // with no click. Retries each frame until a phone appears; then a manual stop
         // sticks. Skipped on a transient gap so it doesn't fight a manual stop.
         let phone_reachable =
-            self.phone().is_some() || (self.transport_direct && self.multipeer.connected());
+            self.phone().is_some() || (self.effective_direct() && self.multipeer.connected());
         if !self.preview_autostarted && self.preview.is_none() && phone_reachable {
             self.toggle_preview();
             if self.preview.is_some() {
@@ -799,13 +821,21 @@ impl eframe::App for Beam {
                 self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
             }
         }
+        // Keep the AWDL link warm so it drops less — a tiny periodic ping keeps the
+        // MCSession active even when idle (e.g. Auto is currently on WiFi, or Direct is
+        // up but not broadcasting). The phone ignores it (no audio/control magic).
+        if self.multipeer.connected() && self.last_keepalive.elapsed() >= Duration::from_millis(1000) {
+            self.last_keepalive = Instant::now();
+            self.multipeer.send(vec![0u8; 4], true);
+        }
+
         // Direct transport: the broadcaster only FILLS its tap in Direct mode; a
         // dedicated thread (spawned in start()) streams those packets over the link
         // smoothly. (No UI-loop draining — that batched audio into ~10 Hz bursts.)
         if let Some(b) = &self.broadcaster {
             // Fill the tap only with a live link to forward to (else packets pile up
             // for a bridge that drops them anyway).
-            b.set_tap(self.transport_direct && self.multipeer.connected());
+            b.set_tap(self.effective_direct() && self.multipeer.connected());
             b.set_monitor(self.source_listen); // local speaker monitor of the source
         }
 
@@ -815,7 +845,7 @@ impl eframe::App for Beam {
             self.last_heartbeat = Instant::now();
             let port = self.preview.as_ref().map(|r| r.port()).unwrap_or(0);
             let q = self.effective_preview_q() as u16;
-            if self.transport_direct && self.multipeer.connected() {
+            if self.effective_direct() && self.multipeer.connected() {
                 // Field path: no UDP addr — drive preview over the Multipeer link.
                 self.multipeer.send(control_packet(CMD_PREVIEW_START, port).to_vec(), true);
                 self.multipeer.send(control_packet(CMD_PREVIEW_QUALITY, q).to_vec(), true);
@@ -1070,7 +1100,7 @@ impl eframe::App for Beam {
                                 {
                                     self.preview_q_mode = i as u8;
                                     let q = self.effective_preview_q();
-                                    if self.transport_direct && self.multipeer.connected() {
+                                    if self.effective_direct() && self.multipeer.connected() {
                                         self.multipeer
                                             .send(control_packet(CMD_PREVIEW_QUALITY, q as u16).to_vec(), true);
                                     } else if let Some(addr) = self.phone() {
@@ -1155,26 +1185,25 @@ impl eframe::App for Beam {
                     if mp_on && !self.mp_last_recv.is_empty() {
                         ui.weak(format!("recv: {}", self.mp_last_recv));
                     }
-                    // Transport selector — route audio/preview/control over WiFi (UDP) or
-                    // straight through the Multipeer link (the no-WiFi field path).
+                    // Transport selector. Auto = WiFi when the phone is on the LAN, else
+                    // the Direct (Multipeer/AWDL) link — the no-WiFi field path.
                     ui.horizontal(|ui| {
                         ui.label("Transport:");
-                        ui.selectable_value(&mut self.transport_direct, false, "WiFi");
-                        ui.selectable_value(&mut self.transport_direct, true, "Direct");
+                        ui.selectable_value(&mut self.transport_mode, Transport::Auto, "Auto");
+                        ui.selectable_value(&mut self.transport_mode, Transport::WiFi, "WiFi");
+                        ui.selectable_value(&mut self.transport_mode, Transport::Direct, "Direct");
                     });
-                    if self.transport_direct {
+                    // Show which transport is EFFECTIVE right now (esp. in Auto).
+                    if self.effective_direct() {
                         let conn = self.multipeer.connected();
                         let col = if conn {
                             egui::Color32::from_rgb(90, 220, 130)
                         } else {
                             egui::Color32::from_rgb(230, 70, 70)
                         };
-                        // Live diagnostics — so a field "no signal" tells us WHERE it breaks:
-                        // link must be connected, tx must climb (audio forwarded), preview
-                        // fps must move (frames coming back).
                         ui.colored_label(
                             col,
-                            if conn { "link: connected" } else { "link: NOT connected — can't route" },
+                            if conn { "→ Direct link: connected" } else { "→ Direct: NOT connected" },
                         );
                         ui.weak(format!(
                             "tx {} audio pkts · preview {:.0} fps{}",
@@ -1182,11 +1211,21 @@ impl eframe::App for Beam {
                             self.preview_fps,
                             if self.on() { "" } else { " · (hit ▶ broadcast for audio)" },
                         ));
-                        // The bridge's last line — tells us WHERE the link is stuck
-                        // (browsing / found / connecting / a browse/permission error).
                         let st = self.multipeer.status();
                         if !st.is_empty() {
                             ui.weak(format!("bridge: {st}"));
+                        }
+                    } else if self.transport_mode == Transport::Auto {
+                        if !self.peers.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(90, 220, 130),
+                                "→ WiFi (phone on the LAN)",
+                            );
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 200, 90),
+                                "→ searching… (no WiFi; Direct link not up yet)",
+                            );
                         }
                     }
 
