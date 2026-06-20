@@ -12,7 +12,7 @@ mod multipeer;
 mod prefs;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1235,11 +1235,20 @@ impl eframe::App for Beam {
                                 "● REC (no local backup — start ▶ broadcast)",
                             ),
                         };
-                    } else if let Some(f) = &self.local_rec_file {
-                        ui.weak(format!("💾 saved clean audio: {f}"));
+                    } else if let Some(f) = self.local_rec_file.clone() {
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("💾 saved clean audio: {f}"));
+                            if let Some(p) = self.last_rec_path.clone() {
+                                if ui.button("📂").on_hover_text("show in Finder").clicked() {
+                                    reveal_in_finder(&p);
+                                }
+                            }
+                        });
                         // Send the clean audio to the phone → it merges onto the last clip
-                        // + exports to Photos (ready for Reels). Needs the link connected.
-                        let can_send = self.last_rec_path.is_some() && self.multipeer.connected();
+                        // + exports to Photos (ready for Reels). Over WiFi (TCP) when a phone
+                        // IP is set; else over the Direct/AWDL link.
+                        let can_send = self.last_rec_path.is_some()
+                            && (self.phone().is_some() || self.multipeer.connected());
                         if ui
                             .add_enabled(
                                 can_send,
@@ -1249,9 +1258,21 @@ impl eframe::App for Beam {
                             .clicked()
                         {
                             if let Some(p) = self.last_rec_path.clone() {
-                                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("audio.m4a");
-                                self.multipeer.send_resource(&p.to_string_lossy(), name);
-                                self.status = "sent audio → phone is merging…".into();
+                                let name = p
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("audio.m4a")
+                                    .to_string();
+                                if let Some(phone) = self.phone() {
+                                    let addr = SocketAddr::new(phone.ip(), 9011);
+                                    std::thread::spawn(move || {
+                                        let _ = send_file_tcp(addr, &p, &name);
+                                    });
+                                    self.status = "sent audio (WiFi) → phone is merging…".into();
+                                } else {
+                                    self.multipeer.send_resource(&p.to_string_lossy(), &name);
+                                    self.status = "sent audio → phone is merging…".into();
+                                }
                             }
                         }
                     }
@@ -1542,6 +1563,24 @@ fn backup_audio_path() -> PathBuf {
     let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Movies/Reelcam");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("beam-audio-{ts}.m4a"))
+}
+
+/// Reveal a file in Finder (opens its folder + selects it).
+fn reveal_in_finder(path: &Path) {
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+}
+
+/// Send a local file to the phone over WiFi (TCP) for the M2 merge — used when the
+/// Direct/AWDL link is down (the WiFi default). Wire: "<name>\n" then the raw bytes,
+/// then close (the phone reads to EOF). Blocking; call on a worker thread.
+fn send_file_tcp(addr: SocketAddr, path: &Path, name: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = std::fs::read(path)?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    stream.write_all(name.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.write_all(&bytes)?;
+    stream.flush()
 }
 
 /// Horizontal level meter: green→yellow→red. Dim track when not broadcasting.

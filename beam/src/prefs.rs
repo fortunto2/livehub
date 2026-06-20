@@ -20,9 +20,11 @@ fn path() -> Option<PathBuf> {
     Some(dir.join("beam_prefs.txt"))
 }
 
-/// Load persisted prefs. Missing/unparseable fields fall back to `Default`.
+/// Load persisted prefs. Missing/unparseable fields fall back to these defaults —
+/// transport defaults to WiFi (1): AWDL/Direct time-slices the WiFi radio, so plain
+/// WiFi is the right default; Direct is opt-in for the field.
 pub fn load() -> Prefs {
-    let mut p = Prefs { gain: 1.0, ..Prefs::default() };
+    let mut p = Prefs { gain: 1.0, transport: 1, ..Prefs::default() };
     let Some(path) = path() else { return p };
     let Ok(s) = std::fs::read_to_string(&path) else { return p };
     for line in s.lines() {
