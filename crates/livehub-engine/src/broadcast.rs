@@ -22,7 +22,7 @@ use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -72,6 +72,9 @@ pub struct Broadcaster {
     rec_on: Arc<AtomicBool>,
     rec_cmd_tx: Sender<RecCmd>,
     rec_writer: Option<std::thread::JoinHandle<()>>,
+    /// Which stereo pair to capture (multichannel/aggregate devices) + master gain.
+    ch_offset: Arc<AtomicUsize>,
+    gain: Arc<AtomicF32>,
 }
 
 impl Broadcaster {
@@ -113,6 +116,12 @@ impl Broadcaster {
         let cb_pulse = pulse.clone();
         let silent = Arc::new(AtomicBool::new(false));
         let cb_silent = silent.clone();
+        // Which stereo pair to capture from a multichannel/aggregate device (e.g. the
+        // music may sit on channels 3-4 of "Mixx Rig", not 1-2), + a master gain.
+        let ch_offset = Arc::new(AtomicUsize::new(0));
+        let cb_offset = ch_offset.clone();
+        let gain = Arc::new(AtomicF32::new(1.0));
+        let cb_gain = gain.clone();
         let stream_cfg: cpal::StreamConfig = cfg.clone().into();
         let stream = dev
             .build_input_stream(
@@ -122,6 +131,8 @@ impl Broadcaster {
                     // A/V-sync click: replace this block with a sharp impulse.
                     let click = cb_pulse.swap(false, Ordering::Relaxed);
                     let mute = cb_silent.load(Ordering::Relaxed);
+                    let off = cb_offset.load(Ordering::Relaxed).min(in_ch.saturating_sub(2));
+                    let g = cb_gain.load(Ordering::Relaxed);
                     let mut peak = 0.0f32;
                     for f in 0..frames {
                         let base = f * in_ch;
@@ -136,9 +147,10 @@ impl Broadcaster {
                         } else if mute {
                             (0.0, 0.0) // sync-test silence: only the click survives
                         } else {
-                            let l = data.get(base).copied().unwrap_or(0.0);
+                            // Capture the SELECTED stereo pair (off) × master gain.
+                            let l = data.get(base + off).copied().unwrap_or(0.0) * g;
                             let r = if in_ch >= 2 {
-                                data.get(base + 1).copied().unwrap_or(0.0)
+                                data.get(base + off + 1).copied().unwrap_or(0.0) * g
                             } else {
                                 l
                             };
@@ -229,6 +241,8 @@ impl Broadcaster {
             rec_on,
             rec_cmd_tx,
             rec_writer,
+            ch_offset,
+            gain,
         })
     }
 
@@ -262,6 +276,16 @@ impl Broadcaster {
     pub fn record_stop(&self) {
         self.rec_on.store(false, Ordering::Relaxed);
         let _ = self.rec_cmd_tx.send(RecCmd::Stop);
+    }
+
+    /// Capture from this stereo pair (channel `offset`, `offset+1`) — for aggregate /
+    /// multichannel devices where the music isn't on channels 1-2.
+    pub fn set_channel(&self, offset: usize) {
+        self.ch_offset.store(offset, Ordering::Relaxed);
+    }
+    /// Master gain applied to the broadcast (and the monitor/recording).
+    pub fn set_gain(&self, g: f32) {
+        self.gain.store(g.max(0.0), Ordering::Relaxed);
     }
 
     /// Fire one A/V-sync CLICK into the broadcast on the next captured block. Pair
@@ -311,22 +335,34 @@ impl Drop for Broadcaster {
 pub struct LevelMonitor {
     _stream: cpal::Stream,
     level: Arc<AtomicF32>,
+    ch_offset: Arc<AtomicUsize>,
 }
 
 impl LevelMonitor {
     pub fn start(device_hint: &str) -> Result<LevelMonitor> {
         let dev = pick_input(device_hint)?;
         let cfg = best_input_config(&dev)?;
+        let in_ch = (cfg.channels() as usize).max(1);
         let stream_cfg: cpal::StreamConfig = cfg.into();
         let level = Arc::new(AtomicF32::new(0.0));
         let cb_level = level.clone();
+        let ch_offset = Arc::new(AtomicUsize::new(0));
+        let cb_offset = ch_offset.clone();
         let stream = dev
             .build_input_stream(
                 &stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Meter only the SELECTED stereo pair — what will actually be
+                    // broadcast — so the pre-broadcast level matches the live one.
+                    let off = cb_offset.load(Ordering::Relaxed).min(in_ch.saturating_sub(2));
+                    let frames = data.len() / in_ch;
                     let mut peak = 0.0f32;
-                    for &s in data {
-                        peak = peak.max(s.abs());
+                    for f in 0..frames {
+                        let base = f * in_ch;
+                        peak = peak.max(data.get(base + off).copied().unwrap_or(0.0).abs());
+                        if in_ch >= 2 {
+                            peak = peak.max(data.get(base + off + 1).copied().unwrap_or(0.0).abs());
+                        }
                     }
                     let prev = cb_level.load(Ordering::Relaxed);
                     let v = if peak > prev { peak } else { prev * 0.85 };
@@ -337,11 +373,15 @@ impl LevelMonitor {
             )
             .context("build_input_stream (level monitor)")?;
         stream.play()?;
-        Ok(LevelMonitor { _stream: stream, level })
+        Ok(LevelMonitor { _stream: stream, level, ch_offset })
     }
 
     pub fn level(&self) -> f32 {
         self.level.load(Ordering::Relaxed)
+    }
+    /// Meter this stereo pair (match the broadcaster's channel selection).
+    pub fn set_channel(&self, offset: usize) {
+        self.ch_offset.store(offset, Ordering::Relaxed);
     }
 }
 

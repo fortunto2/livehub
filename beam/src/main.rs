@@ -118,6 +118,8 @@ struct Beam {
     broadcast_device: String,  // the device the live broadcaster is on (detect a switch)
     local_rec_file: Option<String>, // backup: clean audio file being/just recorded (synced to the take)
     last_rec_path: Option<PathBuf>, // full path of the last backup take (to send to the phone)
+    broadcast_ch: usize, // which stereo PAIR to capture (0=1-2, 1=3-4, …) for aggregates
+    master_gain: f32,    // master volume applied to the broadcast
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -205,6 +207,8 @@ impl Beam {
             broadcast_device: String::new(),
             local_rec_file: None,
             last_rec_path: None,
+            broadcast_ch: 0,
+            master_gain: 1.0,
         }
     }
 
@@ -860,6 +864,11 @@ impl eframe::App for Beam {
             // for a bridge that drops them anyway).
             b.set_tap(self.effective_direct() && self.multipeer.connected());
             b.set_monitor(self.source_listen); // local speaker monitor of the source
+            b.set_channel(self.broadcast_ch * 2); // which stereo pair (aggregate devices)
+            b.set_gain(self.master_gain); // master volume
+        }
+        if let Some(m) = &self.level_monitor {
+            m.set_channel(self.broadcast_ch * 2); // pre-broadcast meter matches the live one
         }
 
         // Heartbeat: while previewing, re-arm the phone's watchdog (~every 2 s) so
@@ -977,6 +986,26 @@ impl eframe::App for Beam {
                     } else {
                         ui.weak("Auto = whatever the source device runs at");
                     }
+                    ui.add_space(4.0);
+                    // Channel pair (aggregate/multichannel devices: the music may not be
+                    // on 1-2) + master volume. Both apply live; the level meter follows.
+                    ui.horizontal(|ui| {
+                        ui.label("Channels:");
+                        for (i, lbl) in ["1-2", "3-4", "5-6", "7-8"].iter().enumerate() {
+                            ui.selectable_value(&mut self.broadcast_ch, i, *lbl);
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.master_gain, 0.0..=2.0)
+                            .text("master")
+                            .custom_formatter(|v, _| {
+                                if v <= 0.0001 {
+                                    "−∞".to_owned()
+                                } else {
+                                    format!("{:+.0} dB", 20.0 * v.log10())
+                                }
+                            }),
+                    );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Phone (ip:port):");
