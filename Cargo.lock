@@ -473,10 +473,12 @@ name = "beam"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
  "eframe",
  "egui",
  "image",
  "livehub-engine",
+ "rtrb",
  "wgpu",
 ]
 
