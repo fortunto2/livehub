@@ -845,13 +845,20 @@ impl eframe::App for Beam {
             if f.len() > 8 && u32::from_le_bytes([f[0], f[1], f[2], f[3]]) == PREVIEW_MAGIC {
                 self.show_jpeg(ctx, &f[8..]);
             } else {
-                self.mp_last_recv = String::from_utf8_lossy(&f).chars().take(60).collect();
+                let s = String::from_utf8_lossy(&f);
+                if s.starts_with("merge") {
+                    self.status = s.to_string(); // phone's merge result → main status
+                }
+                self.mp_last_recv = s.chars().take(60).collect();
             }
         }
-        // Keep the AWDL link warm so it drops less — a tiny periodic ping keeps the
-        // MCSession active even when idle (e.g. Auto is currently on WiFi, or Direct is
-        // up but not broadcasting). The phone ignores it (no audio/control magic).
-        if self.multipeer.connected() && self.last_keepalive.elapsed() >= Duration::from_millis(1000) {
+        // Keep the AWDL link warm so it drops less — but ONLY while actually routing
+        // over Direct. On WiFi this ping would keep AWDL active and time-slice the WiFi
+        // radio → degraded WiFi audio. So on WiFi we stay quiet (AWDL goes dormant).
+        if self.effective_direct()
+            && self.multipeer.connected()
+            && self.last_keepalive.elapsed() >= Duration::from_millis(1000)
+        {
             self.last_keepalive = Instant::now();
             self.multipeer.send(vec![0u8; 4], true);
         }
