@@ -68,6 +68,8 @@ struct Beam {
     rec_sync: Option<std::net::UdpSocket>, // inbound: phone's record button → sync our backup
     last_phone_alive: Option<Instant>, // last phone heartbeat (honest link health, both transports)
     phone_rx: bool,       // the phone reports it's actually receiving our audio
+    phone_recording: bool, // the phone reports its camera is ACTUALLY recording (confirmed)
+    rec_armed_at: Instant, // when we armed REC — grace before flagging a phone mismatch
     last_hb_sent: Instant, // throttle our outbound heartbeat to the phone
     // A/V-sync test: periodically flash the window + click the audio together.
     sync_test: bool,
@@ -204,6 +206,8 @@ impl Beam {
             },
             last_phone_alive: None,
             phone_rx: false,
+            phone_recording: false,
+            rec_armed_at: Instant::now(),
             last_hb_sent: Instant::now(),
             sync_test: false,
             last_pulse: Instant::now(),
@@ -578,6 +582,7 @@ impl Beam {
         }
         self.remote_rec = recording;
         if recording {
+            self.rec_armed_at = Instant::now(); // grace window before flagging a mismatch
             let path = backup_audio_path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             if let Some(b) = &self.broadcaster {
@@ -603,6 +608,7 @@ impl Beam {
         let mut want: Option<bool> = None;
         let mut beat = false;
         let mut rx = self.phone_rx;
+        let mut rec = self.phone_recording;
         if let Some(sock) = &self.rec_sync {
             let mut buf = [0u8; 64];
             while let Ok((n, _)) = sock.recv_from(&mut buf) {
@@ -612,8 +618,11 @@ impl Beam {
                         CMD_REC_STOP => want = Some(false),
                         CMD_HEARTBEAT => {
                             beat = true;
-                            // port field = 1 when the phone is actually receiving our audio.
-                            rx = n >= 7 && u16::from_le_bytes([buf[5], buf[6]]) == 1;
+                            // port field = flags: bit0 = receiving our audio, bit1 = the
+                            // phone's camera is actually recording (confirmed).
+                            let flags = if n >= 7 { u16::from_le_bytes([buf[5], buf[6]]) } else { 0 };
+                            rx = flags & 1 != 0;
+                            rec = flags & 2 != 0;
                         }
                         _ => {}
                     }
@@ -623,6 +632,7 @@ impl Beam {
         if beat {
             self.last_phone_alive = Some(Instant::now());
             self.phone_rx = rx;
+            self.phone_recording = rec;
         }
         if let Some(recording) = want {
             self.apply_local_rec(recording);
@@ -1355,16 +1365,48 @@ impl eframe::App for Beam {
                     }
                     // Local clean-audio backup status (the post-merge safety net).
                     if self.remote_rec {
-                        match &self.local_rec_file {
-                            Some(f) => ui.colored_label(
-                                egui::Color32::from_rgb(210, 90, 90),
-                                format!("● REC + 💾 clean audio → {f}"),
-                            ),
-                            None => ui.colored_label(
-                                egui::Color32::from_rgb(230, 170, 70),
-                                "● REC (no local backup — start ▶ broadcast)",
-                            ),
+                        // Confirmed feedback — trust the PHONE's reported recording state, not
+                        // just our button intent (the take you THINK is running may not be).
+                        let phone_alive = self
+                            .last_phone_alive
+                            .map(|t| t.elapsed() < Duration::from_millis(2500))
+                            .unwrap_or(false);
+                        let red = egui::Color32::from_rgb(235, 70, 70);
+                        let amber = egui::Color32::from_rgb(235, 170, 60);
+                        let backup = match &self.local_rec_file {
+                            Some(f) => format!(" · 💾 {f}"),
+                            None => " · ⚠ no local backup".to_string(),
                         };
+                        if self.phone_recording && phone_alive {
+                            ui.colored_label(
+                                red,
+                                egui::RichText::new(format!("🔴 REC — phone confirmed{backup}"))
+                                    .strong(),
+                            );
+                        } else if !phone_alive {
+                            ui.colored_label(
+                                amber,
+                                egui::RichText::new(
+                                    "⚠ REC armed — phone link lost, CAN'T confirm recording!",
+                                )
+                                .strong(),
+                            );
+                        } else if self.rec_armed_at.elapsed() < Duration::from_millis(2500) {
+                            ui.colored_label(amber, "● REC starting… (confirming with phone)");
+                        } else {
+                            ui.colored_label(
+                                red,
+                                egui::RichText::new(
+                                    "⛔ REC pressed but phone is NOT recording — tap record on the phone!",
+                                )
+                                .strong(),
+                            );
+                        }
+                    } else if self.phone_recording {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(235, 70, 70),
+                            egui::RichText::new("🔴 phone is recording (not armed in beam)").strong(),
+                        );
                     } else if let Some(f) = self.local_rec_file.clone() {
                         ui.horizontal(|ui| {
                             ui.weak(format!("💾 saved clean audio: {f}"));
