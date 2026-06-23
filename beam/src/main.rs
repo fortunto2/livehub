@@ -31,8 +31,8 @@ use livehub_engine::{
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
-            .with_min_inner_size([520.0, 360.0])
+            .with_inner_size([900.0, 600.0])
+            .with_min_inner_size([560.0, 360.0])
             .with_always_on_top()
             .with_title("beam"),
         renderer: eframe::Renderer::Wgpu,
@@ -853,9 +853,12 @@ impl Beam {
     /// over the same `cam()` path (WiFi + Multipeer). No ack channel → the console holds
     /// intent; defaults mirror reelcam's (tracking + HUD-burn on).
     fn gesture_controls_ui(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("🎛 Gesture").strong());
+        ui.heading("🎛 Gesture");
+        ui.weak("drive reelcam — no need to touch the phone");
+        ui.add_space(4.0);
+
+        // Master toggles (wrap to the narrow sidebar width).
+        ui.horizontal_wrapped(|ui| {
             if ui.toggle_value(&mut self.gest_midi, "🎹 MIDI").changed() {
                 self.cam(GEST_MIDI, if self.gest_midi { 1.0 } else { 0.0 });
             }
@@ -866,9 +869,11 @@ impl Beam {
                 self.cam(GEST_BURN_HUD, if self.gest_burn_hud { 1.0 } else { 0.0 });
             }
         });
+        ui.add_space(6.0);
+
         // Mode — what NOTES do (CC knobs drive in every mode).
-        ui.horizontal(|ui| {
-            ui.label("Mode:");
+        ui.label("Mode");
+        ui.horizontal_wrapped(|ui| {
             for (i, name) in ["FX", "Beat", "Melody"].iter().enumerate() {
                 if ui.selectable_label(self.gest_mode == i, *name).clicked() {
                     self.gest_mode = i;
@@ -876,9 +881,11 @@ impl Beam {
                 }
             }
         });
+        ui.add_space(6.0);
+
         // Note generation — how a fist becomes notes.
-        ui.horizontal(|ui| {
-            ui.label("Notes:");
+        ui.label("Notes");
+        ui.horizontal_wrapped(|ui| {
             for (i, name) in ["Single", "Chord", "Arp", "Markov"].iter().enumerate() {
                 if ui.selectable_label(self.gest_notemode == i, *name).clicked() {
                     self.gest_notemode = i;
@@ -886,24 +893,30 @@ impl Beam {
                 }
             }
         });
+        ui.add_space(6.0);
+
         // Note length — staccato … HOLD.
-        ui.horizontal(|ui| {
-            ui.label("Len:");
-            if ui
-                .add(egui::Slider::new(&mut self.gest_notelen, 0.0..=1.0).show_value(false))
-                .changed()
-            {
-                self.cam(GEST_NOTELEN, self.gest_notelen);
-            }
-            ui.weak(if self.gest_notelen >= 0.97 {
+        ui.label(format!(
+            "Length · {}",
+            if self.gest_notelen >= 0.97 {
                 "HOLD"
             } else if self.gest_notelen < 0.15 {
                 "staccato"
             } else {
                 "—"
-            });
-            // Profile (CC/Note map): Default vs Analog Lab V (fixed CC map → no MIDI-learn).
-            ui.separator();
+            }
+        ));
+        if ui
+            .add(egui::Slider::new(&mut self.gest_notelen, 0.0..=1.0).show_value(false))
+            .changed()
+        {
+            self.cam(GEST_NOTELEN, self.gest_notelen);
+        }
+        ui.add_space(6.0);
+
+        // Profile (CC/Note map): Default vs Analog Lab V (fixed CC map → no MIDI-learn).
+        ui.label("Profile");
+        ui.horizontal_wrapped(|ui| {
             for (i, name) in ["Default", "Analog Lab"].iter().enumerate() {
                 if ui.selectable_label(self.gest_profile == i, *name).clicked() {
                     self.gest_profile = i;
@@ -1699,6 +1712,21 @@ impl eframe::App for Beam {
                 match self.tab {
                     Tab::Gallery => self.gallery_ui(ui),
                     Tab::Preview => {
+                        // Gesture-instrument remote — its OWN sidebar to the right of the
+                        // preview (the bottom strip was too cramped). Always visible in the
+                        // Preview tab so it's reachable even before the preview starts.
+                        egui::SidePanel::right("gesture_panel")
+                            .resizable(false)
+                            .exact_width(196.0)
+                            .frame(
+                                egui::Frame::default()
+                                    .fill(egui::Color32::from_gray(18))
+                                    .inner_margin(8.0),
+                            )
+                            .show_inside(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .show(ui, |ui| self.gesture_controls_ui(ui));
+                            });
                         // Camera remote + histogram pinned under the preview.
                         if self.preview.is_some() {
                             egui::TopBottomPanel::bottom("cam_ctrls")
@@ -1708,10 +1736,7 @@ impl eframe::App for Beam {
                                         .fill(egui::Color32::from_gray(20))
                                         .inner_margin(8.0),
                                 )
-                                .show_inside(ui, |ui| {
-                                    self.camera_controls_ui(ui);
-                                    self.gesture_controls_ui(ui);
-                                });
+                                .show_inside(ui, |ui| self.camera_controls_ui(ui));
                         }
                         if let Some(tex) = &self.preview_tex {
                             let avail = ui.available_size();
