@@ -245,6 +245,19 @@ struct App {
     /// Remembered phone (by Bonjour name) — persisted across runs so the same
     /// reelcam auto-re-targets when rediscovered, even if its IP changed (hotspot/DHCP).
     remembered_phone: Option<String>,
+    /// Persistent remote-control sender (camera + gesture params → phone). Lazy.
+    remote: Option<livehub_engine::RemoteControl>,
+    /// Console mirror of the phone's gesture-instrument state — the phone doesn't report
+    /// back, so the console is the source of truth and sends on change. Defaults match
+    /// reelcam's own (tracking + HUD-burn on). Lets the performer drive chords / note
+    /// length / mode from the console instead of running to the phone mid-set.
+    gest_midi: bool,
+    gest_tracking: bool,
+    gest_burn_hud: bool,
+    gest_mode: usize,     // 0 FX · 1 Beat · 2 Melody
+    gest_notemode: usize, // 0 Single · 1 Chord · 2 Arp · 3 Markov
+    gest_notelen: f32,    // 0..1 staccato … HOLD
+    gest_profile: usize,  // 0 Default · 1 Analog Lab
     /// Floating tool-window toggles (opened from the top toolbar). Real windows —
     /// movable, and combos/sliders inside them work (a menu dropdown ate them).
     show_fx: bool,
@@ -315,6 +328,14 @@ impl App {
             bcast_status: String::new(),
             discovery: livehub_engine::Discovery::start().ok(),
             remembered_phone: saved_phone.0,
+            remote: None,
+            gest_midi: false,
+            gest_tracking: true,
+            gest_burn_hud: true,
+            gest_mode: 0,
+            gest_notemode: 0,
+            gest_notelen: 0.35,
+            gest_profile: 0,
             show_fx: false,
             show_broadcast: false,
             show_mix: false,
@@ -1068,6 +1089,112 @@ impl App {
                 ui.weak(self.bcast_status.as_str());
             }
         });
+        self.remote_panel(ui);
+    }
+
+    /// Send a normalized camera/gesture param to the targeted phone (lazy socket).
+    fn remote_cam(&mut self, param: u8, value: f32) {
+        let Ok(addr) = self.bcast_ip.parse::<std::net::SocketAddr>() else {
+            self.bcast_status = "set a valid phone ip:port first".into();
+            return;
+        };
+        if self.remote.is_none() {
+            self.remote = livehub_engine::RemoteControl::new().ok();
+        }
+        if let Some(rc) = &self.remote {
+            let _ = rc.send_cam(addr, param, value);
+        }
+    }
+
+    /// Send a control command (record toggle, …) to the targeted phone.
+    fn remote_ctl(&mut self, cmd: u8, port: u16) {
+        let Ok(addr) = self.bcast_ip.parse::<std::net::SocketAddr>() else {
+            self.bcast_status = "set a valid phone ip:port first".into();
+            return;
+        };
+        if self.remote.is_none() {
+            self.remote = livehub_engine::RemoteControl::new().ok();
+        }
+        if let Some(rc) = &self.remote {
+            let _ = rc.send(addr, cmd, port);
+        }
+    }
+
+    /// 🎛 Remote control of the phone's gesture instrument — so the performer drives
+    /// record / mode / chords / note-length from the console, not by running to the phone.
+    /// The console holds the state (the phone doesn't report back) and sends on change.
+    fn remote_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(egui::RichText::new("🎛 Remote control (gesture instrument)").strong());
+
+        // Record toggle (the phone mirrors its own record state back over heartbeat,
+        // but we just fire a toggle — the phone ignores redundant start/stop).
+        ui.horizontal(|ui| {
+            if ui.button("⏺ Rec toggle").clicked() {
+                self.remote_ctl(livehub_engine::CMD_REC_TOGGLE, 0);
+            }
+            if ui.toggle_value(&mut self.gest_midi, "🎹 MIDI").changed() {
+                self.remote_cam(livehub_engine::GEST_MIDI, if self.gest_midi { 1.0 } else { 0.0 });
+            }
+            if ui.toggle_value(&mut self.gest_tracking, "💀 Track").changed() {
+                self.remote_cam(livehub_engine::GEST_TRACKING, if self.gest_tracking { 1.0 } else { 0.0 });
+            }
+            if ui.toggle_value(&mut self.gest_burn_hud, "🔥 HUD").changed() {
+                self.remote_cam(livehub_engine::GEST_BURN_HUD, if self.gest_burn_hud { 1.0 } else { 0.0 });
+            }
+        });
+
+        // Mode — what NOTES do (CC knobs drive in all modes).
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            for (i, name) in ["FX", "Beat", "Melody"].iter().enumerate() {
+                if ui.selectable_label(self.gest_mode == i, *name).clicked() {
+                    self.gest_mode = i;
+                    self.remote_cam(livehub_engine::GEST_MODE, i as f32);
+                }
+            }
+        });
+
+        // Note generation — how a fist becomes notes.
+        ui.horizontal(|ui| {
+            ui.label("Notes:");
+            for (i, name) in ["Single", "Chord", "Arp", "Markov"].iter().enumerate() {
+                if ui.selectable_label(self.gest_notemode == i, *name).clicked() {
+                    self.gest_notemode = i;
+                    self.remote_cam(livehub_engine::GEST_NOTEMODE, i as f32);
+                }
+            }
+        });
+
+        // Note length — staccato … HOLD.
+        ui.horizontal(|ui| {
+            ui.label("Length:");
+            if ui
+                .add(egui::Slider::new(&mut self.gest_notelen, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                self.remote_cam(livehub_engine::GEST_NOTELEN, self.gest_notelen);
+            }
+            ui.weak(if self.gest_notelen >= 0.97 {
+                "HOLD"
+            } else if self.gest_notelen < 0.15 {
+                "staccato"
+            } else {
+                "—"
+            });
+        });
+
+        // Instrument profile (CC/Note map): Default vs Analog Lab V (fixed CC map).
+        ui.horizontal(|ui| {
+            ui.label("Profile:");
+            for (i, name) in ["Default", "Analog Lab"].iter().enumerate() {
+                if ui.selectable_label(self.gest_profile == i, *name).clicked() {
+                    self.gest_profile = i;
+                    self.remote_cam(livehub_engine::GEST_PROFILE, i as f32);
+                }
+            }
+        });
+        ui.weak("↪ controls reelcam over the same link — no need to touch the phone.");
     }
 
     /// Floating tool windows toggled from the top toolbar. Each is movable and

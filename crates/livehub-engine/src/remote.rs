@@ -38,6 +38,18 @@ pub const CAM_AE_LOCK: u8 = 6;
 pub const CAM_LENS_SELECT: u8 = 7; // value 0=ultra-wide, 1=wide, 2=tele
 pub const CAM_FLIP: u8 = 8; // value 0=back, 1=front
 
+// Performance params (Mac → phone) — drive reelcam's gesture instrument from the console
+// so the performer doesn't run back to the phone mid-set. Enums are sent as the INDEX as a
+// float (Int(value.rounded()) on the phone, matching CAM_LENS_SELECT); toggles 0.0/1.0.
+pub const GEST_MIDI: u8 = 20; // 0/1 — enable gesture → MIDI
+pub const GEST_MODE: u8 = 21; // index 0=FX, 1=Beat, 2=Melody
+pub const GEST_NOTEMODE: u8 = 22; // index 0=Single, 1=Chord, 2=Arp, 3=Markov
+pub const GEST_NOTELEN: u8 = 23; // 0..1 — staccato … HOLD
+pub const GEST_PROFILE: u8 = 24; // index 0=Default, 1=Analog Lab
+pub const GEST_TRACKING: u8 = 25; // 0/1 — skeleton tracking on/off
+pub const GEST_BURN_HUD: u8 = 26; // 0/1 — burn the HUD table into the recording
+pub const GEST_CYCLE_MODE: u8 = 27; // momentary — any value cycles to the next mode
+
 /// Build the 9-byte camera-param packet: `magic · param u8 · value f32` (LE).
 pub fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
     let mut buf = [0u8; 9];
