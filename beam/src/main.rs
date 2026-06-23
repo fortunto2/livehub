@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use livehub_engine::{
     input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor,
-    MicMonitor, Peer,
+    LinkHub, MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
     CAM_SHUTTER, CMD_HEARTBEAT, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
     CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE, CTRL_MAGIC, PREVIEW_MAGIC,
-    GEST_BURN_HUD, GEST_MIDI, GEST_MODE, GEST_NOTELEN, GEST_NOTEMODE, GEST_PROFILE,
+    GEST_BPM, GEST_BURN_HUD, GEST_MIDI, GEST_MODE, GEST_NOTELEN, GEST_NOTEMODE, GEST_PROFILE,
     GEST_TRACKING,
 };
 
@@ -109,6 +109,12 @@ struct Beam {
     gest_notemode: usize, // 0 Single · 1 Chord · 2 Arp · 3 Markov
     gest_notelen: f32,    // 0..1 staccato … HOLD
     gest_profile: usize,  // 0 Default · 1 Analog Lab
+    // Ableton Link → phone tempo relay. Link works on the Mac (multicast is fine here); the
+    // phone can't join Link (iOS blocks the multicast), so beam reads the session tempo and
+    // forwards it as GEST_BPM over the control channel the phone already trusts.
+    link: LinkHub,
+    last_bpm_sent: f64,
+    last_bpm_at: Instant,
     // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
     level_monitor: Option<LevelMonitor>,
     monitored_device: String,
@@ -247,6 +253,9 @@ impl Beam {
             gest_notemode: 0,
             gest_notelen: 0.35,
             gest_profile: 0,
+            link: LinkHub::new(120.0),
+            last_bpm_sent: 0.0,
+            last_bpm_at: Instant::now(),
             level_monitor: None,
             monitored_device: String::new(),
             mic_monitor: None,
@@ -441,6 +450,26 @@ impl Beam {
         }
         if self.effective_direct() && self.multipeer.connected() {
             self.multipeer.send(camparam_packet(param, value).to_vec(), true);
+        }
+    }
+
+    /// Relay the Ableton Link session tempo to the phone (GEST_BPM) so reelcam follows the
+    /// DAW tempo WITHOUT joining Link itself (iOS blocks Link's multicast). Throttled: on a
+    /// real change, else ~once a second so the phone's external-tempo watchdog (1.2 s) doesn't
+    /// lapse back to tap-tempo. No relay until a phone is reachable.
+    fn relay_tempo(&mut self) {
+        if !self.phone_reachable() {
+            return;
+        }
+        let bpm = self.link.tempo();
+        if !(40.0..=300.0).contains(&bpm) {
+            return;
+        }
+        let changed = (bpm - self.last_bpm_sent).abs() >= 0.05;
+        if changed || self.last_bpm_at.elapsed() >= Duration::from_millis(900) {
+            self.cam(GEST_BPM, bpm as f32);
+            self.last_bpm_sent = bpm;
+            self.last_bpm_at = Instant::now();
         }
     }
 
@@ -857,6 +886,21 @@ impl Beam {
         ui.weak("drive reelcam — no need to touch the phone");
         ui.add_space(4.0);
 
+        // Ableton Link tempo we're relaying to the phone (green = a Link peer, e.g. Ableton,
+        // is present). This is how the phone follows the DAW BPM — Link itself can't reach iOS.
+        let peers = self.link.num_peers();
+        let bpm = self.link.tempo();
+        let (col, txt) = if peers > 0 {
+            (
+                egui::Color32::from_rgb(90, 220, 130),
+                format!("🔗 {bpm:.1} BPM · {peers} peer{} → phone", if peers == 1 { "" } else { "s" }),
+            )
+        } else {
+            (egui::Color32::from_gray(150), format!("🔗 {bpm:.1} BPM · no Link peers"))
+        };
+        ui.colored_label(col, txt);
+        ui.add_space(6.0);
+
         // Master toggles (wrap to the narrow sidebar width).
         ui.horizontal_wrapped(|ui| {
             if ui.toggle_value(&mut self.gest_midi, "🎹 MIDI").changed() {
@@ -1145,6 +1189,8 @@ impl eframe::App for Beam {
 
         // Phone's record button → keep our clean backup in sync.
         self.poll_rec_sync();
+        // Relay the Ableton Link tempo to the phone (so reelcam follows the DAW BPM).
+        self.relay_tempo();
         // Heartbeat to the phone every ~1 s: it learns beam's IP (for rec-sync + its own
         // heartbeat back) even before audio flows, and the steady packet helps hold the
         // phone's WiFi awake. The phone heartbeats back → honest link status (below).

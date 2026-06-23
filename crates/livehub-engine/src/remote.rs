@@ -49,6 +49,8 @@ pub const GEST_PROFILE: u8 = 24; // index 0=Default, 1=Analog Lab
 pub const GEST_TRACKING: u8 = 25; // 0/1 — skeleton tracking on/off
 pub const GEST_BURN_HUD: u8 = 26; // 0/1 — burn the HUD table into the recording
 pub const GEST_CYCLE_MODE: u8 = 27; // momentary — any value cycles to the next mode
+pub const GEST_BPM: u8 = 28; // f32 = absolute BPM (40..300) — the Mac relays Ableton Link tempo
+                             // so the phone follows it WITHOUT Link's (iOS-blocked) multicast
 
 /// Build the 9-byte camera-param packet: `magic · param u8 · value f32` (LE).
 pub fn camparam_packet(param: u8, value: f32) -> [u8; 9] {
