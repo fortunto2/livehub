@@ -24,6 +24,8 @@ use livehub_engine::{
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
     CAM_SHUTTER, CMD_HEARTBEAT, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
     CMD_REC_START, CMD_REC_STOP, CMD_REC_TOGGLE, CTRL_MAGIC, PREVIEW_MAGIC,
+    GEST_BURN_HUD, GEST_MIDI, GEST_MODE, GEST_NOTELEN, GEST_NOTEMODE, GEST_PROFILE,
+    GEST_TRACKING,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -97,6 +99,16 @@ struct Beam {
     cam_ae_lock: bool,
     cam_front: bool, // tracked flip intent (the phone has no ack channel)
     active_cam: u8,  // director slot: 0=0.5× 1=1× 2=tele 3=front (keys 1–4)
+    // Gesture-instrument remote (beam → phone): the performer drives reelcam's MIDI
+    // instrument from the console instead of running to the phone mid-set. No ack channel,
+    // so the console holds intent; defaults mirror reelcam's own (tracking + HUD-burn on).
+    gest_midi: bool,
+    gest_tracking: bool,
+    gest_burn_hud: bool,
+    gest_mode: usize,     // 0 FX · 1 Beat · 2 Melody
+    gest_notemode: usize, // 0 Single · 1 Chord · 2 Arp · 3 Markov
+    gest_notelen: f32,    // 0..1 staccato … HOLD
+    gest_profile: usize,  // 0 Default · 1 Analog Lab
     // Pre-broadcast input level meter (so you can SEE signal before hitting ▶).
     level_monitor: Option<LevelMonitor>,
     monitored_device: String,
@@ -228,6 +240,13 @@ impl Beam {
             cam_ae_lock: false,
             cam_front: false,
             active_cam: 1, // phone starts on the rear wide (1×) lens
+            gest_midi: false,
+            gest_tracking: true,
+            gest_burn_hud: true,
+            gest_mode: 0,
+            gest_notemode: 0,
+            gest_notelen: 0.35,
+            gest_profile: 0,
             level_monitor: None,
             monitored_device: String::new(),
             mic_monitor: None,
@@ -827,6 +846,71 @@ impl Beam {
         {
             self.cam(CAM_LENS, self.cam_lens);
         }
+    }
+
+    /// 🎛 Gesture-instrument remote — drive reelcam's MIDI instrument from the console so
+    /// the performer never runs back to the phone mid-set. Each change sends a GEST_* param
+    /// over the same `cam()` path (WiFi + Multipeer). No ack channel → the console holds
+    /// intent; defaults mirror reelcam's (tracking + HUD-burn on).
+    fn gesture_controls_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("🎛 Gesture").strong());
+            if ui.toggle_value(&mut self.gest_midi, "🎹 MIDI").changed() {
+                self.cam(GEST_MIDI, if self.gest_midi { 1.0 } else { 0.0 });
+            }
+            if ui.toggle_value(&mut self.gest_tracking, "💀 Track").changed() {
+                self.cam(GEST_TRACKING, if self.gest_tracking { 1.0 } else { 0.0 });
+            }
+            if ui.toggle_value(&mut self.gest_burn_hud, "🔥 HUD").changed() {
+                self.cam(GEST_BURN_HUD, if self.gest_burn_hud { 1.0 } else { 0.0 });
+            }
+        });
+        // Mode — what NOTES do (CC knobs drive in every mode).
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            for (i, name) in ["FX", "Beat", "Melody"].iter().enumerate() {
+                if ui.selectable_label(self.gest_mode == i, *name).clicked() {
+                    self.gest_mode = i;
+                    self.cam(GEST_MODE, i as f32);
+                }
+            }
+        });
+        // Note generation — how a fist becomes notes.
+        ui.horizontal(|ui| {
+            ui.label("Notes:");
+            for (i, name) in ["Single", "Chord", "Arp", "Markov"].iter().enumerate() {
+                if ui.selectable_label(self.gest_notemode == i, *name).clicked() {
+                    self.gest_notemode = i;
+                    self.cam(GEST_NOTEMODE, i as f32);
+                }
+            }
+        });
+        // Note length — staccato … HOLD.
+        ui.horizontal(|ui| {
+            ui.label("Len:");
+            if ui
+                .add(egui::Slider::new(&mut self.gest_notelen, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                self.cam(GEST_NOTELEN, self.gest_notelen);
+            }
+            ui.weak(if self.gest_notelen >= 0.97 {
+                "HOLD"
+            } else if self.gest_notelen < 0.15 {
+                "staccato"
+            } else {
+                "—"
+            });
+            // Profile (CC/Note map): Default vs Analog Lab V (fixed CC map → no MIDI-learn).
+            ui.separator();
+            for (i, name) in ["Default", "Analog Lab"].iter().enumerate() {
+                if ui.selectable_label(self.gest_profile == i, *name).clicked() {
+                    self.gest_profile = i;
+                    self.cam(GEST_PROFILE, i as f32);
+                }
+            }
+        });
     }
 
     /// Draw the luma histogram (64 bins) as a small bar strip.
@@ -1624,7 +1708,10 @@ impl eframe::App for Beam {
                                         .fill(egui::Color32::from_gray(20))
                                         .inner_margin(8.0),
                                 )
-                                .show_inside(ui, |ui| self.camera_controls_ui(ui));
+                                .show_inside(ui, |ui| {
+                                    self.camera_controls_ui(ui);
+                                    self.gesture_controls_ui(ui);
+                                });
                         }
                         if let Some(tex) = &self.preview_tex {
                             let avail = ui.available_size();
