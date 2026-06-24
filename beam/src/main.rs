@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, load_last_phone, save_last_phone, Broadcaster, Discovery, LevelMonitor,
-    LinkHub, MicMonitor, Peer,
+    input_device_names, is_self_addr, load_last_phone, save_last_phone, Broadcaster, Discovery,
+    LevelMonitor, LinkHub, MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
     CAM_SHUTTER, CMD_HEARTBEAT, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
@@ -1064,7 +1064,12 @@ impl eframe::App for Beam {
                     self.phone_addr = p.addr.to_string();
                 }
             }
-            if self.phone_addr.is_empty() && self.peers.len() == 1 {
+            // Adopt the one live phone when our target is empty OR points at THIS Mac (a
+            // stale self-pointing record left in prefs — beam would talk to itself: no
+            // preview, link reads LOST). `peers()` already drops self entries, so the one
+            // remaining peer is the real phone.
+            let target_self = self.phone().is_some_and(|a| is_self_addr(&a));
+            if (self.phone_addr.is_empty() || target_self) && self.peers.len() == 1 {
                 self.phone_addr = self.peers[0].addr.to_string();
             }
         }

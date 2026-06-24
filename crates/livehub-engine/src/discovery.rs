@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +37,24 @@ fn pick_addr(addrs: &[IpAddr]) -> Option<IpAddr> {
         .or_else(|| addrs.iter().find(|ip| ip.is_ipv4()))
         .or_else(|| addrs.first())
         .copied()
+}
+
+/// Is this address actually THIS Mac (a stale mDNS record resolving to one of our own
+/// interface IPs)? After a DHCP reshuffle the phone's old `.local` A-record can linger in
+/// mDNSResponder pointing at an IP the Mac itself later took — beam would then "target the
+/// phone" by talking to itself: no preview comes back, the link reads LOST, and the
+/// broadcast goes nowhere. Detect it dependency-free: a UDP `connect()` to the addr makes
+/// the kernel pick the egress source IP; if the route to `addr` leaves via an interface
+/// whose own IP == `addr.ip()` (i.e. it's local), source == dest → it's us. No packet is
+/// sent (connect just sets the default peer).
+pub fn is_self_addr(addr: &SocketAddr) -> bool {
+    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    UdpSocket::bind(bind)
+        .and_then(|s| {
+            s.connect(addr)?;
+            Ok(s.local_addr()?.ip() == addr.ip())
+        })
+        .unwrap_or(false)
 }
 
 /// A discovered reelcam phone.
@@ -109,9 +127,13 @@ impl Discovery {
         Ok(Discovery { peers, browse })
     }
 
-    /// Currently-discovered phones.
+    /// Currently-discovered phones. Drops any whose resolved IP is THIS Mac (a stale
+    /// self-pointing mDNS record — see `is_self_addr`), so auto-target never picks us.
     pub fn peers(&self) -> Vec<Peer> {
-        self.peers.lock().map(|g| g.clone()).unwrap_or_default()
+        self.peers
+            .lock()
+            .map(|g| g.iter().filter(|p| !is_self_addr(&p.addr)).cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Re-query the network from scratch (fresh browse subprocess). Use when the phone

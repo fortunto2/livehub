@@ -26,7 +26,7 @@ pub use audio::{run_passthrough, run_sweep};
 pub use broadcast::{run_broadcast, run_broadcast_test, Broadcaster, LevelMonitor};
 pub use device::input_device_names;
 pub use mic_monitor::MicMonitor;
-pub use discovery::{Discovery, Peer};
+pub use discovery::{is_self_addr, Discovery, Peer};
 pub use last_phone::{load_last_phone, save_last_phone};
 pub use remote::{
     camparam_packet, control_packet, send_control, PreviewReceiver, RemoteControl, CTRL_MAGIC,
