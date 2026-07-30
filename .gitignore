@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# signed release artefacts (published as GitHub release assets)
+/dist/
