@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-: "${CARGO_TARGET_DIR:=/Users/rustam/.cargo-target}"
+: "${CARGO_TARGET_DIR:=$HOME/.cargo-target}"
 export CARGO_TARGET_DIR
 BIN="$CARGO_TARGET_DIR/release/beam"
 APP="${1:-/Applications}/beam.app"
