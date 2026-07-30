@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime is mandatory for notarization, and it blocks audio capture unless
+	     this is declared. beam's whole job is capturing an input device (BlackHole carrying a
+	     DAW, or a hardware interface), so without it the app launches and records silence. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

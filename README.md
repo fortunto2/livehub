@@ -46,8 +46,25 @@ cargo build --release -p beam
 The script also compiles `beam/swift/mp-bridge.swift` (the MultipeerConnectivity/AWDL helper)
 with `swiftc`; if that step fails, beam still runs and just loses the Multipeer transport.
 
-Builds are **not signed or notarised**, so macOS will complain the first time — right-click
-the app and choose *Open*. Signed builds are on the list.
+That flow ad-hoc signs the app so macOS keeps the microphone and local-network grants
+between rebuilds. It is **not** notarised, so a copy handed to someone else gets the
+Gatekeeper warning — right-click and choose *Open*.
+
+### Shipping a signed build
+
+```sh
+./scripts/release-beam.sh        # → dist/beam.zip, signed + notarised + stapled
+```
+
+It signs inside-out with Hardened Runtime and `beam/beam.entitlements` (audio-input is
+required, or the app records silence under the hardened runtime), notarises through
+`asc notarization submit --wait`, staples the ticket and re-zips with `ditto`.
+
+One prerequisite it cannot do for you: a **Developer ID Application** identity in the login
+keychain. Apple lets only the *Account Holder* create one — the App Store Connect API
+refuses it ("This operation can only be performed by the Account Holder"). Create it in
+Xcode → Settings → Accounts → Manage Certificates → **+** → Developer ID Application, or in
+the developer portal from a CSR.
 
 ## Status and expectations
 
