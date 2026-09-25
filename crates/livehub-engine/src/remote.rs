@@ -74,8 +74,8 @@ pub fn control_packet(cmd: u8, preview_port: u16) -> [u8; 7] {
 /// repeated sends use [`RemoteControl`] so the phone sees a STABLE source port
 /// (one connection) instead of a new flow per packet.
 pub fn send_control(to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.send_to(&control_packet(cmd, preview_port), to)?;
+    let sock = crate::net::udp_dual(0)?;
+    sock.send_to(&control_packet(cmd, preview_port), crate::net::sock_dest(&sock, to))?;
     Ok(())
 }
 
@@ -88,17 +88,18 @@ pub struct RemoteControl {
 
 impl RemoteControl {
     pub fn new() -> std::io::Result<RemoteControl> {
-        Ok(RemoteControl { sock: UdpSocket::bind("0.0.0.0:0")? })
+        // Dual-stack (IPv6-only hotspot support) — v4 targets go v4-mapped in send.
+        Ok(RemoteControl { sock: crate::net::udp_dual(0)? })
     }
 
     pub fn send(&self, to: SocketAddr, cmd: u8, preview_port: u16) -> std::io::Result<()> {
-        self.sock.send_to(&control_packet(cmd, preview_port), to)?;
+        self.sock.send_to(&control_packet(cmd, preview_port), crate::net::sock_dest(&self.sock, to))?;
         Ok(())
     }
 
     /// Send a camera parameter (normalized 0..1) to the phone over the same socket.
     pub fn send_cam(&self, to: SocketAddr, param: u8, value: f32) -> std::io::Result<()> {
-        self.sock.send_to(&camparam_packet(param, value), to)?;
+        self.sock.send_to(&camparam_packet(param, value), crate::net::sock_dest(&self.sock, to))?;
         Ok(())
     }
 }
@@ -116,7 +117,9 @@ pub struct PreviewReceiver {
 
 impl PreviewReceiver {
     pub fn start() -> Result<PreviewReceiver> {
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        // Dual-stack: the phone replies to whichever of our addresses it learned from
+        // the control packet's source — which is IPv6 on an IPv6-only hotspot.
+        let sock = crate::net::udp_dual(0)?;
         sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
         let port = sock.local_addr()?.port();
         let latest = Arc::new(Mutex::new(None));

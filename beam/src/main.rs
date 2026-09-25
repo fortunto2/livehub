@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use livehub_engine::{
-    input_device_names, is_self_addr, load_last_phone, save_last_phone, Broadcaster, Discovery,
-    LevelMonitor, LinkHub, MicMonitor, Peer,
+    input_device_names, is_self_addr, load_last_phone, save_last_phone, udp_dual, Broadcaster,
+    Discovery, LevelMonitor, LinkHub, MicMonitor, Peer,
     PreviewReceiver, RemoteControl, CAM_AE_LOCK, CAM_EV, CAM_FLIP, CAM_ISO, CAM_LENS,
     camparam_packet, control_packet, CAM_LENS_SELECT, CAM_MANUAL_EXP, CAM_MANUAL_FOCUS,
     CAM_SHUTTER, CMD_HEARTBEAT, CMD_PREVIEW_QUALITY, CMD_PREVIEW_START, CMD_PREVIEW_STOP,
@@ -69,6 +69,15 @@ struct Beam {
     control: Option<RemoteControl>, // persistent control socket (stable port)
     rec_sync: Option<std::net::UdpSocket>, // inbound: phone's record button → sync our backup
     last_phone_alive: Option<Instant>, // last phone heartbeat (honest link health, both transports)
+    /// When the CURRENT target address was chosen — the failover clock. If no phone
+    /// heartbeat arrives within a few seconds of targeting an address, we advance to
+    /// the peer's next candidate (v4 → global v6 → link-local v6). Heals the
+    /// IPv6-only-hotspot trap where the phone advertises a dead 172.20.10.1.
+    target_since: Instant,
+    /// Failover hops since the phone last heartbeated. One full wrap of the
+    /// candidate list ⇒ back off to slow probing; a heartbeat while >0 counts as
+    /// ONE reconnect (recoveries, not search hops) and resets it.
+    rotations_since_alive: usize,
     phone_rx: bool,       // the phone reports it's actually receiving our audio
     phone_recording: bool, // the phone reports its camera is ACTUALLY recording (confirmed)
     rec_armed_at: Instant, // when we armed REC — grace before flagging a phone mismatch
@@ -215,14 +224,17 @@ impl Beam {
             last_heartbeat: Instant::now(),
             control: RemoteControl::new().ok(),
             rec_sync: {
-                // Bind the phone→beam rec-sync port (the phone's record button sends here).
-                let s = std::net::UdpSocket::bind(("0.0.0.0", 9020)).ok();
+                // Bind the phone→beam rec-sync port (the phone's record button sends
+                // here). Dual-stack: on an IPv6-only hotspot the phone replies over v6.
+                let s = udp_dual(9020).ok();
                 if let Some(ref s) = s {
                     let _ = s.set_nonblocking(true);
                 }
                 s
             },
             last_phone_alive: None,
+            target_since: Instant::now(),
+            rotations_since_alive: 0,
             phone_rx: false,
             phone_recording: false,
             rec_armed_at: Instant::now(),
@@ -304,9 +316,25 @@ impl Beam {
     }
 
     /// The phone's IP (without the audio port) — the gallery's file server is on its
-    /// own port on the same host.
+    /// own port on the same host. A link-local IPv6 keeps its scope (`fe80::…%14`):
+    /// `.ip()` alone would drop it and the address would stop routing (getaddrinfo
+    /// on macOS accepts the `%scope` form).
     fn phone_ip(&self) -> Option<String> {
-        self.phone_addr.parse::<SocketAddr>().ok().map(|a| a.ip().to_string())
+        self.phone().map(|a| match a {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => {
+                format!("{}%{}", v6.ip(), v6.scope_id())
+            }
+            a => a.ip().to_string(),
+        })
+    }
+
+    /// The same host as `addr` on a different port. `set_port` (unlike
+    /// `SocketAddr::new(addr.ip(), port)`) preserves an IPv6 scope_id, without
+    /// which a link-local target stops routing.
+    fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
+        let mut a = addr;
+        a.set_port(port);
+        a
     }
 
     /// The remote-gallery window: refresh, thumbnail grid, per-clip download.
@@ -550,12 +578,17 @@ impl Beam {
             .remembered
             .as_ref()
             .and_then(|n| self.peers.iter().find(|p| &p.name == n))
-            .or_else(|| (self.peers.len() == 1).then(|| &self.peers[0]))
-            .map(|p| p.addr.to_string());
-        let Some(addr) = found else { return };
+            .or_else(|| (self.peers.len() == 1).then(|| &self.peers[0]));
+        let Some(p) = found else { return };
+        // A target that is ANY of the peer's candidates counts as current — the
+        // heartbeat failover may have rotated past a dead addrs[0]; stamping it
+        // back here would undo that. Only adopt a genuinely NEW address.
+        let same = self.phone().is_some_and(|a| p.addrs.contains(&a));
+        let addr = p.addr.to_string();
         self.last_reconnect_at = Instant::now();
-        if addr != self.phone_addr {
+        if !same && addr != self.phone_addr {
             self.phone_addr = addr.clone();
+            self.target_since = Instant::now();
             self.reconnects += 1;
             if self.on() {
                 self.start(); // drop + rebuild the broadcaster pointed at the new addr
@@ -565,6 +598,63 @@ impl Beam {
             // Same address — nudge preview to re-arm on the next heartbeat tick.
             self.last_heartbeat =
                 Instant::now().checked_sub(Duration::from_secs(3)).unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// Failover across a peer's candidate addresses when the CURRENT target is
+    /// heartbeat-silent. A phone can advertise addresses that don't route — the
+    /// measured case: an IPv6-only carrier hotspot (T-Mobile 464XLAT) where the
+    /// advertised 172.20.10.1 answers no ARP and only IPv6 carries packets. The
+    /// phone's 1 Hz heartbeat is the known-answer probe: no beat within ~3 s of
+    /// targeting an address ⇒ try the peer's next one (wrapping — the network may
+    /// simply not be up yet). A live heartbeat pins the current choice.
+    fn rotate_dead_target(&mut self) {
+        if self.effective_direct() {
+            return; // Direct rides Multipeer; no WiFi address to rotate
+        }
+        // A rotation mid-take rebuilds the Broadcaster, which truncates the local
+        // clean-audio backup. A stalled link during a take is recoverable in post;
+        // a truncated backup is not — pin the target while recording.
+        if self.remote_rec {
+            return;
+        }
+        let alive =
+            self.last_phone_alive.is_some_and(|t| t.elapsed() < Duration::from_millis(2500));
+        if alive {
+            if self.rotations_since_alive > 0 {
+                self.reconnects += 1; // count RECOVERIES, not search hops
+                self.rotations_since_alive = 0;
+            }
+            self.target_since = Instant::now(); // link up → hold this target
+            return;
+        }
+        let Some(cur) = self.phone() else { return };
+        // Only rotate within the peer that OWNS the current target. A manually
+        // typed address belongs to no discovered peer and stays pinned — replacing
+        // what the user explicitly entered is worse than a dead link.
+        let Some(p) = self.peers.iter().find(|p| p.addrs.contains(&cur)) else { return };
+        if p.addrs.len() < 2 {
+            return; // nowhere to rotate
+        }
+        // After one full wrap every candidate has had its chance — the phone is
+        // likely gone. Keep probing, but gently: no 3 s CoreAudio rebuild churn
+        // while somebody's phone sits in a backpack.
+        let wrapped = self.rotations_since_alive >= p.addrs.len();
+        let patience = if wrapped { Duration::from_secs(15) } else { Duration::from_secs(3) };
+        if self.target_since.elapsed() < patience {
+            return;
+        }
+        let next = p
+            .addrs
+            .iter()
+            .position(|a| *a == cur)
+            .map(|i| p.addrs[(i + 1) % p.addrs.len()])
+            .unwrap_or(p.addrs[0]);
+        if next != cur {
+            self.phone_addr = next.to_string();
+            self.target_since = Instant::now();
+            self.rotations_since_alive += 1;
+            self.status = format!("no heartbeat — trying {next}");
         }
     }
 
@@ -697,7 +787,7 @@ impl Beam {
             .unwrap_or("audio.m4a")
             .to_string();
         if let Some(phone) = self.phone() {
-            let addr = SocketAddr::new(phone.ip(), 9011);
+            let addr = Self::with_port(phone, 9011);
             std::thread::spawn(move || {
                 let _ = send_file_tcp(addr, &p, &name);
             });
@@ -1030,8 +1120,11 @@ impl Beam {
                     self.broadcast_device = self.sel_device.clone();
                     self.broadcast_addr = self.phone_addr.clone();
                     self.status = format!("streaming → {addr}");
+                    // Match by ANY candidate address — after a failover the target is
+                    // addrs[1..], and matching only p.addr would wipe the remembered
+                    // name (killing the by-name auto-retarget on the next launch).
                     if let Some(name) =
-                        self.peers.iter().find(|p| p.addr == addr).map(|p| p.name.clone())
+                        self.peers.iter().find(|p| p.addrs.contains(&addr)).map(|p| p.name.clone())
                     {
                         self.remembered = Some(name.clone());
                         save_last_phone(&name, &addr.to_string());
@@ -1061,7 +1154,14 @@ impl eframe::App for Beam {
         if !self.on() {
             if let Some(name) = &self.remembered {
                 if let Some(p) = self.peers.iter().find(|p| &p.name == name) {
-                    self.phone_addr = p.addr.to_string();
+                    // Adopt the peer's address — but if the current target is already
+                    // ONE of its candidates, keep it: the failover rotation may have
+                    // moved past a dead first choice, and re-stamping addrs[0] every
+                    // frame would pin us to the dead one forever.
+                    if !self.phone().is_some_and(|a| p.addrs.contains(&a)) {
+                        self.phone_addr = p.addr.to_string();
+                        self.target_since = Instant::now();
+                    }
                 }
             }
             // Adopt the one live phone when our target is empty OR points at THIS Mac (a
@@ -1071,6 +1171,7 @@ impl eframe::App for Beam {
             let target_self = self.phone().is_some_and(|a| is_self_addr(&a));
             if (self.phone_addr.is_empty() || target_self) && self.peers.len() == 1 {
                 self.phone_addr = self.peers[0].addr.to_string();
+                self.target_since = Instant::now();
             }
         }
 
@@ -1089,6 +1190,7 @@ impl eframe::App for Beam {
                     .map(|p| p.addr.to_string());
                 if let Some(want) = want {
                     self.phone_addr = want;
+                    self.target_since = Instant::now();
                 }
             }
         }
@@ -1171,6 +1273,9 @@ impl eframe::App for Beam {
 
         // Link watchdog: auto-recover a stalled phone link (no manual 🔄 refresh).
         self.link_watchdog();
+        // Heartbeat-silent target → try the peer's next candidate address (IPv6-only
+        // hotspots advertise a dead IPv4 first; the audio rebuild below re-points).
+        self.rotate_dead_target();
 
         // AWDL/Multipeer is a WiFi-RADIO hog: an active link time-slices the WiFi radio
         // → laggy + dropped WiFi audio, and even stalls unrelated WiFi (Xcode device
@@ -1201,10 +1306,14 @@ impl eframe::App for Beam {
         // phone's WiFi awake. The phone heartbeats back → honest link status (below).
         if self.last_hb_sent.elapsed() >= Duration::from_millis(1000) {
             self.last_hb_sent = Instant::now();
+            // bit0 = "audio is being broadcast right now": the phone's watchdog uses
+            // it to re-accept a zombified audio flow (audio promised but not arriving)
+            // without thrashing its listener while beam is idle.
+            let flags = self.on() as u16;
             if let Some(addr) = self.phone() {
-                self.ctl(addr, CMD_HEARTBEAT, 0);
+                self.ctl(addr, CMD_HEARTBEAT, flags);
             } else if self.effective_direct() && self.multipeer.connected() {
-                self.multipeer.send(control_packet(CMD_HEARTBEAT, 0).to_vec(), false);
+                self.multipeer.send(control_packet(CMD_HEARTBEAT, flags).to_vec(), false);
             }
         }
         // Pull the latest camera-preview frame (if any) into the texture.
@@ -1323,6 +1432,7 @@ impl eframe::App for Beam {
                             };
                             if ui.button(format!("{star}{} · {}", p.name, p.addr)).clicked() {
                                 self.phone_addr = p.addr.to_string();
+                                self.target_since = Instant::now();
                                 self.remembered = Some(p.name.clone());
                                 save_last_phone(&p.name, &self.phone_addr);
                             }

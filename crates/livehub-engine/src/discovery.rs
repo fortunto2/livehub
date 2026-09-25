@@ -22,21 +22,30 @@ use std::time::{Duration, Instant};
 const SERVICE_ARG: &str = "_reelcam._udp";
 const SERVICE_DOT: &str = "_reelcam._udp.";
 
-/// Pick the best address: a real WiFi-LAN IPv4 (192.168/10/172) over a 169.254
-/// link-local or an awdl0 IPv6 — so audio rides WiFi, not the JITTERY AWDL link (the
-/// phone advertises on BOTH when the Multipeer link is up).
-fn pick_addr(addrs: &[IpAddr]) -> Option<IpAddr> {
-    addrs
-        .iter()
-        .find(|ip| matches!(ip, IpAddr::V4(v4) if v4.is_private()))
-        .or_else(|| {
-            addrs
-                .iter()
-                .find(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_loopback()))
-        })
-        .or_else(|| addrs.iter().find(|ip| ip.is_ipv4()))
-        .or_else(|| addrs.first())
-        .copied()
+/// Rank candidate addresses, best first: a real WiFi-LAN IPv4 (192.168/10/172), then
+/// other IPv4, then global IPv6, then link-local IPv6 — so audio prefers plain WiFi
+/// IPv4 (not the JITTERY AWDL v6 link the phone also advertises when Multipeer is up).
+/// ALL candidates are kept: on an IPv6-only carrier hotspot (T-Mobile 464XLAT,
+/// measured 2026-09-24) the phone still ADVERTISES 172.20.10.1 but never services
+/// IPv4 — the v4 is dead and only v6 carries packets. beam fails over down this list
+/// when the phone's heartbeat goes silent, so a dead first choice heals itself.
+/// Ranks full `SocketAddr`s (NOT bare `IpAddr`s) because a link-local IPv6 target is
+/// only routable with its scope_id, which lives in `SocketAddrV6`.
+fn rank_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let score = |sa: &SocketAddr| match sa.ip() {
+        IpAddr::V4(v4) if v4.is_private() => 0,
+        IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_loopback() => 1,
+        IpAddr::V4(_) => 2,
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) != 0xfe80 => 3, // global v6
+        IpAddr::V6(_) => 4,                                          // link-local v6
+    };
+    let mut ranked: Vec<SocketAddr> = addrs.to_vec();
+    ranked.sort_by_key(score);
+    // Vec::dedup only removes ADJACENT duplicates; a duplicate separated by
+    // another equal-score address would survive and burn a failover slot.
+    let mut seen = std::collections::HashSet::new();
+    ranked.retain(|a| seen.insert(*a));
+    ranked
 }
 
 /// Is this address actually THIS Mac (a stale mDNS record resolving to one of our own
@@ -61,7 +70,10 @@ pub fn is_self_addr(addr: &SocketAddr) -> bool {
 #[derive(Clone)]
 pub struct Peer {
     pub name: String,     // instance name (e.g. "reelcam")
-    pub addr: SocketAddr, // resolved ip:port to broadcast to
+    pub addr: SocketAddr, // best resolved ip:port to broadcast to (= addrs[0])
+    /// ALL resolved candidates, best first (v4 → global v6 → link-local v6). beam
+    /// walks down this list when the current target goes heartbeat-silent.
+    pub addrs: Vec<SocketAddr>,
 }
 
 /// Live list of discovered phones. Start once; poll `peers()`. Dropping it kills the
@@ -113,13 +125,15 @@ impl Discovery {
                         store.lock().unwrap().retain(|p| p.name != inst);
                         continue;
                     }
-                    if let Some(addr) = resolve_instance(&inst) {
+                    if let Some(addrs) = resolve_instance(&inst) {
+                        let addr = addrs[0];
                         let mut g = store.lock().unwrap();
                         // upsert by name (the phone's IP can change between scans)
                         if let Some(p) = g.iter_mut().find(|p| p.name == inst) {
                             p.addr = addr;
+                            p.addrs = addrs;
                         } else {
-                            g.push(Peer { name: inst, addr });
+                            g.push(Peer { name: inst, addr, addrs });
                         }
                     }
                 }
@@ -127,12 +141,22 @@ impl Discovery {
         Ok(Discovery { peers, browse })
     }
 
-    /// Currently-discovered phones. Drops any whose resolved IP is THIS Mac (a stale
-    /// self-pointing mDNS record — see `is_self_addr`), so auto-target never picks us.
+    /// Currently-discovered phones. Drops any ADDRESS that is THIS Mac (a stale
+    /// self-pointing mDNS record — see `is_self_addr`), and any peer with no real
+    /// address left, so auto-target never picks us.
     pub fn peers(&self) -> Vec<Peer> {
         self.peers
             .lock()
-            .map(|g| g.iter().filter(|p| !is_self_addr(&p.addr)).cloned().collect())
+            .map(|g| {
+                g.iter()
+                    .filter_map(|p| {
+                        let addrs: Vec<SocketAddr> =
+                            p.addrs.iter().filter(|a| !is_self_addr(a)).copied().collect();
+                        let addr = *addrs.first()?;
+                        Some(Peer { name: p.name.clone(), addr, addrs })
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -149,9 +173,10 @@ impl Discovery {
     }
 }
 
-/// Resolve an instance → ip:port via `dns-sd -L` (host:port) + `getaddrinfo` (address).
-/// `dns-sd -L` runs forever, so read with a deadline then kill it.
-fn resolve_instance(inst: &str) -> Option<SocketAddr> {
+/// Resolve an instance → ranked ip:port candidates via `dns-sd -L` (host:port) +
+/// `getaddrinfo` (addresses). `dns-sd -L` runs forever, so read with a deadline then
+/// kill it. Returns a non-empty list, best first.
+fn resolve_instance(inst: &str) -> Option<Vec<SocketAddr>> {
     let mut child = Command::new("dns-sd")
         .args(["-L", inst, SERVICE_ARG, "local."])
         .stdout(Stdio::piped())
@@ -197,13 +222,10 @@ fn resolve_instance(inst: &str) -> Option<SocketAddr> {
     let _ = reader.join();
 
     let (host, port) = host_port?;
-    // getaddrinfo: on macOS this resolves `.local` via mDNSResponder. May return both an
-    // IPv4 (WiFi LAN) and an IPv6 link-local — pick_addr prefers the WiFi-LAN IPv4.
-    let addrs: Vec<IpAddr> = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()?
-        .map(|sa| sa.ip())
-        .collect();
-    let ip = pick_addr(&addrs)?;
-    Some(SocketAddr::new(ip, port))
+    // getaddrinfo: on macOS this resolves `.local` via mDNSResponder. May return an
+    // IPv4 (WiFi LAN), a global IPv6 and a scoped link-local IPv6 — keep them ALL,
+    // ranked, so beam can fail over when the preferred one turns out dead.
+    let addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs().ok()?.collect();
+    let ranked = rank_addrs(&addrs);
+    (!ranked.is_empty()).then_some(ranked)
 }

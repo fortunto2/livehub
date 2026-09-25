@@ -182,7 +182,10 @@ fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<Vec<u8>> {
     let mut s = std::net::TcpStream::connect((host, port))?;
     s.set_read_timeout(Some(Duration::from_secs(60)))?;
     s.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    // RFC 7230: an IPv6 literal in the Host header must be bracketed.
+    let host_hdr =
+        if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_hdr}:{port}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)?;

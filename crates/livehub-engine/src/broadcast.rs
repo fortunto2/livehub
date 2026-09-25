@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::io::Write;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -400,7 +400,9 @@ fn pump(
     // forward each packet here when the gate is on (for the Multipeer link)
     tap: Option<(SyncSender<Vec<u8>>, Arc<AtomicBool>)>,
 ) {
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
+    // Dual-stack: the phone may only be reachable over IPv6 (IPv6-only carrier
+    // hotspot) — [::] handles both families; v4 targets go v4-mapped in dest().
+    let sock = match crate::net::udp_dual(0) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("broadcast: bind failed: {e}");
@@ -428,7 +430,7 @@ fn pump(
             filled += 1;
             if filled == FRAMES_PER_PACKET * 2 {
                 packet[4..12].copy_from_slice(&seq.to_le_bytes());
-                let _ = sock.send_to(&packet, addr);
+                let _ = sock.send_to(&packet, crate::net::sock_dest(&sock, addr));
                 // Only clone+forward to the Multipeer tap when Direct transport wants it
                 // (else WiFi mode would clone every packet for a channel nobody drains).
                 if let Some((t, on)) = &tap {
@@ -589,6 +591,7 @@ fn record_writer(mut cons: rtrb::Consumer<f32>, cmd_rx: Receiver<RecCmd>, sr: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
 
     #[test]
     fn pump_emits_one_well_formed_audio_packet() {
@@ -686,7 +689,7 @@ pub fn run_broadcast_test(to: SocketAddr, secs: u64, record: bool) -> Result<()>
     }
     eprintln!("broadcast-test: {secs}s marker tone → {to}{}", if record { " (recording)" } else { "" });
 
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let sock = crate::net::udp_dual(0)?;
     let sr = 48_000u32;
     let mut packet = vec![0u8; HEADER + FRAMES_PER_PACKET * 2 * 4];
     packet[0..4].copy_from_slice(&MAGIC.to_le_bytes());
@@ -705,7 +708,7 @@ pub fn run_broadcast_test(to: SocketAddr, secs: u64, record: bool) -> Result<()>
             packet[off + 4..off + 8].copy_from_slice(&s);
         }
         packet[4..12].copy_from_slice(&seq.to_le_bytes());
-        let _ = sock.send_to(&packet, to);
+        let _ = sock.send_to(&packet, crate::net::sock_dest(&sock, to));
         seq += 1;
         frame += FRAMES_PER_PACKET;
         let target = start + std::time::Duration::from_secs_f64(frame as f64 / sr as f64);

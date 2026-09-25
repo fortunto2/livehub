@@ -18,6 +18,7 @@ mod last_phone;
 mod link;
 mod loops;
 mod mic_monitor;
+mod net;
 mod remote;
 mod track;
 mod wav;
@@ -28,6 +29,7 @@ pub use device::input_device_names;
 pub use mic_monitor::MicMonitor;
 pub use discovery::{is_self_addr, Discovery, Peer};
 pub use last_phone::{load_last_phone, save_last_phone};
+pub use net::{dual_dest, sock_dest, udp_dual};
 pub use remote::{
     camparam_packet, control_packet, send_control, PreviewReceiver, RemoteControl, CTRL_MAGIC,
     PREVIEW_MAGIC,
