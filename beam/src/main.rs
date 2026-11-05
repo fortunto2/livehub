@@ -341,7 +341,17 @@ impl Beam {
     fn gallery_ui(&mut self, ui: &mut egui::Ui) {
         let host = self.phone_ip();
         ui.horizontal(|ui| {
-            if ui.add_enabled(host.is_some(), egui::Button::new("🔄 refresh")).clicked() {
+            ui.label("code");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.gallery.code)
+                    .hint_text("pairing code")
+                    .desired_width(120.0),
+            );
+            if r.changed() {
+                self.gallery.code = gallery::normalize_code(&self.gallery.code);
+            }
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.add_enabled(host.is_some(), egui::Button::new("🔄 refresh")).clicked() || enter {
                 if let Some(h) = host.clone() {
                     self.gallery.refresh(h);
                 }
@@ -374,7 +384,7 @@ impl Beam {
         ui.separator();
         let items = self.gallery.items.clone();
         if items.is_empty() {
-            ui.weak("No clips — hit refresh (turn the gallery ON in Reelcam settings first).");
+            ui.weak("No clips — hit refresh (turn the gallery ON in Live2play Settings > Remote gallery, enter its code).");
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {

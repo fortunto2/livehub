@@ -31,7 +31,7 @@ good performance is mush. beam fixes that, and then some.
   burn-in) is drivable from a sidebar.
 - **Tempo.** Relays Ableton Link tempo to the phone, so loops and arp sit on your grid.
 
-Discovery is mDNS, audio is UDP, the gallery is plain HTTP. **Everything is local** — no
+Discovery is mDNS, audio is UDP, the gallery is plain HTTP, off by default and gated by a per-session pairing code: turn it on in Live2play Settings > Remote gallery, then type the code into beam's Gallery tab (or set `BEAM_GALLERY_CODE`). beam keeps the code in memory only. **Everything is local** — no
 internet, no account, no server of ours anywhere in the path.
 
 ## Build

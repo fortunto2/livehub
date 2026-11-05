@@ -1,5 +1,5 @@
 //! Remote gallery: browse + pull recorded clips from the phone's file server over
-//! WiFi (reelcam's `FileServer`, off-by-default + token-gated). Hand-rolled blocking
+//! WiFi (reelcam's `FileServer`, off-by-default + pairing-code-gated). Hand-rolled blocking
 //! HTTP client on background threads (no extra deps); results flow back over a
 //! channel and the egui UI polls them.
 
@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-/// Must match reelcam `FileServer.token`.
-pub const TOKEN: &str = "rcm-7f3a9c2e8b1d4056";
+/// Env var that pre-fills the pairing code (it is never written to disk by beam).
+pub const CODE_ENV: &str = "BEAM_GALLERY_CODE";
 pub const PORT: u16 = 9010;
 
 #[derive(Clone)]
@@ -33,6 +33,9 @@ pub struct Gallery {
     pub thumbs: HashMap<String, egui::TextureHandle>,
     pub status: String,
     pub busy: bool,
+    /// Per-session pairing code shown on the phone (Settings > Remote gallery).
+    /// Memory only: never persisted, never logged.
+    pub code: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     pub dir: PathBuf,
@@ -48,6 +51,7 @@ impl Default for Gallery {
             thumbs: HashMap::new(),
             status: String::new(),
             busy: false,
+            code: normalize_code(&std::env::var(CODE_ENV).unwrap_or_default()),
             tx,
             rx,
             dir: PathBuf::from(home).join("Movies/Reelcam"),
@@ -59,19 +63,24 @@ impl Gallery {
     /// (Re)load the clip list + thumbnails from `host` (the phone's IP).
     pub fn refresh(&mut self, host: String) {
         self.items.clear();
+        if self.code.is_empty() {
+            self.status = "enter the pairing code from Live2play Settings > Remote gallery".into();
+            return;
+        }
+        let code = self.code.clone();
         self.thumbs.clear();
         self.status = "loading…".into();
         self.busy = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            match http_get(&host, PORT, &format!("/list?token={TOKEN}")) {
+            match http_get(&host, PORT, &format!("/list?token={code}")) {
                 Ok(body) => {
                     let items = parse_list(&body);
                     let names: Vec<String> = items.iter().map(|c| c.name.clone()).collect();
                     let _ = tx.send(Msg::List(items));
                     for name in names {
                         if let Ok(jpeg) =
-                            http_get(&host, PORT, &format!("/thumb/{name}?token={TOKEN}"))
+                            http_get(&host, PORT, &format!("/thumb/{name}?token={code}"))
                         {
                             let _ = tx.send(Msg::Thumb(name, jpeg));
                         }
@@ -79,7 +88,7 @@ impl Gallery {
                     let _ = tx.send(Msg::Status(String::new())); // clear "loading"
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::Status(format!("✗ {e} (gallery off on the phone?)")));
+                    let _ = tx.send(Msg::Status(explain(&e)));
                 }
             }
         });
@@ -89,10 +98,11 @@ impl Gallery {
     pub fn download(&mut self, host: String, name: String) {
         let tx = self.tx.clone();
         let dir = self.dir.clone();
+        let code = self.code.clone();
         self.busy = true;
         std::thread::spawn(move || {
             let _ = tx.send(Msg::Status(format!("↓ {name}…")));
-            match http_get(&host, PORT, &format!("/file/{name}?token={TOKEN}")) {
+            match http_get(&host, PORT, &format!("/file/{name}?token={code}")) {
                 Ok(bytes) => {
                     std::fs::create_dir_all(&dir).ok();
                     let path = dir.join(&name);
@@ -104,7 +114,7 @@ impl Gallery {
                         Err(e) => let_status(&tx, format!("✗ write: {e}")),
                     }
                 }
-                Err(e) => let_status(&tx, format!("✗ {e}")),
+                Err(e) => let_status(&tx, explain(&e)),
             }
         });
     }
@@ -113,12 +123,15 @@ impl Gallery {
     /// device, so the request blocks until they tap — then the clip drops off /list.
     pub fn delete_remote(&mut self, host: String, name: String) {
         let tx = self.tx.clone();
+        let code = self.code.clone();
         self.busy = true;
         std::thread::spawn(move || {
-            let _ = tx.send(Msg::Status(format!("deleting {name} — confirm on the phone…")));
-            match http_get(&host, PORT, &format!("/delete/{name}?token={TOKEN}")) {
+            let _ = tx.send(Msg::Status(format!(
+                "deleting {name} — confirm on the phone…"
+            )));
+            match http_get(&host, PORT, &format!("/delete/{name}?token={code}")) {
                 Ok(_) => let_status(&tx, format!("✓ deleted {name} on phone (hit refresh)")),
-                Err(e) => let_status(&tx, format!("✗ {e}")),
+                Err(e) => let_status(&tx, explain(&e)),
             }
         });
     }
@@ -127,12 +140,15 @@ impl Gallery {
     /// on the device. Quick way to free space after pulling everything.
     pub fn delete_all_remote(&mut self, host: String) {
         let tx = self.tx.clone();
+        let code = self.code.clone();
         self.busy = true;
         std::thread::spawn(move || {
-            let _ = tx.send(Msg::Status("deleting ALL on phone — confirm on the device…".into()));
-            match http_get(&host, PORT, &format!("/deleteall?token={TOKEN}")) {
+            let _ = tx.send(Msg::Status(
+                "deleting ALL on phone — confirm on the device…".into(),
+            ));
+            match http_get(&host, PORT, &format!("/deleteall?token={code}")) {
                 Ok(_) => let_status(&tx, "✓ phone cleared (hit refresh)".into()),
-                Err(e) => let_status(&tx, format!("✗ {e}")),
+                Err(e) => let_status(&tx, explain(&e)),
             }
         });
     }
@@ -176,6 +192,24 @@ pub fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
+/// Keep only what the phone can have issued (letters/digits), uppercased, so pasted
+/// whitespace, dashes or URL-breaking characters never reach the request line.
+pub fn normalize_code(raw: &str) -> String {
+    raw.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Human message for a failed request. Never includes the request path (it holds the code).
+fn explain(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "✗ wrong or expired pairing code — turn the gallery on in Live2play Settings and copy the code".into(),
+        std::io::ErrorKind::ConnectionRefused => "✗ gallery is off — turn it on in Live2play Settings > Remote gallery".into(),
+        _ => format!("✗ {e}"),
+    }
+}
+
 /// Minimal blocking HTTP GET. The server replies `Connection: close`, so read-to-end
 /// captures the whole body. Returns the body (after the header) on `200`.
 fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<Vec<u8>> {
@@ -183,9 +217,13 @@ fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<Vec<u8>> {
     s.set_read_timeout(Some(Duration::from_secs(60)))?;
     s.set_write_timeout(Some(Duration::from_secs(10)))?;
     // RFC 7230: an IPv6 literal in the Host header must be bracketed.
-    let host_hdr =
-        if host.contains(':') { format!("[{host}]") } else { host.to_string() };
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_hdr}:{port}\r\nConnection: close\r\n\r\n");
+    let host_hdr = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_hdr}:{port}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)?;
@@ -195,8 +233,13 @@ fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<Vec<u8>> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header"))?;
     let head = std::str::from_utf8(&buf[..sep]).unwrap_or("");
     if !head.starts_with("HTTP/1.1 200") {
-        let code = head.lines().next().unwrap_or("HTTP error");
-        return Err(std::io::Error::other(code.to_string()));
+        let line = head.lines().next().unwrap_or("HTTP error");
+        let kind = if line.contains(" 401") || line.contains(" 403") {
+            std::io::ErrorKind::PermissionDenied
+        } else {
+            std::io::ErrorKind::Other
+        };
+        return Err(std::io::Error::new(kind, line.to_string()));
     }
     Ok(buf[sep + 4..].to_vec())
 }
@@ -218,4 +261,56 @@ fn parse_list(body: &[u8]) -> Vec<ClipMeta> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// One-shot server: records the request line, answers with `status`.
+    fn serve_once(status: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = c.read(&mut buf).unwrap();
+            let _ = c.write_all(
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            );
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        });
+        (port, h)
+    }
+
+    #[test]
+    fn request_carries_code_and_401_maps_to_message() {
+        let (port, h) = serve_once("401 Unauthorized");
+        let err = http_get("127.0.0.1", port, "/list?token=ABCD2345EFGH").unwrap_err();
+        assert_eq!(h.join().unwrap(), "GET /list?token=ABCD2345EFGH HTTP/1.1");
+        let msg = explain(&err);
+        assert!(msg.contains("wrong or expired pairing code"));
+        assert!(!msg.contains("ABCD2345EFGH"));
+    }
+
+    #[test]
+    fn refused_maps_to_gallery_off() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = http_get("127.0.0.1", port, "/list?token=X").unwrap_err();
+        assert!(explain(&err).contains("gallery is off"));
+    }
+
+    #[test]
+    fn code_is_normalized() {
+        assert_eq!(normalize_code(" abcd-2345 efgh\n"), "ABCD2345EFGH");
+    }
 }
